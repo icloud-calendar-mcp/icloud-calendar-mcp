@@ -1,0 +1,48 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config
+local.properties
+.env
+.env.*
+*.env
+
+# Claude Code / AI assistant files
+CLAUDE.md
+.claude/
+
+# Internal documentation (references private repos)
+IMPLEMENTATION_PLAN.md
+
+# Credentials (never commit)
+credentials.json
+secrets.json
+*.pem
+*.key
+
+# Test artifacts
+test-mcp.sh
+test-caldav.sh
+test-live.kt
+test-manual.sh
+test-mcp-client.js
+
+# npm/Python package build artifacts
+npm-package/lib/*.jar
+py-package/dist/
+py-package/.venv/
+py-package/*.egg-info/
+__pycache__/
+*.pyc

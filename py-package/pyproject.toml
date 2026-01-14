@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "icloud-calendar-mcp"
+version = "2.0.0"
+description = "MCP server for iCloud Calendar access via CalDAV"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Onekash Labs" }]
+keywords = ["mcp", "model-context-protocol", "icloud", "calendar", "caldav", "claude", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp"
+Repository = "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp"
+Issues = "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/issues"
+
+[project.scripts]
+icloud-calendar-mcp = "icloud_calendar_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/icloud_calendar_mcp"]
