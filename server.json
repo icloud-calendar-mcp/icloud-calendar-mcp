@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "org.onekash/icloud-calendar-mcp",
+  "description": "MCP server for iCloud (Apple) Calendar access via CalDAV",
+  "repository": {
+    "url": "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp",
+    "source": "github"
+  },
+  "version": "2.0.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@icloud-calendar-mcp/server",
+      "version": "2.0.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Your Apple ID email",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false,
+          "name": "APPLE_ID"
+        },
+        {
+          "description": "App-specific password for iCloud",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true,
+          "name": "APP_SPECIFIC_PASSWORD"
+        }
+      ]
+    }
+  ]
+}
