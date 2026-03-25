@@ -494,6 +494,249 @@ class CalendarServiceTest {
         val error = result as ServiceResult.Error
         assertEquals(404, error.code)
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CONNECTION VALIDATION (Chunk 4)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `listCalendars validates connection on first call`() {
+        mockClient.checkConnectionResult = CalDavResult.Error(400,
+            "Server does not support CalDAV")
+
+        val result = service.listCalendars()
+
+        assertTrue(result is ServiceResult.Error)
+        val error = result as ServiceResult.Error
+        assertEquals(400, error.code)
+        assertTrue(error.message.contains("CalDAV"))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // E2E: PROPERTY PRESERVATION (Chunk 24 - IcsPatcher integration)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `update event preserves VALARM and ATTENDEE via IcsPatcher`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+
+        // Event with VALARM, ATTENDEE, ORGANIZER, X-APPLE-* props
+        val richIcs = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:rich-event-001
+            DTSTAMP:20251220T100000Z
+            DTSTART:20251225T100000Z
+            DTEND:20251225T110000Z
+            SUMMARY:Team Meeting
+            DESCRIPTION:Weekly sync
+            LOCATION:Room A
+            ORGANIZER;CN=Boss:mailto:boss@example.com
+            ATTENDEE;CN=Alice:mailto:alice@example.com
+            ATTENDEE;CN=Bob:mailto:bob@example.com
+            X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER:-PT15M
+            DESCRIPTION:15 min reminder
+            END:VALARM
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER:-PT1H
+            DESCRIPTION:1 hour reminder
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val existingEvent = CalDavEvent(
+            uid = "rich-event-001",
+            href = "/cal/rich-event-001.ics",
+            url = "https://test.com/cal/rich-event-001.ics",
+            etag = "\"etag1\"",
+            icalData = richIcs
+        )
+        mockClient.eventsResponse = listOf(existingEvent)
+        mockClient.registeredEvents["rich-event-001"] = existingEvent
+
+        // Populate cache
+        service.getEvents("cal-1", "2025-12-25", "2025-12-25")
+
+        // Update only the summary - everything else should be preserved
+        val result = service.updateEvent(
+            eventId = "rich-event-001",
+            summary = "Updated Meeting"
+        )
+
+        assertTrue(result is ServiceResult.Success)
+
+        // Verify the updated ICS preserves everything
+        val updatedIcs = mockClient.lastUpdatedIcs!!
+        assertTrue(updatedIcs.contains("SUMMARY:Updated Meeting"), "Title updated")
+        assertTrue(updatedIcs.contains("boss@example.com"), "Organizer preserved")
+        assertTrue(updatedIcs.contains("alice@example.com"), "Attendee Alice preserved")
+        assertTrue(updatedIcs.contains("bob@example.com"), "Attendee Bob preserved")
+        assertTrue(updatedIcs.contains("X-APPLE-TRAVEL-ADVISORY"), "X-APPLE prop preserved")
+
+        // VALARM blocks preserved
+        val alarmCount = updatedIcs.split("BEGIN:VALARM").size - 1
+        assertEquals(2, alarmCount, "Both VALARM blocks preserved")
+        assertTrue(updatedIcs.contains("TRIGGER:-PT15M"), "15 min alarm preserved")
+        assertTrue(updatedIcs.contains("TRIGGER:-PT1H"), "1 hour alarm preserved")
+
+        // SEQUENCE incremented
+        assertTrue(updatedIcs.contains("SEQUENCE:1"), "SEQUENCE incremented")
+    }
+
+    @Test
+    fun `update event preserves properties through multiple updates`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+
+        val originalIcs = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:multi-update-001
+            DTSTAMP:20251220T100000Z
+            DTSTART:20251225T100000Z
+            DTEND:20251225T110000Z
+            SUMMARY:Original
+            ORGANIZER;CN=John:mailto:john@example.com
+            ATTENDEE;CN=Jane:mailto:jane@example.com
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER:-PT30M
+            DESCRIPTION:Reminder
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val existingEvent = CalDavEvent(
+            uid = "multi-update-001",
+            href = "/cal/multi-update-001.ics",
+            url = "https://test.com/cal/multi-update-001.ics",
+            etag = "\"etag1\"",
+            icalData = originalIcs
+        )
+        mockClient.eventsResponse = listOf(existingEvent)
+        mockClient.registeredEvents["multi-update-001"] = existingEvent
+
+        service.getEvents("cal-1", "2025-12-25", "2025-12-25")
+
+        // First update: change title
+        service.updateEvent(eventId = "multi-update-001", summary = "V2")
+        val v2Ics = mockClient.lastUpdatedIcs!!
+        assertTrue(v2Ics.contains("SUMMARY:V2"))
+        assertTrue(v2Ics.contains("jane@example.com"), "Attendee survives 1st update")
+        assertTrue(v2Ics.contains("BEGIN:VALARM"), "VALARM survives 1st update")
+
+        // Refresh cache with v2 ICS (mock client returns what was sent)
+        service.clearCache()
+        mockClient.eventsResponse = listOf(
+            CalDavEvent("multi-update-001", "/cal/multi-update-001.ics",
+                "https://test.com/cal/multi-update-001.ics", "\"etag2\"", v2Ics)
+        )
+        mockClient.registeredEvents["multi-update-001"] = mockClient.eventsResponse[0]
+        service.getEvents("cal-1", "2025-12-25", "2025-12-25")
+
+        // Second update: add location
+        service.updateEvent(eventId = "multi-update-001", location = "Room 42")
+        val v3Ics = mockClient.lastUpdatedIcs!!
+        assertTrue(v3Ics.contains("SUMMARY:V2"), "Title from v2 preserved")
+        assertTrue(v3Ics.contains("LOCATION:Room 42"), "Location added")
+        assertTrue(v3Ics.contains("jane@example.com"), "Attendee survives 2nd update")
+        assertTrue(v3Ics.contains("BEGIN:VALARM"), "VALARM survives 2nd update")
+        assertTrue(v3Ics.contains("SEQUENCE:2"), "SEQUENCE incremented twice")
+    }
+
+    @Test
+    fun `full CRUD flow with extended fields`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+
+        // 1. Create event with timezone and rrule
+        val createResult = service.createEvent(
+            calendarId = "cal-1",
+            summary = "Weekly Standup",
+            startTime = "2025-12-25T10:00:00Z",
+            endTime = "2025-12-25T11:00:00Z",
+            description = "Team sync",
+            location = "Zoom",
+            rrule = "FREQ=WEEKLY;BYDAY=MO"
+        )
+
+        assertTrue(createResult is ServiceResult.Success)
+        val created = (createResult as ServiceResult.Success).data
+        assertEquals("Weekly Standup", created.summary)
+        assertNotNull(created.uid)
+
+        // Verify ICS has RRULE
+        val createdIcs = mockClient.lastCreatedIcs!!
+        assertTrue(createdIcs.contains("RRULE:FREQ=WEEKLY"), "RRULE in created ICS")
+
+        // 2. Get events
+        val eventUid = created.uid
+        val getResult = service.getEvents("cal-1", "2025-12-25", "2025-12-25")
+        assertTrue(getResult is ServiceResult.Success)
+
+        // 3. Get by ID
+        val byIdResult = service.getEventById(eventUid)
+        assertTrue(byIdResult is ServiceResult.Success)
+        val fetched = (byIdResult as ServiceResult.Success).data
+        assertEquals("Weekly Standup", fetched.summary)
+
+        // 4. Update - only change title, preserve RRULE
+        val updateResult = service.updateEvent(
+            eventId = eventUid,
+            summary = "Daily Standup"
+        )
+        assertTrue(updateResult is ServiceResult.Success)
+
+        val updatedIcs = mockClient.lastUpdatedIcs!!
+        assertTrue(updatedIcs.contains("SUMMARY:Daily Standup"), "Title updated")
+        assertTrue(updatedIcs.contains("RRULE:FREQ=WEEKLY"), "RRULE preserved")
+        assertTrue(updatedIcs.contains("LOCATION:Zoom"), "Location preserved")
+        assertTrue(updatedIcs.contains("DESCRIPTION:Team sync"), "Description preserved")
+
+        // 5. Delete
+        service.clearCache()
+        mockClient.eventsResponse = listOf(
+            CalDavEvent(eventUid, "/cal/$eventUid.ics", "https://test.com/cal/$eventUid.ics",
+                "\"updated-etag\"", updatedIcs)
+        )
+        mockClient.registeredEvents[eventUid] = mockClient.eventsResponse[0]
+        service.getEvents("cal-1", "2025-12-25", "2025-12-25")
+
+        val deleteResult = service.deleteEvent(eventUid)
+        assertTrue(deleteResult is ServiceResult.Success)
+        assertEquals("/cal/$eventUid.ics", mockClient.lastDeletedHref)
+    }
+
+    @Test
+    fun `listCalendars caches connection validation`() {
+        // First call succeeds (default is Success)
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+
+        val result1 = service.listCalendars()
+        assertTrue(result1 is ServiceResult.Success)
+
+        // Change connection result to failure - should still work (cached)
+        mockClient.checkConnectionResult = CalDavResult.Error(500, "Server down")
+
+        val result2 = service.listCalendars()
+        assertTrue(result2 is ServiceResult.Success) // Uses cached validation
+    }
 }
 
 /**
@@ -566,5 +809,15 @@ class MockCalDavClient : CalDavClient {
             registeredEvents.remove(event.uid)
         }
         return CalDavResult.Success(Unit)
+    }
+
+    var checkConnectionResult: CalDavResult<Boolean> = CalDavResult.Success(true)
+
+    override fun checkConnection(): CalDavResult<Boolean> = checkConnectionResult
+
+    override fun fetchEtags(calendarId: String, startDate: String, endDate: String): CalDavResult<Map<String, String?>> {
+        val calendar = calendars.find { it.id == calendarId }
+            ?: return CalDavResult.Error(404, "Calendar not found: $calendarId")
+        return CalDavResult.Success(eventsResponse.associate { it.href to it.etag })
     }
 }

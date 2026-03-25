@@ -2,6 +2,7 @@ package org.onekash.mcp.calendar.service
 
 import org.onekash.mcp.calendar.caldav.*
 import org.onekash.mcp.calendar.ics.IcsBuilder
+import org.onekash.mcp.calendar.ics.IcsPatcher
 import org.onekash.mcp.calendar.ics.IcsParser
 import org.onekash.mcp.calendar.ics.ParsedEvent
 import java.util.concurrent.ConcurrentHashMap
@@ -21,7 +22,8 @@ data class CalendarInfo(
     val id: String,
     val name: String,
     val color: String?,
-    val readOnly: Boolean
+    val readOnly: Boolean,
+    val supportedComponents: Set<String> = emptySet()
 )
 
 /**
@@ -40,7 +42,13 @@ data class EventInfo(
     val endTime: String?,
     val startDate: String?,
     val endDate: String?,
-    val rrule: String?
+    val rrule: String?,
+    val status: String? = null,
+    val url: String? = null,
+    val categories: List<String> = emptyList(),
+    val priority: Int? = null,
+    val organizer: String? = null,
+    val attendeeCount: Int = 0
 )
 
 /**
@@ -66,11 +74,27 @@ class CalendarService(
     private val client: CalDavClient,
     private val parser: IcsParser = IcsParser(),
     private val builder: IcsBuilder = IcsBuilder(),
+    private val patcher: IcsPatcher = IcsPatcher(),
     private val cacheTtlMs: Long = 5 * 60 * 1000L,  // 5 minutes default
     private val maxCacheSize: Int = 1000
 ) {
     // Thread-safe cache with TTL support
     private val eventCache = ConcurrentHashMap<String, CachedEvent>()
+
+    // Connection validation (lazy, cached)
+    @Volatile
+    private var connectionValidated = false
+
+    private fun ensureConnected(): ServiceResult<Unit> {
+        if (connectionValidated) return ServiceResult.Success(Unit)
+        return when (val result = client.checkConnection()) {
+            is CalDavResult.Success -> {
+                connectionValidated = true
+                ServiceResult.Success(Unit)
+            }
+            is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+        }
+    }
 
     /**
      * Get event from cache if not expired.
@@ -129,6 +153,10 @@ class CalendarService(
      * List all accessible calendars.
      */
     fun listCalendars(): ServiceResult<List<CalendarInfo>> {
+        // Validate connection on first use (lazy, cached)
+        val connResult = ensureConnected()
+        if (connResult is ServiceResult.Error) return connResult
+
         return when (val result = client.listCalendars()) {
             is CalDavResult.Success -> {
                 val calendars = result.data.map { cal ->
@@ -136,7 +164,8 @@ class CalendarService(
                         id = cal.id,
                         name = cal.displayName,
                         color = cal.color,
-                        readOnly = cal.isReadOnly
+                        readOnly = cal.isReadOnly,
+                        supportedComponents = cal.supportedComponents
                     )
                 }
                 ServiceResult.Success(calendars)
@@ -301,28 +330,20 @@ class CalendarService(
         val existing = getFromCache(eventId)
             ?: return ServiceResult.Error(404, "Event not found: $eventId")
 
-        // Parse existing event to get current values
-        val parsed = parser.parse(existing.icalData)
-        if (parsed.isEmpty()) {
-            return ServiceResult.Error(500, "Could not parse existing event")
-        }
-
-        val current = parsed[0]
-
-        // Build updated ICS, merging new values with existing
-        val effectiveIsAllDay = isAllDay ?: current.isAllDay
-        val ics = builder.build(
+        // Use IcsPatcher to preserve VALARM, ATTENDEE, ORGANIZER, X-* properties
+        val ics = patcher.patch(
+            existingIcs = existing.icalData,
             uid = eventId,
-            summary = summary ?: current.summary,
-            startTime = if (!effectiveIsAllDay) (startTime ?: current.startTime) else null,
-            endTime = if (!effectiveIsAllDay) (endTime ?: current.endTime) else null,
-            startDate = if (effectiveIsAllDay) (startDate ?: current.startDate) else null,
-            endDate = if (effectiveIsAllDay) (endDate ?: current.endDate) else null,
-            isAllDay = effectiveIsAllDay,
-            description = description ?: current.description,
-            location = location ?: current.location,
+            summary = summary,
+            startTime = startTime,
+            endTime = endTime,
+            startDate = startDate,
+            endDate = endDate,
+            isAllDay = isAllDay,
+            description = description,
+            location = location,
             timezone = timezone,
-            rrule = rrule ?: current.rrule
+            rrule = rrule
         )
 
         // Update via CalDAV
@@ -336,20 +357,26 @@ class CalendarService(
                 if (parsedUpdated.isNotEmpty()) {
                     ServiceResult.Success(toEventInfo(parsedUpdated[0], updated))
                 } else {
-                    ServiceResult.Success(EventInfo(
-                        uid = updated.uid,
-                        href = updated.href,
-                        etag = updated.etag,
-                        summary = summary ?: current.summary,
-                        description = description ?: current.description,
-                        location = location ?: current.location,
-                        isAllDay = effectiveIsAllDay,
-                        startTime = if (!effectiveIsAllDay) (startTime ?: current.startTime) else null,
-                        endTime = if (!effectiveIsAllDay) (endTime ?: current.endTime) else null,
-                        startDate = if (effectiveIsAllDay) (startDate ?: current.startDate) else null,
-                        endDate = if (effectiveIsAllDay) (endDate ?: current.endDate) else null,
-                        rrule = rrule ?: current.rrule
-                    ))
+                    // Fallback: parse the ICS we sent
+                    val sentParsed = parser.parse(ics)
+                    if (sentParsed.isNotEmpty()) {
+                        ServiceResult.Success(toEventInfo(sentParsed[0], updated))
+                    } else {
+                        ServiceResult.Success(EventInfo(
+                            uid = updated.uid,
+                            href = updated.href,
+                            etag = updated.etag,
+                            summary = summary ?: eventId,
+                            description = description,
+                            location = location,
+                            isAllDay = isAllDay ?: false,
+                            startTime = startTime,
+                            endTime = endTime,
+                            startDate = startDate,
+                            endDate = endDate,
+                            rrule = rrule
+                        ))
+                    }
                 }
             }
             is CalDavResult.Error -> {
@@ -397,7 +424,13 @@ class CalendarService(
             endTime = parsed.endTime,
             startDate = parsed.startDate,
             endDate = parsed.endDate,
-            rrule = parsed.rrule
+            rrule = parsed.rrule,
+            status = parsed.status,
+            url = parsed.url,
+            categories = parsed.categories,
+            priority = parsed.priority,
+            organizer = parsed.organizer,
+            attendeeCount = parsed.attendeeCount
         )
     }
 }

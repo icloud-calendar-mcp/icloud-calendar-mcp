@@ -29,6 +29,93 @@ object SecureErrorHandler {
     }
 
     /**
+     * Hierarchical error types with context, retryability, and suggested actions.
+     * Kotlin `when` exhaustiveness enforced at compile time.
+     */
+    sealed class CalendarError(
+        val code: String,
+        val httpStatus: Int,
+        val isRetryable: Boolean,
+        val suggestedAction: String
+    ) {
+        data class Validation(
+            val field: String? = null,
+            val detail: String = "Invalid input"
+        ) : CalendarError("VALIDATION_ERROR", 400, false, "Check input parameters and retry")
+
+        data class Authentication(
+            val reason: String = "Authentication failed"
+        ) : CalendarError("AUTH_ERROR", 401, false, "Verify credentials and retry")
+
+        data class Authorization(
+            val calendarName: String? = null,
+            val reason: String = "Access denied"
+        ) : CalendarError("FORBIDDEN", 403, false, "Check calendar sharing permissions")
+
+        data class NotFound(
+            val resourceType: String = "resource",
+            val resourceId: String? = null
+        ) : CalendarError("NOT_FOUND", 404, false, "Verify the resource exists")
+
+        data class Conflict(
+            val eventTitle: String? = null,
+            val reason: String = "Resource was modified"
+        ) : CalendarError("CONFLICT", 409, false, "Refresh and retry with updated data")
+
+        data class RateLimited(
+            val retryAfterMs: Long = 0
+        ) : CalendarError("RATE_LIMITED", 429, true, "Wait and retry after the indicated delay")
+
+        data class Network(
+            val reason: String = "Network error"
+        ) : CalendarError("NETWORK_ERROR", 0, true, "Check network connection and retry")
+
+        data class Timeout(
+            val timeoutMs: Long = 0
+        ) : CalendarError("TIMEOUT", 408, true, "Retry the request")
+
+        data class ServerError(
+            val serverCode: Int = 500,
+            val reason: String = "Server error"
+        ) : CalendarError("SERVER_ERROR", serverCode, true, "Retry after a short delay")
+
+        data class CalDav(
+            val reason: String = "Calendar service error"
+        ) : CalendarError("CALDAV_ERROR", 502, true, "Retry or check server status")
+
+        data class Internal(
+            val reason: String = "Internal error"
+        ) : CalendarError("INTERNAL_ERROR", 500, false, "Contact support if the issue persists")
+
+        /** Convert to ErrorCode for backward compatibility */
+        fun toErrorCode(): ErrorCode = when (this) {
+            is Validation -> ErrorCode.VALIDATION_ERROR
+            is Authentication -> ErrorCode.AUTHENTICATION_ERROR
+            is Authorization -> ErrorCode.AUTHORIZATION_ERROR
+            is NotFound -> ErrorCode.NOT_FOUND
+            is Conflict -> ErrorCode.CONFLICT
+            is RateLimited -> ErrorCode.RATE_LIMITED
+            is Network, is Timeout, is ServerError, is CalDav -> ErrorCode.CALDAV_ERROR
+            is Internal -> ErrorCode.INTERNAL_ERROR
+        }
+
+        /** Safe message for external display */
+        fun safeMessage(): String = when (this) {
+            is Validation -> detail
+            is Authentication -> reason
+            is Authorization -> reason
+            is NotFound -> "$resourceType not found"
+            is Conflict -> reason
+            is RateLimited -> "Rate limit exceeded"
+            is Network -> reason
+            is Timeout -> "Request timed out"
+            is ServerError -> reason
+            is CalDav -> reason
+            is Internal -> "An internal error occurred"
+        }
+    }
+
+    /**
      * Create a secure error result for MCP tools.
      */
     fun createErrorResult(
@@ -143,6 +230,61 @@ object SecureErrorHandler {
             ErrorCode.INTERNAL_ERROR,
             "An internal error occurred. Please try again."
         )
+    }
+
+    /**
+     * Map exception to CalendarError type.
+     */
+    fun fromException(exception: Exception): CalendarError {
+        return when (exception) {
+            is java.net.SocketTimeoutException -> CalendarError.Timeout()
+            is java.net.UnknownHostException -> CalendarError.Network(reason = "Unknown host: ${exception.message}")
+            is javax.net.ssl.SSLException -> CalendarError.Authentication(reason = "Certificate error")
+            is java.net.ConnectException -> CalendarError.Network(reason = "Connection refused")
+            else -> CalendarError.Internal(reason = exception.message ?: "Unknown error")
+        }
+    }
+
+    /**
+     * Map HTTP status code to CalendarError type.
+     */
+    fun fromHttpCode(code: Int, message: String = ""): CalendarError {
+        return when (code) {
+            401 -> CalendarError.Authentication()
+            403 -> CalendarError.Authorization()
+            404 -> CalendarError.NotFound()
+            409 -> CalendarError.Conflict()
+            429 -> CalendarError.RateLimited()
+            in 500..599 -> CalendarError.ServerError(serverCode = code, reason = message.ifBlank { "Server error" })
+            else -> CalendarError.Internal(reason = message.ifBlank { "Unexpected error ($code)" })
+        }
+    }
+
+    /**
+     * Mask email address for safe display.
+     * "john.doe@icloud.com" -> "joh***@***.com"
+     */
+    fun maskEmail(email: String): String {
+        val atIdx = email.indexOf('@')
+        if (atIdx < 0) {
+            // No @ sign, mask most of the string
+            return if (email.length <= 3) "***" else email.take(3) + "***"
+        }
+
+        val local = email.substring(0, atIdx)
+        val domain = email.substring(atIdx + 1)
+
+        val maskedLocal = if (local.length <= 3) "***" else local.take(3) + "***"
+
+        // Show only TLD
+        val dotIdx = domain.lastIndexOf('.')
+        val maskedDomain = if (dotIdx >= 0) {
+            "***" + domain.substring(dotIdx)
+        } else {
+            "***"
+        }
+
+        return "$maskedLocal@$maskedDomain"
     }
 
     // Maximum message length to prevent DoS via regex processing

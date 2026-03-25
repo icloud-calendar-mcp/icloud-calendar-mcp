@@ -1,5 +1,6 @@
 package org.onekash.mcp.calendar.ics
 
+import net.fortuna.ical4j.model.TimeZoneRegistryFactory
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -13,8 +14,9 @@ import java.util.UUID
  * - All-day vs timed events
  * - UTC and timezone-aware datetimes
  * - RFC 5545 text escaping
- * - Line folding at 75 octets
+ * - Line folding at 75 octets (not chars)
  * - RRULE for recurring events
+ * - VTIMEZONE generation via ical4j
  */
 class IcsBuilder {
 
@@ -22,7 +24,7 @@ class IcsBuilder {
         private const val PRODID = "-//OnekashMCP//AppleCalendarMCP 1.0//EN"
         private const val VERSION = "2.0"
         private const val CALSCALE = "GREGORIAN"
-        private const val MAX_LINE_LENGTH = 75
+        private const val MAX_LINE_OCTETS = 75
     }
 
     private val utcFormatter = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'")
@@ -46,6 +48,11 @@ class IcsBuilder {
      * @param location Event location
      * @param timezone IANA timezone (e.g., "America/New_York") for non-UTC timed events
      * @param rrule Recurrence rule (e.g., "FREQ=WEEKLY;BYDAY=MO")
+     * @param status Event status (TENTATIVE, CONFIRMED, CANCELLED)
+     * @param url URL associated with the event
+     * @param categories List of category strings
+     * @param priority Priority (1=highest, 9=lowest, 0=undefined)
+     * @param transp Time transparency (OPAQUE or TRANSPARENT)
      */
     fun build(
         uid: String? = null,
@@ -58,16 +65,31 @@ class IcsBuilder {
         description: String? = null,
         location: String? = null,
         timezone: String? = null,
-        rrule: String? = null
+        rrule: String? = null,
+        status: String? = null,
+        url: String? = null,
+        categories: List<String>? = null,
+        priority: Int? = null,
+        transp: String? = null
     ): String {
         val effectiveUid = uid ?: "${UUID.randomUUID()}@icloud-calendar-mcp"
         val dtstamp = utcFormatter.format(Instant.now())
+
+        // Determine if we need VTIMEZONE
+        val needsVtimezone = timezone != null &&
+            startTime != null && !startTime.endsWith("Z") &&
+            endTime != null && !endTime.endsWith("Z")
 
         return buildString {
             appendLine("BEGIN:VCALENDAR")
             appendLine("VERSION:$VERSION")
             appendLine("PRODID:$PRODID")
             appendLine("CALSCALE:$CALSCALE")
+
+            // VTIMEZONE must appear before VEVENT
+            if (needsVtimezone) {
+                appendVtimezone(timezone!!)
+            }
 
             appendLine("BEGIN:VEVENT")
             appendLine("UID:$effectiveUid")
@@ -97,9 +119,46 @@ class IcsBuilder {
                 appendLine("RRULE:$rrule")
             }
 
+            // Extended properties
+            if (!status.isNullOrBlank()) {
+                appendLine("STATUS:$status")
+            }
+
+            if (!url.isNullOrBlank()) {
+                appendFoldedLine("URL:$url")
+            }
+
+            if (!categories.isNullOrEmpty()) {
+                val escaped = categories.joinToString(",") { escapeText(it) }
+                appendFoldedLine("CATEGORIES:$escaped")
+            }
+
+            if (priority != null) {
+                appendLine("PRIORITY:$priority")
+            }
+
+            if (!transp.isNullOrBlank()) {
+                appendLine("TRANSP:$transp")
+            }
+
             appendLine("END:VEVENT")
             appendLine("END:VCALENDAR")
         }.trimEnd()
+    }
+
+    /**
+     * Append VTIMEZONE component from ical4j registry.
+     */
+    private fun StringBuilder.appendVtimezone(timezoneId: String) {
+        try {
+            val registry = TimeZoneRegistryFactory.getInstance().createRegistry()
+            val tz = registry.getTimeZone(timezoneId) ?: return
+            val vtimezone = tz.vTimeZone ?: return
+            val tzStr = vtimezone.toString().trimEnd()
+            appendLine(tzStr)
+        } catch (_: Exception) {
+            // If timezone lookup fails, skip VTIMEZONE (event still valid with TZID)
+        }
     }
 
     /**
@@ -180,24 +239,42 @@ class IcsBuilder {
     /**
      * Append a line with RFC 5545 line folding.
      * Lines longer than 75 octets are folded with CRLF + space.
+     * Counts UTF-8 byte length (octets), not chars.
+     * Multi-byte chars (including surrogate pairs) are never split across fold boundaries.
      */
     private fun StringBuilder.appendFoldedLine(line: String) {
-        if (line.length <= MAX_LINE_LENGTH) {
+        val bytes = line.toByteArray(Charsets.UTF_8)
+        if (bytes.size <= MAX_LINE_OCTETS) {
             appendLine(line)
             return
         }
 
-        var remaining = line
+        var charOffset = 0
         var first = true
 
-        while (remaining.isNotEmpty()) {
-            val maxLen = if (first) MAX_LINE_LENGTH else MAX_LINE_LENGTH - 1  // Account for space prefix
-            val chunk = if (remaining.length <= maxLen) {
-                remaining
-            } else {
-                remaining.substring(0, maxLen)
+        while (charOffset < line.length) {
+            val maxOctets = if (first) MAX_LINE_OCTETS else MAX_LINE_OCTETS - 1 // space prefix
+            var chunkOctets = 0
+            var chunkEnd = charOffset
+
+            while (chunkEnd < line.length) {
+                // Get the full Unicode code point (handles surrogate pairs)
+                val codePoint = line.codePointAt(chunkEnd)
+                val cpChars = Character.charCount(codePoint)
+                val cpBytes = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8).size
+
+                if (chunkOctets + cpBytes > maxOctets) break
+                chunkOctets += cpBytes
+                chunkEnd += cpChars
             }
 
+            if (chunkEnd == charOffset) {
+                // Single code point exceeds limit — emit it anyway to avoid infinite loop
+                val codePoint = line.codePointAt(chunkEnd)
+                chunkEnd += Character.charCount(codePoint)
+            }
+
+            val chunk = line.substring(charOffset, chunkEnd)
             if (first) {
                 appendLine(chunk)
                 first = false
@@ -205,7 +282,7 @@ class IcsBuilder {
                 appendLine(" $chunk")
             }
 
-            remaining = remaining.substring(chunk.length)
+            charOffset = chunkEnd
         }
     }
 }

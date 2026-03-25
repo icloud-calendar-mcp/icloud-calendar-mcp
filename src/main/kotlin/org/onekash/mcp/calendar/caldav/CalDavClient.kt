@@ -85,4 +85,23 @@ interface CalDavClient {
      * @return Success or error
      */
     fun deleteEvent(href: String, etag: String?): CalDavResult<Unit>
+
+    /**
+     * Check connection to CalDAV server.
+     *
+     * Sends OPTIONS request and verifies DAV header contains 'calendar-access'.
+     *
+     * @return Success(true) if CalDAV is supported, error otherwise
+     */
+    fun checkConnection(): CalDavResult<Boolean>
+
+    /**
+     * Fetch ETags only (no calendar-data) for bandwidth optimization.
+     *
+     * @param calendarId Calendar ID
+     * @param startDate Start date (YYYY-MM-DD)
+     * @param endDate End date (YYYY-MM-DD)
+     * @return Map of href to etag
+     */
+    fun fetchEtags(calendarId: String, startDate: String, endDate: String): CalDavResult<Map<String, String?>>
 }

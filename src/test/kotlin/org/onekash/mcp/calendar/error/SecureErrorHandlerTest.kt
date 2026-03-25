@@ -396,6 +396,116 @@ class SecureErrorHandlerTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // HIERARCHICAL ERROR TYPES (Chunk 17)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `Validation error is not retryable`() {
+        val error = SecureErrorHandler.CalendarError.Validation(field = "title", detail = "Required")
+        assertFalse(error.isRetryable)
+        assertEquals("VALIDATION_ERROR", error.code)
+        assertEquals("Check input parameters and retry", error.suggestedAction)
+        assertEquals("Required", error.safeMessage())
+    }
+
+    @Test
+    fun `Authentication error is not retryable`() {
+        val error = SecureErrorHandler.CalendarError.Authentication()
+        assertFalse(error.isRetryable)
+        assertEquals(401, error.httpStatus)
+    }
+
+    @Test
+    fun `Authorization error includes calendar context`() {
+        val error = SecureErrorHandler.CalendarError.Authorization(calendarName = "Work")
+        assertFalse(error.isRetryable)
+        assertEquals("Work", error.calendarName)
+        assertEquals("Check calendar sharing permissions", error.suggestedAction)
+    }
+
+    @Test
+    fun `NotFound error includes resource info`() {
+        val error = SecureErrorHandler.CalendarError.NotFound(resourceType = "calendar", resourceId = "home")
+        assertEquals("calendar not found", error.safeMessage())
+        assertEquals("home", error.resourceId)
+    }
+
+    @Test
+    fun `Conflict error includes event context`() {
+        val error = SecureErrorHandler.CalendarError.Conflict(eventTitle = "Meeting")
+        assertEquals("Meeting", error.eventTitle)
+        assertEquals("Refresh and retry with updated data", error.suggestedAction)
+    }
+
+    @Test
+    fun `RateLimited error is retryable`() {
+        val error = SecureErrorHandler.CalendarError.RateLimited(retryAfterMs = 5000)
+        assertTrue(error.isRetryable)
+        assertEquals(5000, error.retryAfterMs)
+    }
+
+    @Test
+    fun `Network error is retryable`() {
+        val error = SecureErrorHandler.CalendarError.Network(reason = "Connection refused")
+        assertTrue(error.isRetryable)
+        assertEquals("Connection refused", error.safeMessage())
+    }
+
+    @Test
+    fun `Timeout error is retryable with code 408`() {
+        val error = SecureErrorHandler.CalendarError.Timeout(timeoutMs = 30000)
+        assertTrue(error.isRetryable)
+        assertEquals(408, error.httpStatus)
+    }
+
+    @Test
+    fun `ServerError is retryable`() {
+        val error = SecureErrorHandler.CalendarError.ServerError(serverCode = 503, reason = "Service Unavailable")
+        assertTrue(error.isRetryable)
+        assertEquals(503, error.httpStatus)
+    }
+
+    @Test
+    fun `Internal error is not retryable`() {
+        val error = SecureErrorHandler.CalendarError.Internal()
+        assertFalse(error.isRetryable)
+        assertEquals("An internal error occurred", error.safeMessage())
+    }
+
+    @Test
+    fun `toErrorCode maps correctly`() {
+        assertEquals(ErrorCode.VALIDATION_ERROR, SecureErrorHandler.CalendarError.Validation().toErrorCode())
+        assertEquals(ErrorCode.AUTHENTICATION_ERROR, SecureErrorHandler.CalendarError.Authentication().toErrorCode())
+        assertEquals(ErrorCode.NOT_FOUND, SecureErrorHandler.CalendarError.NotFound().toErrorCode())
+        assertEquals(ErrorCode.CONFLICT, SecureErrorHandler.CalendarError.Conflict().toErrorCode())
+        assertEquals(ErrorCode.RATE_LIMITED, SecureErrorHandler.CalendarError.RateLimited().toErrorCode())
+        assertEquals(ErrorCode.CALDAV_ERROR, SecureErrorHandler.CalendarError.Network().toErrorCode())
+        assertEquals(ErrorCode.CALDAV_ERROR, SecureErrorHandler.CalendarError.Timeout().toErrorCode())
+        assertEquals(ErrorCode.CALDAV_ERROR, SecureErrorHandler.CalendarError.ServerError().toErrorCode())
+        assertEquals(ErrorCode.INTERNAL_ERROR, SecureErrorHandler.CalendarError.Internal().toErrorCode())
+    }
+
+    @Test
+    fun `all error types have suggestedAction`() {
+        val errors = listOf(
+            SecureErrorHandler.CalendarError.Validation(),
+            SecureErrorHandler.CalendarError.Authentication(),
+            SecureErrorHandler.CalendarError.Authorization(),
+            SecureErrorHandler.CalendarError.NotFound(),
+            SecureErrorHandler.CalendarError.Conflict(),
+            SecureErrorHandler.CalendarError.RateLimited(),
+            SecureErrorHandler.CalendarError.Network(),
+            SecureErrorHandler.CalendarError.Timeout(),
+            SecureErrorHandler.CalendarError.ServerError(),
+            SecureErrorHandler.CalendarError.CalDav(),
+            SecureErrorHandler.CalendarError.Internal()
+        )
+        for (error in errors) {
+            assertTrue(error.suggestedAction.isNotBlank(), "${error::class.simpleName} missing suggestedAction")
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // ERROR CODE TESTS
     // ═══════════════════════════════════════════════════════════════════
 
@@ -409,6 +519,93 @@ class SecureErrorHandlerTest {
         assertEquals(429, ErrorCode.RATE_LIMITED.httpStatus)
         assertEquals(500, ErrorCode.INTERNAL_ERROR.httpStatus)
         assertEquals(502, ErrorCode.CALDAV_ERROR.httpStatus)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // EXCEPTION MAPPING (Chunk 18)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `fromException maps SocketTimeoutException to timeout`() {
+        val error = SecureErrorHandler.fromException(java.net.SocketTimeoutException("Read timed out"))
+        assertTrue(error is SecureErrorHandler.CalendarError.Timeout)
+        assertTrue(error.isRetryable)
+    }
+
+    @Test
+    fun `fromException maps UnknownHostException to network`() {
+        val error = SecureErrorHandler.fromException(java.net.UnknownHostException("caldav.icloud.com"))
+        assertTrue(error is SecureErrorHandler.CalendarError.Network)
+        assertTrue(error.isRetryable)
+    }
+
+    @Test
+    fun `fromException maps SSLException to auth error`() {
+        val error = SecureErrorHandler.fromException(javax.net.ssl.SSLException("cert error"))
+        assertTrue(error is SecureErrorHandler.CalendarError.Authentication)
+        assertFalse(error.isRetryable)
+    }
+
+    @Test
+    fun `fromException maps ConnectException to network`() {
+        val error = SecureErrorHandler.fromException(java.net.ConnectException("Connection refused"))
+        assertTrue(error is SecureErrorHandler.CalendarError.Network)
+        assertTrue(error.isRetryable)
+    }
+
+    @Test
+    fun `fromHttpCode maps 401 to auth`() {
+        val error = SecureErrorHandler.fromHttpCode(401)
+        assertTrue(error is SecureErrorHandler.CalendarError.Authentication)
+    }
+
+    @Test
+    fun `fromHttpCode maps 403 to authorization`() {
+        val error = SecureErrorHandler.fromHttpCode(403)
+        assertTrue(error is SecureErrorHandler.CalendarError.Authorization)
+    }
+
+    @Test
+    fun `fromHttpCode maps 429 to rate limited`() {
+        val error = SecureErrorHandler.fromHttpCode(429)
+        assertTrue(error is SecureErrorHandler.CalendarError.RateLimited)
+    }
+
+    @Test
+    fun `fromHttpCode maps 5xx to server error`() {
+        val error = SecureErrorHandler.fromHttpCode(503, "Service Unavailable")
+        assertTrue(error is SecureErrorHandler.CalendarError.ServerError)
+        assertTrue(error.isRetryable)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // EMAIL MASKING (Chunk 19)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `maskEmail masks standard email`() {
+        assertEquals("joh***@***.com", SecureErrorHandler.maskEmail("john.doe@icloud.com"))
+    }
+
+    @Test
+    fun `maskEmail handles short local part`() {
+        val result = SecureErrorHandler.maskEmail("ab@x.co")
+        assertTrue(result.contains("@"))
+        assertFalse(result.contains("ab@x.co"))
+    }
+
+    @Test
+    fun `maskEmail handles no at sign`() {
+        val result = SecureErrorHandler.maskEmail("no-at-sign")
+        assertFalse(result.contains("no-at-sign"))
+        assertTrue(result.contains("***"))
+    }
+
+    @Test
+    fun `maskEmail shows only TLD`() {
+        val result = SecureErrorHandler.maskEmail("user@sub.domain.com")
+        assertTrue(result.contains(".com"))
+        assertFalse(result.contains("sub.domain"))
     }
 
     // ═══════════════════════════════════════════════════════════════════

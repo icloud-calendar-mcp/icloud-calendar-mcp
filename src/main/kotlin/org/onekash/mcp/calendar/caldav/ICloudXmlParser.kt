@@ -19,6 +19,10 @@ class ICloudXmlParser {
 
     private val docBuilderFactory = DocumentBuilderFactory.newInstance().apply {
         isNamespaceAware = true
+        // Security: Enable secure processing (XMLConstants.FEATURE_SECURE_PROCESSING)
+        try {
+            setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true)
+        } catch (_: Exception) { }
         // Security: Disable external entities (gracefully handle if features not supported)
         try {
             setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
@@ -58,18 +62,19 @@ class ICloudXmlParser {
         // Get href
         val href = getElementText(response, "href") ?: return null
 
-        // Check if this is a calendar collection
-        if (!isCalendarCollection(response)) return null
+        // Get 200-status propstat subtree (scoped extraction)
+        val successProp = getSuccessPropElement(response) ?: return null
 
-        // Check status (must be 200 OK)
-        if (!hasSuccessStatus(response)) return null
+        // Check if this is a calendar collection (from 200-propstat only)
+        if (!isCalendarCollectionInProp(successProp)) return null
 
-        // Extract properties
-        val displayName = getElementText(response, "displayname") ?: extractCalendarIdFromHref(href)
-        val ctag = getElementText(response, "getctag")
-        val rawColor = getElementText(response, "calendar-color")
+        // Extract properties from 200-propstat subtree only
+        val displayName = getElementText(successProp, "displayname") ?: extractCalendarIdFromHref(href)
+        val ctag = getElementText(successProp, "getctag")
+        val rawColor = getElementText(successProp, "calendar-color")
         val color = normalizeColor(rawColor)
-        val isReadOnly = !hasWritePrivilege(response)
+        val isReadOnly = !hasWritePrivilegeInProp(successProp)
+        val supportedComponents = parseSupportedComponents(successProp)
 
         val id = extractCalendarIdFromHref(href)
         val url = buildUrl(baseUrl, href)
@@ -81,8 +86,30 @@ class ICloudXmlParser {
             displayName = displayName,
             color = color,
             ctag = ctag,
-            isReadOnly = isReadOnly
+            isReadOnly = isReadOnly,
+            supportedComponents = supportedComponents
         )
+    }
+
+    /**
+     * Get the <prop> element from the first propstat with 200 status.
+     * Propstat with no status element is treated as 200 (lenient).
+     * Returns null if no 200-status propstat found.
+     */
+    private fun getSuccessPropElement(response: Element): Element? {
+        val propstats = response.getElementsByTagNameNS("*", "propstat")
+        for (i in 0 until propstats.length) {
+            val propstat = propstats.item(i) as? Element ?: continue
+            val status = getElementText(propstat, "status")
+            // Treat missing status as 200 (lenient), or explicit 200
+            if (status == null || status.contains("200")) {
+                val props = propstat.getElementsByTagNameNS("*", "prop")
+                if (props.length > 0) {
+                    return props.item(0) as? Element
+                }
+            }
+        }
+        return null
     }
 
     private fun isCalendarCollection(response: Element): Boolean {
@@ -91,8 +118,20 @@ class ICloudXmlParser {
         if (resourceTypes.length == 0) return false
 
         val resourceType = resourceTypes.item(0) as? Element ?: return false
-        val children = resourceType.childNodes
+        return hasCalendarType(resourceType)
+    }
 
+    /** Check if <prop> element contains calendar resourcetype */
+    private fun isCalendarCollectionInProp(prop: Element): Boolean {
+        val resourceTypes = prop.getElementsByTagNameNS("*", "resourcetype")
+        if (resourceTypes.length == 0) return false
+
+        val resourceType = resourceTypes.item(0) as? Element ?: return false
+        return hasCalendarType(resourceType)
+    }
+
+    private fun hasCalendarType(resourceType: Element): Boolean {
+        val children = resourceType.childNodes
         for (i in 0 until children.length) {
             val child = children.item(i)
             if (child.nodeType == Node.ELEMENT_NODE) {
@@ -108,8 +147,43 @@ class ICloudXmlParser {
         if (privilegeSets.length == 0) return true  // Assume writable if no privilege info
 
         val privilegeSet = privilegeSets.item(0) as? Element ?: return true
-        val privileges = privilegeSet.getElementsByTagNameNS("*", "privilege")
+        return checkWriteInPrivilegeSet(privilegeSet)
+    }
 
+    /** Check write privilege scoped to a <prop> element */
+    private fun hasWritePrivilegeInProp(prop: Element): Boolean {
+        val privilegeSets = prop.getElementsByTagNameNS("*", "current-user-privilege-set")
+        if (privilegeSets.length == 0) return true  // Assume writable if no privilege info
+
+        val privilegeSet = privilegeSets.item(0) as? Element ?: return true
+        return checkWriteInPrivilegeSet(privilegeSet)
+    }
+
+    /**
+     * Parse supported-calendar-component-set from prop element.
+     * Returns set of component names (e.g., VEVENT, VTODO).
+     */
+    private fun parseSupportedComponents(prop: Element): Set<String> {
+        val compSets = prop.getElementsByTagNameNS("*", "supported-calendar-component-set")
+        if (compSets.length == 0) return emptySet()
+
+        val compSet = compSets.item(0) as? Element ?: return emptySet()
+        val comps = compSet.getElementsByTagNameNS("*", "comp")
+        val result = mutableSetOf<String>()
+
+        for (i in 0 until comps.length) {
+            val comp = comps.item(i) as? Element ?: continue
+            val name = comp.getAttribute("name")
+            if (name.isNotBlank()) {
+                result.add(name)
+            }
+        }
+
+        return result
+    }
+
+    private fun checkWriteInPrivilegeSet(privilegeSet: Element): Boolean {
+        val privileges = privilegeSet.getElementsByTagNameNS("*", "privilege")
         for (i in 0 until privileges.length) {
             val privilege = privileges.item(i) as? Element ?: continue
             val children = privilege.childNodes
@@ -117,7 +191,7 @@ class ICloudXmlParser {
                 val child = children.item(j)
                 if (child.nodeType == Node.ELEMENT_NODE) {
                     val localName = child.localName ?: child.nodeName.substringAfter(":")
-                    if (localName == "write") return true
+                    if (localName == "write" || localName == "write-content") return true
                 }
             }
         }
@@ -150,6 +224,29 @@ class ICloudXmlParser {
 
         val homeSet = homeSets.item(0) as? Element ?: return null
         return getElementText(homeSet, "href")
+    }
+
+    /**
+     * Parse all calendar-home-set hrefs from PROPFIND response (RFC 4791 §6.2.1).
+     * Returns all hrefs found across all calendar-home-set elements.
+     */
+    fun parseCalendarHomeSets(xml: String): List<String> {
+        val doc = parseXml(xml) ?: return emptyList()
+        val homeSets = doc.getElementsByTagNameNS("*", "calendar-home-set")
+        if (homeSets.length == 0) return emptyList()
+
+        val hrefs = mutableListOf<String>()
+        for (i in 0 until homeSets.length) {
+            val homeSet = homeSets.item(i) as? Element ?: continue
+            val hrefElements = homeSet.getElementsByTagNameNS("*", "href")
+            for (j in 0 until hrefElements.length) {
+                val href = hrefElements.item(j)?.textContent?.trim()
+                if (!href.isNullOrBlank()) {
+                    hrefs.add(href)
+                }
+            }
+        }
+        return hrefs
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -189,8 +286,8 @@ class ICloudXmlParser {
         // Extract UID from ICS
         val uid = extractUid(calendarData) ?: return null
 
-        // Get etag
-        val etag = getElementText(response, "getetag")
+        // Get etag (normalize to strip W/ prefix, quotes, XML entities)
+        val etag = EtagUtils.normalizeEtag(getElementText(response, "getetag"))
 
         val url = buildUrl(baseUrl, href)
 
@@ -295,7 +392,25 @@ class ICloudXmlParser {
         val etags = doc.getElementsByTagNameNS("*", "getetag")
         if (etags.length == 0) return null
 
-        return etags.item(0)?.textContent?.trim()
+        return EtagUtils.normalizeEtag(etags.item(0)?.textContent?.trim())
+    }
+
+    /**
+     * Parse all hrefs with etags from REPORT response (for bandwidth optimization).
+     * Returns Map of href to etag (etag may be null if not present).
+     */
+    fun parseEtags(xml: String): Map<String, String?> {
+        val doc = parseXml(xml) ?: return emptyMap()
+        val responses = doc.getElementsByTagNameNS("*", "response")
+        val etags = mutableMapOf<String, String?>()
+
+        for (i in 0 until responses.length) {
+            val response = responses.item(i) as? Element ?: continue
+            val href = getElementText(response, "href") ?: continue
+            val etag = EtagUtils.normalizeEtag(getElementText(response, "getetag"))
+            etags[href] = etag
+        }
+        return etags
     }
 
     // ═══════════════════════════════════════════════════════════════════

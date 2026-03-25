@@ -84,13 +84,14 @@ See [SECURITY.md](SECURITY.md) for security guidelines.
 
 ## Test Categories
 
-The project has 555 tests across these categories:
+The project has 768 tests across these categories:
 
-### Security Tests (239 tests)
+### Security Tests (282 tests)
 
 | Category | Tests | Description |
 |----------|-------|-------------|
 | `AdversarialTest` | 53 | SQL injection, XSS, path traversal, command injection |
+| `IcsPatcherAdversarialTest` | 43 | CRLF injection, property injection, encoding attacks |
 | `UnicodeSecurityTest` | 38 | Homoglyphs, normalization, RTL override |
 | `McpLoggerSecurityTest` | 31 | Log injection, credential sanitization |
 | `OwaspMcpSecurityTest` | 29 | OWASP MCP Top 10 attack vectors |
@@ -99,20 +100,21 @@ The project has 555 tests across these categories:
 | `CancellationSecurityTest` | 22 | Replay attacks, race conditions |
 | `CredentialManagerTest` | 14 | Token masking, secure storage |
 
-### Functional Tests (316 tests)
+### Functional Tests (486 tests)
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| CalDAV Protocol | 105 | XML parsing, HTTP client, models |
-| ICS Parsing | 48 | RFC 5545 compliance, edge cases |
+| CalDAV Protocol | 177 | XML parsing, HTTP client, models, ETag normalization |
+| ICS Format | 98 | RFC 5545 parsing, building, patching |
+| Error Handling | 56 | Secure error responses, credential sanitization |
+| Integration | 40 | End-to-end tools, MCP spec compliance, annotations |
 | Input Validation | 39 | All parameter validation rules |
-| Error Handling | 32 | Secure error responses |
-| Integration | 26 | End-to-end tool execution |
-| Service Layer | 21 | Calendar operations, caching |
+| Service Layer | 26 | Calendar operations, caching |
 | Rate Limiting | 15 | Concurrent access, window reset |
 | Cancellation | 12 | Operation cancellation, cleanup |
 | Logging | 9 | MCP logging compliance |
 | Progress | 9 | Progress reporting |
+| E2E | 5 | Live CalDAV + end-to-end integration |
 
 ## Pull Request Process
 
@@ -199,7 +201,7 @@ See [SECURITY.md](SECURITY.md) for responsible disclosure process.
 
 ```bash
 ./gradlew fatJar
-# Output: build/libs/icloud-calendar-mcp-1.0.0-all.jar
+# Output: build/libs/icloud-calendar-mcp-3.0.0-all.jar
 ```
 
 ### Testing with MCP Inspector
@@ -207,7 +209,7 @@ See [SECURITY.md](SECURITY.md) for responsible disclosure process.
 ```bash
 ICLOUD_USERNAME="test@icloud.com" \
 ICLOUD_PASSWORD="test-password" \
-npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-1.0.0-all.jar
+npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.0.0-all.jar
 ```
 
 ### Adding Security Tests

@@ -327,6 +327,224 @@ class IcsBuilderTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // LINE FOLDING - OCTET COUNTING (Chunk 12)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `emoji line folds at octet boundary not char boundary`() {
+        // Emoji 🎉 is 4 bytes in UTF-8. 18 emojis = 72 bytes for emoji chars
+        // "SUMMARY:" is 8 bytes. 8 + 72 = 80 > 75, must fold
+        val emojis = "🎉".repeat(18)
+        val ics = builder.build(
+            uid = "emoji@test",
+            summary = emojis,
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z"
+        )
+
+        // Verify no line exceeds 75 octets
+        val lines = ics.split("\r\n", "\n")
+        for (line in lines) {
+            val octets = line.toByteArray(Charsets.UTF_8).size
+            assertTrue(octets <= 75, "Line has $octets octets (max 75): ${line.take(40)}...")
+        }
+    }
+
+    @Test
+    fun `CJK characters fold correctly at octet boundary`() {
+        // CJK chars are 3 bytes each in UTF-8. 20 chars = 60 bytes
+        // "SUMMARY:" = 8 bytes, 8 + 60 = 68 <= 75, fits in first line
+        // 30 CJK chars = 90 bytes + 8 = 98, must fold
+        val cjk = "会".repeat(30)
+        val ics = builder.build(
+            uid = "cjk@test",
+            summary = cjk,
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z"
+        )
+
+        val lines = ics.split("\r\n", "\n")
+        for (line in lines) {
+            val octets = line.toByteArray(Charsets.UTF_8).size
+            assertTrue(octets <= 75, "Line has $octets octets (max 75)")
+        }
+    }
+
+    @Test
+    fun `ASCII lines still fold at 75 chars`() {
+        val longAscii = "A".repeat(100)
+        val ics = builder.build(
+            uid = "ascii@test",
+            summary = longAscii,
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z"
+        )
+
+        val lines = ics.split("\r\n", "\n")
+        for (line in lines) {
+            assertTrue(line.length <= 75, "Line too long: ${line.length}")
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXTENDED FIELDS (Chunk 12)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `build event with STATUS TENTATIVE`() {
+        val ics = builder.build(
+            uid = "status@test",
+            summary = "Maybe Meeting",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z",
+            status = "TENTATIVE"
+        )
+
+        assertTrue(ics.contains("STATUS:TENTATIVE"))
+    }
+
+    @Test
+    fun `build event with URL`() {
+        val ics = builder.build(
+            uid = "url@test",
+            summary = "Web Meeting",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z",
+            url = "https://meet.example.com/room"
+        )
+
+        assertTrue(ics.contains("URL:https://meet.example.com/room"))
+    }
+
+    @Test
+    fun `build event with CATEGORIES`() {
+        val ics = builder.build(
+            uid = "cat@test",
+            summary = "Categorized",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z",
+            categories = listOf("Work", "Meeting")
+        )
+
+        assertTrue(ics.contains("CATEGORIES:Work,Meeting"))
+    }
+
+    @Test
+    fun `build event with categories containing semicolons`() {
+        val ics = builder.build(
+            uid = "cat-esc@test",
+            summary = "Escaped",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z",
+            categories = listOf("Work;Important", "Meeting")
+        )
+
+        assertTrue(ics.contains("CATEGORIES:Work\\;Important,Meeting"))
+    }
+
+    @Test
+    fun `build event with PRIORITY`() {
+        val ics = builder.build(
+            uid = "pri@test",
+            summary = "High Priority",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z",
+            priority = 1
+        )
+
+        assertTrue(ics.contains("PRIORITY:1"))
+    }
+
+    @Test
+    fun `build event with TRANSP TRANSPARENT`() {
+        val ics = builder.build(
+            uid = "transp@test",
+            summary = "Free Time",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z",
+            transp = "TRANSPARENT"
+        )
+
+        assertTrue(ics.contains("TRANSP:TRANSPARENT"))
+    }
+
+    @Test
+    fun `null optional fields produce no empty lines`() {
+        val ics = builder.build(
+            uid = "minimal@test",
+            summary = "Minimal",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z"
+        )
+
+        assertFalse(ics.contains("STATUS:"))
+        assertFalse(ics.contains("URL:"))
+        assertFalse(ics.contains("CATEGORIES:"))
+        assertFalse(ics.contains("PRIORITY:"))
+        assertFalse(ics.contains("TRANSP:"))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // VTIMEZONE GENERATION (Chunk 14)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `build event with timezone includes VTIMEZONE`() {
+        val ics = builder.build(
+            uid = "vtz@test",
+            summary = "NYC Meeting",
+            startTime = "2025-01-15T10:00:00",
+            endTime = "2025-01-15T11:00:00",
+            timezone = "America/New_York"
+        )
+
+        assertTrue(ics.contains("BEGIN:VTIMEZONE"), "Should contain VTIMEZONE")
+        assertTrue(ics.contains("TZID:America/New_York") || ics.contains("TZID=America/New_York"),
+            "VTIMEZONE should reference the timezone")
+    }
+
+    @Test
+    fun `UTC times do not include VTIMEZONE`() {
+        val ics = builder.build(
+            uid = "utc-no-vtz@test",
+            summary = "UTC Meeting",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z",
+            timezone = "America/New_York"
+        )
+
+        assertFalse(ics.contains("BEGIN:VTIMEZONE"), "UTC should not have VTIMEZONE")
+    }
+
+    @Test
+    fun `no timezone param means no VTIMEZONE`() {
+        val ics = builder.build(
+            uid = "no-tz@test",
+            summary = "No TZ Meeting",
+            startTime = "2025-01-15T10:00:00Z",
+            endTime = "2025-01-15T11:00:00Z"
+        )
+
+        assertFalse(ics.contains("BEGIN:VTIMEZONE"))
+    }
+
+    @Test
+    fun `VTIMEZONE appears before VEVENT`() {
+        val ics = builder.build(
+            uid = "order@test",
+            summary = "Order Test",
+            startTime = "2025-01-15T10:00:00",
+            endTime = "2025-01-15T11:00:00",
+            timezone = "America/New_York"
+        )
+
+        val vtimezoneIdx = ics.indexOf("BEGIN:VTIMEZONE")
+        val veventIdx = ics.indexOf("BEGIN:VEVENT")
+        assertTrue(vtimezoneIdx >= 0, "VTIMEZONE should be present")
+        assertTrue(vtimezoneIdx < veventIdx, "VTIMEZONE should appear before VEVENT")
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // EDGE CASES
     // ═══════════════════════════════════════════════════════════════════════
 

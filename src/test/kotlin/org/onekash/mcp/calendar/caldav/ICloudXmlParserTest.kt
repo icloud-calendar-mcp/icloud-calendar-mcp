@@ -232,6 +232,172 @@ class ICloudXmlParserTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // MULTI-PROPSTAT SCOPING TESTS (Chunk 10)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parseCalendars scopes properties to 200-propstat only`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:CS="http://calendarserver.org/ns/">
+                <D:response>
+                    <D:href>/123/calendars/home/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>Home</D:displayname>
+                            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+                            <CS:getctag>ctag-200</CS:getctag>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                    <D:propstat>
+                        <D:prop>
+                            <CS:getctag>ctag-404-should-be-ignored</CS:getctag>
+                        </D:prop>
+                        <D:status>HTTP/1.1 404 Not Found</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val calendars = parser.parseCalendars(xml, "https://caldav.icloud.com")
+        assertEquals(1, calendars.size)
+        assertEquals("ctag-200", calendars[0].ctag)
+    }
+
+    @Test
+    fun `parseCalendars treats propstat with no status as 200`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                <D:response>
+                    <D:href>/123/calendars/home/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>No Status</D:displayname>
+                            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+                        </D:prop>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val calendars = parser.parseCalendars(xml, "https://caldav.icloud.com")
+        assertEquals(1, calendars.size)
+        assertEquals("No Status", calendars[0].displayName)
+    }
+
+    @Test
+    fun `parseCalendars ignores 403 propstat properties`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                <D:response>
+                    <D:href>/123/calendars/home/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>Visible</D:displayname>
+                            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>Forbidden Name</D:displayname>
+                        </D:prop>
+                        <D:status>HTTP/1.1 403 Forbidden</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val calendars = parser.parseCalendars(xml, "https://caldav.icloud.com")
+        assertEquals(1, calendars.size)
+        assertEquals("Visible", calendars[0].displayName)
+    }
+
+    @Test
+    fun `parseCalendars recognizes write-content privilege as writable`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                <D:response>
+                    <D:href>/123/calendars/home/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>Writable via write-content</D:displayname>
+                            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+                            <D:current-user-privilege-set>
+                                <D:privilege><D:read/></D:privilege>
+                                <D:privilege><D:write-content/></D:privilege>
+                            </D:current-user-privilege-set>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val calendars = parser.parseCalendars(xml, "https://caldav.icloud.com")
+        assertEquals(1, calendars.size)
+        assertFalse(calendars[0].isReadOnly)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SUPPORTED COMPONENTS (Chunk 11)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parseCalendars extracts supported components`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                <D:response>
+                    <D:href>/123/calendars/home/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>Home</D:displayname>
+                            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+                            <C:supported-calendar-component-set>
+                                <C:comp name="VEVENT"/>
+                                <C:comp name="VTODO"/>
+                            </C:supported-calendar-component-set>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val calendars = parser.parseCalendars(xml, "https://caldav.icloud.com")
+        assertEquals(1, calendars.size)
+        assertEquals(setOf("VEVENT", "VTODO"), calendars[0].supportedComponents)
+    }
+
+    @Test
+    fun `parseCalendars returns empty set when no supported components`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                <D:response>
+                    <D:href>/123/calendars/home/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <D:displayname>Home</D:displayname>
+                            <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val calendars = parser.parseCalendars(xml, "https://caldav.icloud.com")
+        assertEquals(1, calendars.size)
+        assertTrue(calendars[0].supportedComponents.isEmpty())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // CALENDAR PRINCIPAL DISCOVERY
     // ═══════════════════════════════════════════════════════════════════
 
@@ -329,7 +495,7 @@ class ICloudXmlParserTest {
         assertEquals("event-123@icloud.com", event.uid)
         assertEquals("/123/calendars/home/event-123.ics", event.href)
         assertEquals("https://caldav.icloud.com/123/calendars/home/event-123.ics", event.url)
-        assertEquals("\"etag-abc\"", event.etag)
+        assertEquals("etag-abc", event.etag)
         assertTrue(event.icalData.contains("SUMMARY:Meeting"))
     }
 
@@ -596,7 +762,7 @@ class ICloudXmlParserTest {
             </D:multistatus>
         """.trimIndent()
 
-        assertEquals("\"new-etag-123\"", parser.parseEtag(xml))
+        assertEquals("new-etag-123", parser.parseEtag(xml))
     }
 
     @Test
@@ -611,5 +777,127 @@ class ICloudXmlParserTest {
         """.trimIndent()
 
         assertNull(parser.parseEtag(xml))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MULTIPLE HOME SETS (Chunk 9)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parseCalendarHomeSets returns multiple hrefs`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                <D:response>
+                    <D:href>/principal/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <C:calendar-home-set>
+                                <D:href>/123/calendars/</D:href>
+                                <D:href>/123/shared/</D:href>
+                            </C:calendar-home-set>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val homeSets = parser.parseCalendarHomeSets(xml)
+        assertEquals(2, homeSets.size)
+        assertEquals("/123/calendars/", homeSets[0])
+        assertEquals("/123/shared/", homeSets[1])
+    }
+
+    @Test
+    fun `parseCalendarHomeSets returns single-item list for one href`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                <D:response>
+                    <D:href>/principal/</D:href>
+                    <D:propstat>
+                        <D:prop>
+                            <C:calendar-home-set>
+                                <D:href>/123/calendars/</D:href>
+                            </C:calendar-home-set>
+                        </D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val homeSets = parser.parseCalendarHomeSets(xml)
+        assertEquals(1, homeSets.size)
+        assertEquals("/123/calendars/", homeSets[0])
+    }
+
+    @Test
+    fun `parseCalendarHomeSets returns empty list when no home sets`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:">
+                <D:response>
+                    <D:href>/</D:href>
+                    <D:propstat><D:prop></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val homeSets = parser.parseCalendarHomeSets(xml)
+        assertTrue(homeSets.isEmpty())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ETAG MAP PARSING (Chunk 21)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parseEtags returns map of href to etag`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:">
+                <D:response>
+                    <D:href>/cal/event1.ics</D:href>
+                    <D:propstat>
+                        <D:prop><D:getetag>"etag-a"</D:getetag></D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+                <D:response>
+                    <D:href>/cal/event2.ics</D:href>
+                    <D:propstat>
+                        <D:prop><D:getetag>"etag-b"</D:getetag></D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val etags = parser.parseEtags(xml)
+        assertEquals(2, etags.size)
+        assertEquals("etag-a", etags["/cal/event1.ics"])
+        assertEquals("etag-b", etags["/cal/event2.ics"])
+    }
+
+    @Test
+    fun `parseEtags handles missing etag`() {
+        val xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:">
+                <D:response>
+                    <D:href>/cal/event.ics</D:href>
+                    <D:propstat>
+                        <D:prop></D:prop>
+                        <D:status>HTTP/1.1 200 OK</D:status>
+                    </D:propstat>
+                </D:response>
+            </D:multistatus>
+        """.trimIndent()
+
+        val etags = parser.parseEtags(xml)
+        assertEquals(1, etags.size)
+        assertNull(etags["/cal/event.ics"])
     }
 }

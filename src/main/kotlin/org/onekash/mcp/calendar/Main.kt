@@ -1,5 +1,6 @@
 package org.onekash.mcp.calendar
 
+import io.modelcontextprotocol.kotlin.sdk.server.RegisteredResource
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport
@@ -17,6 +18,7 @@ import org.onekash.mcp.calendar.security.CredentialManager
 import org.onekash.mcp.calendar.ratelimit.RateLimiter
 import org.onekash.mcp.calendar.service.CalendarService
 import org.onekash.mcp.calendar.service.ServiceResult
+import org.onekash.mcp.calendar.logging.McpLogger
 import org.onekash.mcp.calendar.validation.InputValidator
 import org.onekash.mcp.calendar.validation.InputValidator.ValidationResult
 
@@ -52,12 +54,19 @@ fun main(args: Array<String>) {
     }
 
     // Create CalendarService with iCloud CalDAV client
-    val calendarService = createCalendarService()
+    val (calendarService, calDavClient) = createCalendarService()
+
+    // Register shutdown hook for graceful cleanup
+    if (calDavClient != null) {
+        Runtime.getRuntime().addShutdownHook(Thread {
+            calDavClient.close()
+        })
+    }
 
     val server = Server(
         serverInfo = Implementation(
             name = "icloud-calendar-mcp",
-            version = "2.0.0"
+            version = "3.0.0"
         ),
         options = ServerOptions(
             capabilities = ServerCapabilities(
@@ -68,8 +77,11 @@ fun main(args: Array<String>) {
         )
     )
 
+    // Create audit logger for CUD operations (MCP08 compliance)
+    val logger = McpLogger(server)
+
     // Register tools with security measures
-    registerTools(server, calendarService)
+    registerTools(server, calendarService, logger)
 
     // Register resources for browsing calendars
     registerResources(server, calendarService)
@@ -79,7 +91,16 @@ fun main(args: Array<String>) {
         inputStream = System.`in`.asSource().buffered(),
         outputStream = System.out.asSink().buffered()
     )
-    server.createSession(transport)
+    val session = server.createSession(transport)
+
+    // Keep the process alive until the transport closes
+    session.onClose {
+        // Session closed, process will exit
+    }
+
+    // Block until stdin is closed (transport handles read loop internally)
+    // The coroutine scope keeps the process alive while the session is active
+    kotlinx.coroutines.awaitCancellation()
     }
 }
 
@@ -87,9 +108,9 @@ fun main(args: Array<String>) {
  * Create CalendarService with iCloud CalDAV client.
  * Returns null if credentials are not configured.
  */
-private fun createCalendarService(): CalendarService? {
+private fun createCalendarService(): Pair<CalendarService?, OkHttpCalDavClient?> {
     return try {
-        val credentials = CredentialManager.loadFromEnvironment() ?: return null
+        val credentials = CredentialManager.loadFromEnvironment() ?: return Pair(null, null)
         val client = OkHttpCalDavClient(
             baseUrl = ICLOUD_CALDAV_URL,
             credentials = CalDavCredentials(
@@ -97,23 +118,31 @@ private fun createCalendarService(): CalendarService? {
                 password = credentials.password
             )
         )
-        CalendarService(client)
+        Pair(CalendarService(client), client)
     } catch (e: Exception) {
         System.err.println("Failed to initialize CalendarService: ${e.message}")
-        null
+        Pair(null, null)
     }
 }
 
-private fun registerTools(server: Server, calendarService: CalendarService?) {
+private fun registerTools(server: Server, calendarService: CalendarService?, logger: McpLogger) {
     // ═══════════════════════════════════════════════════════════════════
     // TOOL: list_calendars
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "list_calendars",
         description = "List all calendars from the connected iCloud account",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject { },
-            required = emptyList()
+        title = "List Calendars",
+        inputSchema = ToolSchema(),
+        outputSchema = ToolSchema(
+            properties = buildJsonObject {
+                put("calendars", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("List of calendars"))
+                    put("items", buildJsonObject { put("type", JsonPrimitive("object")) })
+                })
+            },
+            required = listOf("calendars")
         ),
         toolAnnotations = ToolAnnotations(
             readOnlyHint = true,
@@ -146,6 +175,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                                     put("name", cal.name)
                                     cal.color?.let { put("color", it) }
                                     put("readOnly", cal.readOnly)
+                                    if (cal.supportedComponents.isNotEmpty()) {
+                                        putJsonArray("supportedComponents") {
+                                            cal.supportedComponents.forEach { add(it) }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -169,6 +203,7 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
     server.addTool(
         name = "get_events",
         description = "Get events from a calendar within a date range",
+        title = "Get Events",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 put("calendar_id", buildJsonObject {
@@ -185,6 +220,16 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                 })
             },
             required = listOf("calendar_id", "start_date", "end_date")
+        ),
+        outputSchema = ToolSchema(
+            properties = buildJsonObject {
+                put("events", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("List of events"))
+                    put("items", buildJsonObject { put("type", JsonPrimitive("object")) })
+                })
+            },
+            required = listOf("events")
         ),
         toolAnnotations = ToolAnnotations(
             readOnlyHint = true,
@@ -242,6 +287,16 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                                         event.endTime?.let { put("endTime", it) }
                                     }
                                     event.rrule?.let { put("rrule", it) }
+                                    event.status?.let { put("status", it) }
+                                    event.url?.let { put("url", it) }
+                                    if (event.categories.isNotEmpty()) {
+                                        putJsonArray("categories") {
+                                            event.categories.forEach { add(it) }
+                                        }
+                                    }
+                                    event.priority?.let { put("priority", it) }
+                                    event.organizer?.let { put("organizer", it) }
+                                    if (event.attendeeCount > 0) put("attendeeCount", event.attendeeCount)
                                 }
                             }
                         }
@@ -265,6 +320,7 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
     server.addTool(
         name = "create_event",
         description = "Create a new calendar event",
+        title = "Create Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 put("calendar_id", buildJsonObject {
@@ -303,8 +359,25 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                     put("type", JsonPrimitive("string"))
                     put("description", JsonPrimitive("End date for all-day events (YYYY-MM-DD, inclusive)"))
                 })
+                put("timezone", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("IANA timezone for non-UTC timed events (e.g., America/New_York)"))
+                })
+                put("rrule", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("Recurrence rule (e.g., FREQ=WEEKLY;BYDAY=MO)"))
+                })
             },
             required = listOf("calendar_id", "title")
+        ),
+        outputSchema = ToolSchema(
+            properties = buildJsonObject {
+                put("success", buildJsonObject { put("type", JsonPrimitive("boolean")) })
+                put("uid", buildJsonObject { put("type", JsonPrimitive("string")) })
+                put("summary", buildJsonObject { put("type", JsonPrimitive("string")) })
+                put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
+            },
+            required = listOf("success", "uid", "summary", "message")
         ),
         toolAnnotations = ToolAnnotations(
             readOnlyHint = false,
@@ -330,6 +403,8 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
             val isAllDay = args["is_all_day"]?.jsonPrimitive?.booleanOrNull ?: false
             val startDate = args["start_date"]?.jsonPrimitive?.content
             val endDate = args["end_date"]?.jsonPrimitive?.content
+            val timezone = args["timezone"]?.jsonPrimitive?.content
+            val rrule = args["rrule"]?.jsonPrimitive?.content
 
             // Validate required inputs
             val errors = mutableListOf<String>()
@@ -389,11 +464,18 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                 endDate = if (isAllDay) endDate else null,
                 isAllDay = isAllDay,
                 description = safeDescription,
-                location = safeLocation
+                location = safeLocation,
+                timezone = timezone,
+                rrule = rrule
             )
 
             when (result) {
                 is ServiceResult.Success -> {
+                    logger.info("Event created", mapOf(
+                        "tool" to "create_event",
+                        "uid" to result.data.uid,
+                        "calendar" to calendarId
+                    ))
                     val eventJson = buildJsonObject {
                         put("success", true)
                         put("uid", result.data.uid)
@@ -405,6 +487,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                     )
                 }
                 is ServiceResult.Error -> {
+                    logger.warning("Event creation failed", mapOf(
+                        "tool" to "create_event",
+                        "calendar" to calendarId,
+                        "code" to result.code
+                    ))
                     SecureErrorHandler.serviceError(result.code, result.message)
                 }
             }
@@ -419,6 +506,7 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
     server.addTool(
         name = "update_event",
         description = "Update an existing calendar event. First use get_events to find the event UID.",
+        title = "Update Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 put("event_id", buildJsonObject {
@@ -445,8 +533,36 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                     put("type", JsonPrimitive("string"))
                     put("description", JsonPrimitive("New description (optional)"))
                 })
+                put("is_all_day", buildJsonObject {
+                    put("type", JsonPrimitive("boolean"))
+                    put("description", JsonPrimitive("Change to all-day event (optional)"))
+                })
+                put("start_date", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("New start date for all-day events (YYYY-MM-DD)"))
+                })
+                put("end_date", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("New end date for all-day events (YYYY-MM-DD, inclusive)"))
+                })
+                put("timezone", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("IANA timezone for non-UTC timed events (e.g., America/New_York)"))
+                })
+                put("rrule", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("Recurrence rule (e.g., FREQ=WEEKLY;BYDAY=MO)"))
+                })
             },
             required = listOf("event_id")
+        ),
+        outputSchema = ToolSchema(
+            properties = buildJsonObject {
+                put("success", buildJsonObject { put("type", JsonPrimitive("boolean")) })
+                put("uid", buildJsonObject { put("type", JsonPrimitive("string")) })
+                put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
+            },
+            required = listOf("success", "uid", "message")
         ),
         toolAnnotations = ToolAnnotations(
             readOnlyHint = false,
@@ -469,6 +585,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
             val endTime = args["end_time"]?.jsonPrimitive?.content
             val location = args["location"]?.jsonPrimitive?.content
             val description = args["description"]?.jsonPrimitive?.content
+            val isAllDay = args["is_all_day"]?.jsonPrimitive?.booleanOrNull
+            val startDate = args["start_date"]?.jsonPrimitive?.content
+            val endDate = args["end_date"]?.jsonPrimitive?.content
+            val timezone = args["timezone"]?.jsonPrimitive?.content
+            val rrule = args["rrule"]?.jsonPrimitive?.content
 
             // Validate event ID (required)
             val errors = mutableListOf<String>()
@@ -533,12 +654,22 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                 summary = safeTitle,
                 startTime = startTime,
                 endTime = endTime,
+                startDate = startDate,
+                endDate = endDate,
+                isAllDay = isAllDay,
                 description = safeDescription,
-                location = safeLocation
+                location = safeLocation,
+                timezone = timezone,
+                rrule = rrule
             )
 
             when (result) {
                 is ServiceResult.Success -> {
+                    logger.info("Event updated", mapOf(
+                        "tool" to "update_event",
+                        "uid" to result.data.uid,
+                        "eventId" to eventId
+                    ))
                     val eventJson = buildJsonObject {
                         put("success", true)
                         put("uid", result.data.uid)
@@ -549,6 +680,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                     )
                 }
                 is ServiceResult.Error -> {
+                    logger.warning("Event update failed", mapOf(
+                        "tool" to "update_event",
+                        "eventId" to eventId,
+                        "code" to result.code
+                    ))
                     SecureErrorHandler.serviceError(result.code, result.message)
                 }
             }
@@ -563,6 +699,7 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
     server.addTool(
         name = "delete_event",
         description = "Delete a calendar event. First use get_events to find the event UID.",
+        title = "Delete Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 put("event_id", buildJsonObject {
@@ -571,6 +708,13 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                 })
             },
             required = listOf("event_id")
+        ),
+        outputSchema = ToolSchema(
+            properties = buildJsonObject {
+                put("success", buildJsonObject { put("type", JsonPrimitive("boolean")) })
+                put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
+            },
+            required = listOf("success", "message")
         ),
         toolAnnotations = ToolAnnotations(
             readOnlyHint = false,
@@ -604,6 +748,10 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
 
             when (val result = calendarService.deleteEvent(eventId!!)) {
                 is ServiceResult.Success -> {
+                    logger.info("Event deleted", mapOf(
+                        "tool" to "delete_event",
+                        "eventId" to eventId
+                    ))
                     val responseJson = buildJsonObject {
                         put("success", true)
                         put("message", "Event deleted successfully")
@@ -613,6 +761,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
                     )
                 }
                 is ServiceResult.Error -> {
+                    logger.warning("Event deletion failed", mapOf(
+                        "tool" to "delete_event",
+                        "eventId" to eventId,
+                        "code" to result.code
+                    ))
                     SecureErrorHandler.serviceError(result.code, result.message)
                 }
             }
@@ -623,83 +776,62 @@ private fun registerTools(server: Server, calendarService: CalendarService?) {
 }
 
 /**
- * Register resources for browsing calendars and events.
+ * Register resources for browsing calendars.
  *
  * Resources provide a read-only view of calendar data:
  * - calendar://calendars - List all calendars
- * - calendar://calendars/{id} - Single calendar details
- * - calendar://events/{uid} - Single event details
  */
 private fun registerResources(server: Server, calendarService: CalendarService?) {
-    // Resource: List all calendars
-    server.addResource(
-        uri = "calendar://calendars",
-        name = "iCloud Calendars",
-        description = "List of all calendars in the connected iCloud account",
-        mimeType = "application/json"
-    ) { _ ->
-        // Check rate limit (read operation)
-        val rateResult = rateLimiter.acquireReadWithStatus()
-        if (!rateResult.allowed) {
-            return@addResource ReadResourceResult(
-                contents = listOf(
-                    TextResourceContents(
-                        uri = "calendar://calendars",
-                        mimeType = "application/json",
-                        text = """{"error": "Rate limit exceeded", "retryAfterMs": ${rateResult.retryAfterMs}}"""
-                    )
-                )
-            )
-        }
+    server.addResources(listOf(
+        RegisteredResource(
+            resource = Resource(
+                uri = "calendar://calendars",
+                name = "iCloud Calendars",
+                description = "List of all calendars in the connected iCloud account",
+                mimeType = "application/json",
+                title = "iCloud Calendars"
+            ),
+            readHandler = { _ ->
+                // Check rate limit (read operation)
+                val rateResult = rateLimiter.acquireReadWithStatus()
+                if (!rateResult.allowed) {
+                    throw McpException(-32000, "Rate limit exceeded. Retry after ${rateResult.retryAfterMs}ms")
+                }
 
-        if (calendarService == null) {
-            return@addResource ReadResourceResult(
-                contents = listOf(
-                    TextResourceContents(
-                        uri = "calendar://calendars",
-                        mimeType = "application/json",
-                        text = """{"error": "iCloud credentials not configured"}"""
-                    )
-                )
-            )
-        }
+                if (calendarService == null) {
+                    throw McpException(-32001, "iCloud credentials not configured")
+                }
 
-        when (val result = calendarService.listCalendars()) {
-            is ServiceResult.Success -> {
-                val calendarsJson = buildJsonObject {
-                    putJsonArray("calendars") {
-                        result.data.forEach { cal ->
-                            addJsonObject {
-                                put("id", cal.id)
-                                put("name", cal.name)
-                                put("uri", "calendar://calendars/${cal.id}")
-                                cal.color?.let { put("color", it) }
-                                put("readOnly", cal.readOnly)
+                when (val result = calendarService.listCalendars()) {
+                    is ServiceResult.Success -> {
+                        val calendarsJson = buildJsonObject {
+                            putJsonArray("calendars") {
+                                result.data.forEach { cal ->
+                                    addJsonObject {
+                                        put("id", cal.id)
+                                        put("name", cal.name)
+                                        put("uri", "calendar://calendars/${cal.id}")
+                                        cal.color?.let { put("color", it) }
+                                        put("readOnly", cal.readOnly)
+                                    }
+                                }
                             }
                         }
+                        ReadResourceResult(
+                            contents = listOf(
+                                TextResourceContents(
+                                    uri = "calendar://calendars",
+                                    mimeType = "application/json",
+                                    text = calendarsJson.toString()
+                                )
+                            )
+                        )
+                    }
+                    is ServiceResult.Error -> {
+                        throw McpException(-32002, "Calendar service error: ${result.message}")
                     }
                 }
-                ReadResourceResult(
-                    contents = listOf(
-                        TextResourceContents(
-                            uri = "calendar://calendars",
-                            mimeType = "application/json",
-                            text = calendarsJson.toString()
-                        )
-                    )
-                )
             }
-            is ServiceResult.Error -> {
-                ReadResourceResult(
-                    contents = listOf(
-                        TextResourceContents(
-                            uri = "calendar://calendars",
-                            mimeType = "application/json",
-                            text = """{"error": "${result.message}"}"""
-                        )
-                    )
-                )
-            }
-        }
-    }
+        )
+    ))
 }

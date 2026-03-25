@@ -424,6 +424,156 @@ class IcsParserTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // EXTENDED FIELDS (Chunk 13)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parse event with STATUS TENTATIVE`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:status@test
+            DTSTART:20250115T090000Z
+            DTEND:20250115T100000Z
+            SUMMARY:Maybe Meeting
+            STATUS:TENTATIVE
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals("TENTATIVE", events[0].status)
+    }
+
+    @Test
+    fun `parse event with URL`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:url@test
+            DTSTART:20250115T090000Z
+            DTEND:20250115T100000Z
+            SUMMARY:Web Meeting
+            URL:https://meet.example.com/room
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals("https://meet.example.com/room", events[0].url)
+    }
+
+    @Test
+    fun `parse event with CATEGORIES`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:cat@test
+            DTSTART:20250115T090000Z
+            DTEND:20250115T100000Z
+            SUMMARY:Categorized
+            CATEGORIES:Work,Meeting
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals(listOf("Work", "Meeting"), events[0].categories)
+    }
+
+    @Test
+    fun `parse event with PRIORITY`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:pri@test
+            DTSTART:20250115T090000Z
+            DTEND:20250115T100000Z
+            SUMMARY:High Priority
+            PRIORITY:1
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals(1, events[0].priority)
+    }
+
+    @Test
+    fun `parse event with ORGANIZER`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:org@test
+            DTSTART:20250115T090000Z
+            DTEND:20250115T100000Z
+            SUMMARY:Organized
+            ORGANIZER;CN=John Doe:mailto:john@example.com
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals("John Doe <john@example.com>", events[0].organizer)
+    }
+
+    @Test
+    fun `parse event with ATTENDEE count`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:att@test
+            DTSTART:20250115T090000Z
+            DTEND:20250115T100000Z
+            SUMMARY:Team Meeting
+            ATTENDEE;CN=Alice:mailto:alice@example.com
+            ATTENDEE;CN=Bob:mailto:bob@example.com
+            ATTENDEE;CN=Charlie:mailto:charlie@example.com
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals(3, events[0].attendeeCount)
+    }
+
+    @Test
+    fun `parse event with no extended fields has defaults`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:default@test
+            DTSTART:20250115T090000Z
+            DTEND:20250115T100000Z
+            SUMMARY:Plain Event
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertNull(events[0].status)
+        assertNull(events[0].url)
+        assertTrue(events[0].categories.isEmpty())
+        assertNull(events[0].priority)
+        assertNull(events[0].organizer)
+        assertEquals(0, events[0].attendeeCount)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // SPECIAL CHARACTERS (International)
     // ═══════════════════════════════════════════════════════════════════
 

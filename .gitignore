@@ -25,6 +25,7 @@ CLAUDE.md
 
 # Internal documentation (references private repos)
 IMPLEMENTATION_PLAN.md
+docs/
 
 # Credentials (never commit)
 credentials.json

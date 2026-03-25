@@ -5,6 +5,7 @@ import net.fortuna.ical4j.model.Calendar
 import net.fortuna.ical4j.model.Property
 import net.fortuna.ical4j.model.component.VEvent
 import net.fortuna.ical4j.model.property.*
+import net.fortuna.ical4j.model.parameter.Cn
 import net.fortuna.ical4j.model.parameter.TzId
 import java.io.StringReader
 import java.time.*
@@ -27,7 +28,13 @@ data class ParsedEvent(
     val endTime: String? = null,        // ISO 8601 UTC for timed events
     val startDate: String? = null,      // YYYY-MM-DD for all-day events
     val endDate: String? = null,        // YYYY-MM-DD for all-day events (inclusive)
-    val rrule: String? = null           // Raw RRULE string if recurring
+    val rrule: String? = null,          // Raw RRULE string if recurring
+    val status: String? = null,         // TENTATIVE, CONFIRMED, CANCELLED
+    val url: String? = null,            // URL property
+    val categories: List<String> = emptyList(), // CATEGORIES
+    val priority: Int? = null,          // PRIORITY (1=highest, 9=lowest)
+    val organizer: String? = null,      // Formatted: "Name <email>" or just email
+    val attendeeCount: Int = 0          // Number of ATTENDEEs
 )
 
 /**
@@ -70,8 +77,8 @@ class IcsParser {
 
     private fun parseEvent(vevent: VEvent): ParsedEvent? {
         // Skip cancelled events
-        val status = vevent.getProperty<Status>(Property.STATUS)
-        if (status?.value == "CANCELLED") return null
+        val statusProp = vevent.getProperty<Status>(Property.STATUS)
+        if (statusProp?.value == "CANCELLED") return null
 
         // Require summary
         val summary = vevent.summary?.value ?: return null
@@ -90,11 +97,37 @@ class IcsParser {
         // Get RRULE if present
         val rrule = vevent.getProperty<RRule>(Property.RRULE)?.value
 
-        return if (isAllDay) {
+        // Extended fields
+        val status = statusProp?.value
+        val url = vevent.getProperty<Url>(Property.URL)?.value?.toString()
+        val categories = vevent.getProperty<Categories>(Property.CATEGORIES)
+            ?.categories?.toList() ?: emptyList()
+        val priority = vevent.getProperty<Priority>(Property.PRIORITY)?.level
+        val organizer = parseOrganizer(vevent)
+        val attendeeCount = vevent.getProperties<Attendee>(Property.ATTENDEE).size
+
+        val base = if (isAllDay) {
             parseAllDayEvent(uid, summary, description, location, rrule, vevent)
         } else {
             parseTimedEvent(uid, summary, description, location, rrule, vevent)
         }
+
+        return base.copy(
+            status = status,
+            url = url,
+            categories = categories,
+            priority = priority,
+            organizer = organizer,
+            attendeeCount = attendeeCount
+        )
+    }
+
+    private fun parseOrganizer(vevent: VEvent): String? {
+        val organizer = vevent.getProperty<Organizer>(Property.ORGANIZER) ?: return null
+        val calAddress = organizer.calAddress?.toString() ?: return null
+        val email = calAddress.removePrefix("mailto:")
+        val cn = organizer.getParameter<Cn>(net.fortuna.ical4j.model.Parameter.CN)?.value
+        return if (cn != null) "$cn <$email>" else email
     }
 
     private fun isAllDayEvent(dtStart: DtStart): Boolean {

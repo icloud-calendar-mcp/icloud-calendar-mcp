@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-03-25
+
+### Added
+- IcsPatcher for editing existing events (CRLF injection sanitization)
+- EtagUtils with RFC 7232 normalization at all entry points
+- IcsBuilder VTIMEZONE support and UTF-8 octet line folding
+- Extended event properties: status, url, categories, priority, organizer, attendees
+- CalDavResult factory methods: badRequest, payloadTooLarge, rateLimit, sslError
+- Content-Length early rejection in readBodyWithLimit
+- Retry with exponential backoff, circuit breaker, rate limit handling
+- Multi-homeset calendar discovery (RFC 4791)
+- fetchEtags for efficient sync (ETag-only REPORT)
+- McpLogger for CUD operation audit logging
+- 43 adversarial security tests (ICS injection, prompt injection, OWASP MCP Top 10)
+- E2E integration test suite
+- Version catalog (gradle/libs.versions.toml)
+
+### Fixed
+- MCP server exiting immediately (connect + awaitCancellation)
+- isConflict now checks both HTTP 409 and 412
+- ETag normalization applied consistently across XML parser and HTTP headers
+
+### Changed
+- Bumped all package versions to 3.0.0 (npm, PyPI, JAR)
+- 768 tests passing (up from 555)
+
 ## [2.0.0] - 2026-01-14
 
 ### Added

@@ -26,10 +26,13 @@ class ToolAnnotationsTest {
             )
         )
 
-        // Register tools with annotations (matching Main.kt)
+        // Register tools with annotations (matching Main.kt).
+        // Note: outputSchema is intentionally omitted — this test only verifies annotations.
+        // See McpSpecComplianceTest for outputSchema coverage.
         server.addTool(
             name = "list_calendars",
             description = "List all calendars",
+            title = "List Calendars",
             inputSchema = ToolSchema(properties = buildJsonObject { }, required = emptyList()),
             toolAnnotations = ToolAnnotations(
                 readOnlyHint = true,
@@ -42,6 +45,7 @@ class ToolAnnotationsTest {
         server.addTool(
             name = "get_events",
             description = "Get events",
+            title = "Get Events",
             inputSchema = ToolSchema(properties = buildJsonObject { }, required = emptyList()),
             toolAnnotations = ToolAnnotations(
                 readOnlyHint = true,
@@ -54,6 +58,7 @@ class ToolAnnotationsTest {
         server.addTool(
             name = "create_event",
             description = "Create event",
+            title = "Create Event",
             inputSchema = ToolSchema(properties = buildJsonObject { }, required = emptyList()),
             toolAnnotations = ToolAnnotations(
                 readOnlyHint = false,
@@ -66,6 +71,7 @@ class ToolAnnotationsTest {
         server.addTool(
             name = "update_event",
             description = "Update event",
+            title = "Update Event",
             inputSchema = ToolSchema(properties = buildJsonObject { }, required = emptyList()),
             toolAnnotations = ToolAnnotations(
                 readOnlyHint = false,
@@ -78,6 +84,7 @@ class ToolAnnotationsTest {
         server.addTool(
             name = "delete_event",
             description = "Delete event",
+            title = "Delete Event",
             inputSchema = ToolSchema(properties = buildJsonObject { }, required = emptyList()),
             toolAnnotations = ToolAnnotations(
                 readOnlyHint = false,

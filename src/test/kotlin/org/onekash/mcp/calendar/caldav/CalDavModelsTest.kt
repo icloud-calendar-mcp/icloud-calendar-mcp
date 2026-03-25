@@ -6,6 +6,7 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertFailsWith
 
 /**
  * Tests for CalDAV data models.
@@ -163,6 +164,180 @@ class CalDavModelsTest {
         assertTrue(CalDavResult.Error(502, "Bad Gateway").isServerError)
         assertTrue(CalDavResult.Error(503, "Unavailable").isServerError)
         assertFalse(CalDavResult.Error(400, "Bad Request").isServerError)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // CalDavResult FACTORY METHODS
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `authError factory creates 401 non-retryable error`() {
+        val error = CalDavResult.Error.authError()
+        assertEquals(401, error.code)
+        assertTrue(error.isAuthError)
+        assertFalse(error.isRetryable)
+    }
+
+    @Test
+    fun `forbiddenError factory creates 403 non-retryable error`() {
+        val error = CalDavResult.Error.forbiddenError()
+        assertEquals(403, error.code)
+        assertTrue(error.isAuthError)
+        assertFalse(error.isRetryable)
+    }
+
+    @Test
+    fun `notFoundError factory creates 404 non-retryable error`() {
+        val error = CalDavResult.Error.notFoundError()
+        assertEquals(404, error.code)
+        assertTrue(error.isNotFound)
+        assertFalse(error.isRetryable)
+    }
+
+    @Test
+    fun `timeoutError factory creates 408 retryable error`() {
+        val error = CalDavResult.Error.timeoutError()
+        assertEquals(408, error.code)
+        assertTrue(error.isRetryable)
+    }
+
+    @Test
+    fun `conflictError factory creates 412 non-retryable error`() {
+        val error = CalDavResult.Error.conflictError()
+        assertEquals(412, error.code)
+        assertTrue(error.isConflict)
+        assertFalse(error.isRetryable)
+    }
+
+    @Test
+    fun `networkError factory creates code 0 retryable error`() {
+        val error = CalDavResult.Error.networkError("Connection refused")
+        assertEquals(0, error.code)
+        assertTrue(error.isRetryable)
+        assertEquals("Connection refused", error.message)
+    }
+
+    @Test
+    fun `serverError factory creates retryable error`() {
+        val error = CalDavResult.Error.serverError(503, "Service Unavailable")
+        assertEquals(503, error.code)
+        assertTrue(error.isServerError)
+        assertTrue(error.isRetryable)
+    }
+
+    @Test
+    fun `badRequestError factory creates 400 non-retryable error`() {
+        val error = CalDavResult.Error.badRequestError("Missing UID")
+        assertEquals(400, error.code)
+        assertEquals("Missing UID", error.message)
+        assertFalse(error.isRetryable)
+    }
+
+    @Test
+    fun `payloadTooLargeError factory creates 413 non-retryable error`() {
+        val error = CalDavResult.Error.payloadTooLargeError()
+        assertEquals(413, error.code)
+        assertFalse(error.isRetryable)
+    }
+
+    @Test
+    fun `rateLimitError factory creates 429 retryable error`() {
+        val error = CalDavResult.Error.rateLimitError()
+        assertEquals(429, error.code)
+        assertTrue(error.isRetryable)
+    }
+
+    @Test
+    fun `sslError factory creates code 0 non-retryable error`() {
+        val error = CalDavResult.Error.sslError("Certificate invalid")
+        assertEquals(0, error.code)
+        assertFalse(error.isRetryable)
+        assertEquals("Certificate invalid", error.message)
+    }
+
+    @Test
+    fun `isConflict returns true for 412`() {
+        val error = CalDavResult.Error(412, "Precondition Failed")
+        assertTrue(error.isConflict)
+    }
+
+    @Test
+    fun `isConflict returns true for 409`() {
+        val error = CalDavResult.Error(409, "Conflict")
+        assertTrue(error.isConflict)
+    }
+
+    @Test
+    fun `isConflict returns false for non-conflict codes`() {
+        val error = CalDavResult.Error(404, "Not Found")
+        assertFalse(error.isConflict)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // CalDavResult CHAIN METHODS
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `getOrThrow returns data on Success`() {
+        val result: CalDavResult<String> = CalDavResult.Success("value")
+        assertEquals("value", result.getOrThrow())
+    }
+
+    @Test
+    fun `getOrThrow throws CalDavException on Error`() {
+        val result: CalDavResult<String> = CalDavResult.Error(404, "Not Found")
+        val ex = assertFailsWith<CalDavException> { result.getOrThrow() }
+        assertEquals(404, ex.code)
+        assertEquals("Not Found", ex.message)
+    }
+
+    @Test
+    fun `onSuccess executes block for Success`() {
+        var called = false
+        val result: CalDavResult<Int> = CalDavResult.Success(42)
+        val returned = result.onSuccess { called = true }
+        assertTrue(called)
+        assertIs<CalDavResult.Success<Int>>(returned)
+    }
+
+    @Test
+    fun `onSuccess skips block for Error`() {
+        var called = false
+        val result: CalDavResult<Int> = CalDavResult.Error(500, "Error")
+        result.onSuccess { called = true }
+        assertFalse(called)
+    }
+
+    @Test
+    fun `onError executes block for Error`() {
+        var errorCode = 0
+        val result: CalDavResult<Int> = CalDavResult.Error(503, "Unavailable")
+        result.onError { errorCode = it.code }
+        assertEquals(503, errorCode)
+    }
+
+    @Test
+    fun `onError skips block for Success`() {
+        var called = false
+        val result: CalDavResult<Int> = CalDavResult.Success(1)
+        result.onError { called = true }
+        assertFalse(called)
+    }
+
+    @Test
+    fun `chain onSuccess and onError`() {
+        var successVal = 0
+        var errorMsg = ""
+
+        val success: CalDavResult<Int> = CalDavResult.Success(10)
+        success.onSuccess { successVal = it }.onError { errorMsg = it.message }
+        assertEquals(10, successVal)
+        assertEquals("", errorMsg)
+
+        val error: CalDavResult<Int> = CalDavResult.Error(500, "fail")
+        error.onSuccess { successVal = 99 }.onError { errorMsg = it.message }
+        assertEquals(10, successVal) // unchanged
+        assertEquals("fail", errorMsg)
     }
 
     // ═══════════════════════════════════════════════════════════════════

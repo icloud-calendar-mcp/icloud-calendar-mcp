@@ -1,11 +1,15 @@
-# iCloud Calendar MCP Server
+<p align="center">
+  <img src="images/logo.png" alt="iCloud Calendar MCP Server" width="200"/>
+</p>
+
+<h1 align="center">iCloud Calendar MCP Server</h1>
 
 [![Build](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/actions/workflows/test.yml/badge.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/actions/workflows/test.yml)
 [![npm](https://img.shields.io/npm/v/@icloud-calendar-mcp/server.svg)](https://www.npmjs.com/package/@icloud-calendar-mcp/server)
 [![PyPI](https://img.shields.io/pypi/v/icloud-calendar-mcp.svg)](https://pypi.org/project/icloud-calendar-mcp/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-green.svg)](https://registry.modelcontextprotocol.io/?search=org.onekash)
-[![Tests](https://img.shields.io/badge/Tests-555%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-768%20passing-brightgreen.svg)](#testing)
 [![Security](https://img.shields.io/badge/Security-OWASP%20MCP%20Top%2010-blue.svg)](#security)
 
 A **security-first** MCP (Model Context Protocol) server that provides AI assistants with secure access to iCloud Calendar via CalDAV. Built with comprehensive security controls aligned with the [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/).
@@ -37,7 +41,7 @@ A **security-first** MCP (Model Context Protocol) server that provides AI assist
 - **Input Validation** - All parameters validated with SSRF protection
 - **Rate Limiting** - 60 reads/min, 20 writes/min per MCP specification
 - **Secure Error Handling** - No sensitive data leakage in error messages
-- **OWASP MCP Top 10 Compliance** - 239 security tests covering all major risks
+- **OWASP MCP Top 10 Compliance** - 282 security tests covering all major risks
 - **ReDoS Protection** - All regex patterns tested against catastrophic backtracking
 - **Unicode Security** - Protection against homoglyph and encoding attacks
 
@@ -70,10 +74,10 @@ uvx icloud-calendar-mcp
 
 ```bash
 # Download from GitHub Releases
-curl -LO https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/latest/download/icloud-calendar-mcp-1.0.0-all.jar
+curl -LO https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/latest/download/icloud-calendar-mcp-3.0.0-all.jar
 
 # Run
-java -jar icloud-calendar-mcp-1.0.0-all.jar
+java -jar icloud-calendar-mcp-3.0.0-all.jar
 ```
 
 #### Option 4: Build from Source
@@ -82,7 +86,7 @@ java -jar icloud-calendar-mcp-1.0.0-all.jar
 git clone https://github.com/icloud-calendar-mcp/icloud-calendar-mcp.git
 cd icloud-calendar-mcp
 ./gradlew fatJar
-java -jar build/libs/icloud-calendar-mcp-1.0.0-all.jar
+java -jar build/libs/icloud-calendar-mcp-3.0.0-all.jar
 ```
 
 ### Configuration
@@ -154,7 +158,7 @@ Add to your Claude Desktop configuration:
   "mcpServers": {
     "icloud-calendar": {
       "command": "java",
-      "args": ["-jar", "/path/to/icloud-calendar-mcp-1.0.0-all.jar"],
+      "args": ["-jar", "/path/to/icloud-calendar-mcp-3.0.0-all.jar"],
       "env": {
         "ICLOUD_USERNAME": "your-apple-id@icloud.com",
         "ICLOUD_PASSWORD": "your-app-specific-password"
@@ -194,21 +198,30 @@ No parameters required.
 |-----------|------|----------|-------------|
 | `calendar_id` | string | Yes | Target calendar |
 | `title` | string | Yes | Event title |
-| `start_time` | string | Yes | ISO 8601 datetime or YYYY-MM-DD |
-| `end_time` | string | Yes | ISO 8601 datetime or YYYY-MM-DD |
+| `start_time` | string | Cond. | ISO 8601 datetime (required for timed events) |
+| `end_time` | string | Cond. | ISO 8601 datetime (required for timed events) |
+| `start_date` | string | Cond. | Start date YYYY-MM-DD (required for all-day events) |
+| `end_date` | string | Cond. | End date YYYY-MM-DD, inclusive (required for all-day events) |
+| `is_all_day` | boolean | No | All-day event flag |
 | `description` | string | No | Event description |
 | `location` | string | No | Event location |
-| `is_all_day` | boolean | No | All-day event flag |
+| `timezone` | string | No | IANA timezone (e.g., `America/New_York`) |
+| `rrule` | string | No | Recurrence rule (e.g., `FREQ=WEEKLY;BYDAY=MO`) |
 
 #### update_event
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `event_id` | string | Yes | Event to update |
+| `event_id` | string | Yes | Event UID to update |
 | `title` | string | No | New title |
-| `start_time` | string | No | New start time |
-| `end_time` | string | No | New end time |
+| `start_time` | string | No | New start time (ISO 8601) |
+| `end_time` | string | No | New end time (ISO 8601) |
+| `start_date` | string | No | New start date for all-day events (YYYY-MM-DD) |
+| `end_date` | string | No | New end date for all-day events (YYYY-MM-DD) |
+| `is_all_day` | boolean | No | Change to all-day event |
 | `description` | string | No | New description |
 | `location` | string | No | New location |
+| `timezone` | string | No | IANA timezone (e.g., `America/New_York`) |
+| `rrule` | string | No | Recurrence rule (e.g., `FREQ=WEEKLY;BYDAY=MO`) |
 
 #### delete_event
 | Parameter | Type | Required | Description |
@@ -231,6 +244,10 @@ This server is designed with security as a primary concern, following the [OWASP
 | **Rate Limiting** | Sliding window: 60 reads/min, 20 writes/min |
 | **Error Handling** | Passwords, tokens, paths, emails sanitized from errors |
 | **Injection Prevention** | ICS content properly escaped, command injection tested |
+| **ETag Normalization** | RFC 7232 compliant, strips quotes/W/ prefix/XML entities |
+| **Content-Length Guard** | Early rejection of oversized responses before buffering |
+| **Circuit Breaker** | Prevents cascading failures with automatic recovery |
+| **Audit Logging** | CUD operations logged via MCP logging protocol (MCP08) |
 | **ReDoS Protection** | All regex patterns tested for catastrophic backtracking |
 | **Unicode Security** | Homoglyph, normalization, and encoding bypass protection |
 
@@ -254,7 +271,7 @@ See [SECURITY.md](SECURITY.md) for full security documentation and vulnerability
 
 ## Testing
 
-The server includes **555 comprehensive tests** across 26 test suites:
+The server includes **768 comprehensive tests** across 30 test suites:
 
 ```bash
 ./gradlew test
@@ -264,23 +281,25 @@ The server includes **555 comprehensive tests** across 26 test suites:
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| **Security** | 239 | Adversarial inputs, OWASP MCP Top 10, ReDoS, Unicode |
-| **CalDAV Protocol** | 105 | XML parsing, HTTP client, models |
-| **ICS Parsing** | 48 | RFC 5545 compliance, edge cases |
+| **Security** | 282 | Adversarial inputs, OWASP MCP Top 10, ReDoS, Unicode |
+| **CalDAV Protocol** | 177 | XML parsing, HTTP client, models, ETag normalization |
+| **ICS Format** | 98 | RFC 5545 parsing, building, patching |
+| **Error Handling** | 56 | Secure error responses, credential sanitization |
+| **Integration** | 40 | End-to-end tools, MCP spec compliance, annotations |
 | **Input Validation** | 39 | All parameter validation rules |
-| **Error Handling** | 32 | Secure error responses |
-| **Integration** | 26 | End-to-end tool execution |
-| **Service Layer** | 21 | Calendar operations, caching |
+| **Service Layer** | 26 | Calendar operations, caching |
 | **Rate Limiting** | 15 | Concurrent access, window reset |
 | **Cancellation** | 12 | Operation cancellation, cleanup |
 | **Logging** | 9 | MCP logging compliance |
 | **Progress** | 9 | Progress reporting |
+| **E2E** | 5 | Live CalDAV + end-to-end integration |
 
 ### Security Test Categories
 
 | Category | Tests | Coverage |
 |----------|-------|----------|
 | **Adversarial Inputs** | 53 | SQL/NoSQL injection, XSS, path traversal |
+| **ICS Patcher Security** | 43 | CRLF injection, property injection, encoding attacks |
 | **Unicode Security** | 38 | Homoglyphs, normalization, RTL override |
 | **Logger Security** | 31 | Log injection, credential sanitization |
 | **OWASP MCP Risks** | 29 | MCP01-10 specific attack vectors |
@@ -354,10 +373,15 @@ The server includes **555 comprehensive tests** across 26 test suites:
 |  | Client            |  |  (ical4j)         |  |  (RFC 5545)    |  |
 |  +-------------------+  +-------------------+  +----------------+  |
 |                                                                    |
-|  +-------------------+  +-------------------+                      |
-|  | ICloudXml         |  |  Credential       |                      |
-|  | Parser            |  |  Manager          |                      |
-|  +-------------------+  +-------------------+                      |
+|  +-------------------+  +-------------------+  +----------------+  |
+|  | ICloudXml         |  |  IcsPatcher       |  |  EtagUtils     |  |
+|  | Parser            |  |  (event edits)    |  |  (RFC 7232)    |  |
+|  +-------------------+  +-------------------+  +----------------+  |
+|                                                                    |
+|  +-------------------+                                             |
+|  | Credential        |                                             |
+|  | Manager           |                                             |
+|  +-------------------+                                             |
 +------------------------------------------------------------------+
                               |
                               v
@@ -396,10 +420,12 @@ src/main/kotlin/org/onekash/mcp/calendar/
 │   ├── CalDavClient.kt     # Client interface
 │   ├── CalDavModels.kt     # Domain models
 │   ├── OkHttpCalDavClient.kt
-│   └── ICloudXmlParser.kt
+│   ├── ICloudXmlParser.kt
+│   └── EtagUtils.kt        # RFC 7232 ETag normalization
 ├── ics/                    # ICS format handling
 │   ├── IcsParser.kt        # Parse iCalendar data
-│   └── IcsBuilder.kt       # Generate iCalendar data
+│   ├── IcsBuilder.kt       # Generate iCalendar data
+│   └── IcsPatcher.kt       # Patch existing events (CRLF-safe)
 ├── service/                # Business logic
 │   ├── CalendarService.kt
 │   └── EventCache.kt
@@ -424,7 +450,7 @@ src/main/kotlin/org/onekash/mcp/calendar/
 ```bash
 ICLOUD_USERNAME="test@icloud.com" \
 ICLOUD_PASSWORD="test-app-password" \
-npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-1.0.0-all.jar
+npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.0.0-all.jar
 ```
 
 ---

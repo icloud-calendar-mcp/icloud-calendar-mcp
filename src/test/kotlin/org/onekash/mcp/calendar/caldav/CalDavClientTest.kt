@@ -267,4 +267,10 @@ class MockCalDavClient : CalDavClient {
         deleteEventCalled++
         return errorToReturn ?: if (deleteSuccess) CalDavResult.Success(Unit) else CalDavResult.Error(500, "Delete failed")
     }
+
+    override fun checkConnection(): CalDavResult<Boolean> = CalDavResult.Success(true)
+
+    override fun fetchEtags(calendarId: String, startDate: String, endDate: String): CalDavResult<Map<String, String?>> {
+        return CalDavResult.Success(emptyMap())
+    }
 }

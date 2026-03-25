@@ -28,7 +28,7 @@ What actually happened.
 
 - OS: [e.g., macOS 14.2, Ubuntu 22.04, Windows 11]
 - Java version: [e.g., 17.0.9]
-- Apple Calendar MCP version: [e.g., 1.0.0]
+- Apple Calendar MCP version: [e.g., 3.0.0]
 - Claude Desktop version: [e.g., 1.0.0]
 
 ## Logs

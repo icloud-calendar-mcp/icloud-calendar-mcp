@@ -23,8 +23,49 @@ sealed class CalDavResult<out T> {
 
         /** True if this is a server error (5xx) */
         val isServerError: Boolean get() = code in 500..599
+
+        /** True if this is a conflict/precondition-failed error (409, 412) */
+        val isConflict: Boolean get() = code == 409 || code == 412
+
+        companion object {
+            fun badRequestError(message: String = "Bad request") =
+                Error(400, message, isRetryable = false)
+
+            fun authError(message: String = "Authentication failed") =
+                Error(401, message, isRetryable = false)
+
+            fun forbiddenError(message: String = "Access denied") =
+                Error(403, message, isRetryable = false)
+
+            fun notFoundError(message: String = "Resource not found") =
+                Error(404, message, isRetryable = false)
+
+            fun timeoutError(message: String = "Request timed out") =
+                Error(408, message, isRetryable = true)
+
+            fun conflictError(message: String = "Precondition failed (resource modified)") =
+                Error(412, message, isRetryable = false)
+
+            fun payloadTooLargeError(message: String = "Response too large") =
+                Error(413, message, isRetryable = false)
+
+            fun rateLimitError(message: String = "Rate limited") =
+                Error(429, message, isRetryable = true)
+
+            fun networkError(message: String = "Network error") =
+                Error(0, message, isRetryable = true)
+
+            fun sslError(message: String = "SSL error") =
+                Error(0, message, isRetryable = false)
+
+            fun serverError(code: Int = 500, message: String = "Server error") =
+                Error(code, message, isRetryable = true)
+        }
     }
 }
+
+/** Exception wrapping a CalDavResult.Error for use with getOrThrow() */
+class CalDavException(val code: Int, override val message: String) : Exception(message)
 
 /** True if this result is a Success */
 val <T> CalDavResult<T>.isSuccess: Boolean
@@ -61,6 +102,24 @@ inline fun <T, R> CalDavResult<T>.fold(
     is CalDavResult.Error -> onError(code, message)
 }
 
+/** Returns the data if Success, throws CalDavException on Error */
+fun <T> CalDavResult<T>.getOrThrow(): T = when (this) {
+    is CalDavResult.Success -> data
+    is CalDavResult.Error -> throw CalDavException(code, message)
+}
+
+/** Execute block if Success, return this for chaining */
+inline fun <T> CalDavResult<T>.onSuccess(block: (T) -> Unit): CalDavResult<T> {
+    if (this is CalDavResult.Success) block(data)
+    return this
+}
+
+/** Execute block if Error, return this for chaining */
+inline fun <T> CalDavResult<T>.onError(block: (CalDavResult.Error) -> Unit): CalDavResult<T> {
+    if (this is CalDavResult.Error) block(this)
+    return this
+}
+
 /**
  * Represents a CalDAV calendar collection.
  *
@@ -79,7 +138,8 @@ data class CalDavCalendar(
     val displayName: String,
     val color: String?,
     val ctag: String?,
-    val isReadOnly: Boolean = false
+    val isReadOnly: Boolean = false,
+    val supportedComponents: Set<String> = emptySet()
 )
 
 /**

@@ -935,4 +935,10 @@ class MockCalDavClient : CalDavClient {
             CalDavResult.Success(Unit)
         }
     }
+
+    override fun checkConnection(): CalDavResult<Boolean> = CalDavResult.Success(true)
+
+    override fun fetchEtags(calendarId: String, startDate: String, endDate: String): CalDavResult<Map<String, String?>> {
+        return CalDavResult.Success(emptyMap())
+    }
 }
