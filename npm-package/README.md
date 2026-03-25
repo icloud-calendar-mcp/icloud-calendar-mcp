@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/@icloud-calendar-mcp/server.svg)](https://www.npmjs.com/package/@icloud-calendar-mcp/server)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/blob/main/LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-555%20passing-brightgreen.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp)
+[![Tests](https://img.shields.io/badge/Tests-768%20passing-brightgreen.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp)
 [![Security](https://img.shields.io/badge/Security-OWASP%20MCP%20Top%2010-blue.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/blob/main/SECURITY.md)
 
 A security-first MCP (Model Context Protocol) server for iCloud Calendar access via CalDAV.
@@ -78,14 +78,14 @@ This server is designed with security as a primary concern:
 - **Input Validation** - All inputs validated with SSRF protection
 - **Rate Limiting** - 60 reads/min, 20 writes/min
 - **Error Sanitization** - No credentials leaked in error messages
-- **OWASP MCP Top 10** - Full compliance with 239 security tests
+- **OWASP MCP Top 10** - Full compliance with 282 security tests
 - **ReDoS Protection** - All regex patterns tested against DoS
 - **Unicode Security** - Protection against encoding attacks
 
 ## Test Coverage
 
-- **555 total tests**
-- **239 security tests** covering OWASP MCP Top 10
+- **768 total tests**
+- **282 security tests** covering OWASP MCP Top 10
 - ReDoS, Unicode, SSRF, injection protection
 
 ## Links
