@@ -17,18 +17,18 @@
       },
       "environmentVariables": [
         {
-          "description": "Your Apple ID email",
+          "description": "Your Apple ID email (e.g., user@icloud.com)",
           "isRequired": true,
           "format": "string",
           "isSecret": false,
-          "name": "APPLE_ID"
+          "name": "ICLOUD_USERNAME"
         },
         {
-          "description": "App-specific password for iCloud",
+          "description": "App-specific password for iCloud (not your main Apple ID password)",
           "isRequired": true,
           "format": "string",
           "isSecret": true,
-          "name": "APP_SPECIFIC_PASSWORD"
+          "name": "ICLOUD_PASSWORD"
         }
       ]
     }
