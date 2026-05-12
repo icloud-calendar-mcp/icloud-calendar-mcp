@@ -84,11 +84,24 @@ jobs:
           curl -L -o lib/icloud-calendar-mcp-${{ steps.version.outputs.version }}-all.jar \
             https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/download/v${{ steps.version.outputs.version }}/icloud-calendar-mcp-${{ steps.version.outputs.version }}-all.jar
 
+      - name: Strip stale auth from .npmrc (OIDC handles auth)
+        # actions/setup-node writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
+        # into .npmrc. With NODE_AUTH_TOKEN unset that line becomes the literal
+        # string `${NODE_AUTH_TOKEN}`, which npm interprets as a (bogus) bearer
+        # token instead of falling through to OIDC trusted publishing.
+        run: |
+          if [ -f "$NPM_CONFIG_USERCONFIG" ]; then
+            sed -i '/_authToken=/d' "$NPM_CONFIG_USERCONFIG" || true
+            echo "Scrubbed auth lines from $NPM_CONFIG_USERCONFIG"
+            cat "$NPM_CONFIG_USERCONFIG"
+          fi
+
       - name: Publish to npm
+        # Auth via npm Trusted Publisher OIDC (configured at npmjs.com).
+        # Requires `id-token: write` at the workflow level (already set above).
+        # No NODE_AUTH_TOKEN env — npm picks up the OIDC token automatically.
         working-directory: npm-package
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-pypi:
     runs-on: ubuntu-latest
