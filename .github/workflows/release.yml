@@ -64,15 +64,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Node.js
+        # Node 24 ships with npm 11.x, which supports OIDC trusted publishing.
+        # Older Node + `npm install -g npm@latest` self-upgrade hits
+        # MODULE_NOT_FOUND issues on the runner, so we let setup-node pull a
+        # Node version where the bundled npm is already new enough.
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-
-      - name: Upgrade npm to support OIDC trusted publishing
-        # OIDC trusted publishing requires npm 11.5.1+. Node 22 ships with npm
-        # 10.x by default; this step pulls in the newer CLI globally.
-        run: npm install -g npm@latest
 
       - name: Get version from tag
         id: version
