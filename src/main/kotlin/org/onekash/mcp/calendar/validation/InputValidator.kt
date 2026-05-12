@@ -81,8 +81,107 @@ object InputValidator {
     }
 
     /**
-     * Validate calendar ID.
+     * Validate an IANA timezone identifier (e.g., "America/New_York").
+     * Accepts null/blank as Valid (the field is optional at the MCP layer).
      */
+    fun validateTimezone(timezone: String?, fieldName: String = "timezone"): ValidationResult {
+        if (timezone.isNullOrBlank()) return ValidationResult.Valid
+        if (timezone.length > 100) {
+            return ValidationResult.Invalid("$fieldName is too long")
+        }
+        return try {
+            java.time.ZoneId.of(timezone)
+            ValidationResult.Valid
+        } catch (_: Exception) {
+            ValidationResult.Invalid("$fieldName is not a recognized IANA timezone")
+        }
+    }
+
+    /**
+     * Validate VALARM list inputs from the MCP layer.
+     *
+     * Bounds: list size <= 8 (RFC 5545 doesn't cap, but 8 is well above any
+     * realistic UX and protects against DoS).
+     *
+     * Per element:
+     *   - trigger must match either an RFC 5545 §3.3.6 duration regex
+     *     (e.g. "-PT15M", "+P1D", "PT0S") or a basic-format UTC instant
+     *     ("yyyyMMddTHHmmssZ"). Approximate; ical4j has the final say.
+     *   - action (if present) must be one of DISPLAY/AUDIO/EMAIL.
+     *   - description and summary length <= 500.
+     *   - repeatCount must be >= 0.
+     *   - repeatDuration (if present) must match the duration regex.
+     */
+    private val ALARM_DURATION_PATTERN = Regex("""^[+-]?P(?:T(?:\d+H)?(?:\d+M)?(?:\d+S)?|(?:\d+W|\d+D)(?:T(?:\d+H)?(?:\d+M)?(?:\d+S)?)?)$""")
+    // Single source of truth lives in IcsBuilder.ICAL_ABSOLUTE_TRIGGER_REGEX —
+    // re-exposed here for boundary validation symmetry with the builder/patcher.
+    private val ALARM_ABSOLUTE_PATTERN get() = org.onekash.mcp.calendar.ics.IcsBuilder.ICAL_ABSOLUTE_TRIGGER_REGEX
+    private val ALARM_ACTIONS = setOf("DISPLAY", "AUDIO", "EMAIL")
+
+    /**
+     * Validate alarm list. Each entry is a Map<String, Any?> mirroring the
+     * AlarmSpec data class fields (decoded from the JSON-RPC `alarms` array
+     * at the MCP boundary).
+     */
+    fun validateAlarmList(alarms: List<Map<String, Any?>>?, fieldName: String = "alarms"): ValidationResult {
+        if (alarms.isNullOrEmpty()) return ValidationResult.Valid
+        if (alarms.size > 8) {
+            return ValidationResult.Invalid("$fieldName has too many entries (max 8)")
+        }
+        for ((i, entry) in alarms.withIndex()) {
+            val trigger = entry["trigger"] as? String
+                ?: return ValidationResult.Invalid("$fieldName[$i].trigger is required")
+            if (!ALARM_DURATION_PATTERN.matches(trigger) && !ALARM_ABSOLUTE_PATTERN.matches(trigger)) {
+                return ValidationResult.Invalid(
+                    "$fieldName[$i].trigger must be an RFC 5545 duration (e.g. -PT15M) or absolute UTC instant (yyyyMMddTHHmmssZ)"
+                )
+            }
+            val action = entry["action"] as? String
+            if (action != null && action !in ALARM_ACTIONS) {
+                return ValidationResult.Invalid("$fieldName[$i].action must be one of DISPLAY/AUDIO/EMAIL")
+            }
+            (entry["description"] as? String)?.let {
+                if (it.length > 500) return ValidationResult.Invalid("$fieldName[$i].description exceeds 500 characters")
+            }
+            (entry["summary"] as? String)?.let {
+                if (it.length > 500) return ValidationResult.Invalid("$fieldName[$i].summary exceeds 500 characters")
+            }
+            (entry["repeat_count"] as? Number)?.toInt()?.let {
+                if (it < 0) return ValidationResult.Invalid("$fieldName[$i].repeat_count must be >= 0")
+            }
+            (entry["repeat_duration"] as? String)?.let {
+                if (!ALARM_DURATION_PATTERN.matches(it)) {
+                    return ValidationResult.Invalid("$fieldName[$i].repeat_duration must be an RFC 5545 duration")
+                }
+            }
+        }
+        return ValidationResult.Valid
+    }
+
+    /**
+     * Validate a list of recurrence-date strings (RDATE / EXDATE values).
+     * Each value must be either YYYY-MM-DD (all-day) or an ISO 8601 datetime
+     * accepted by [validateDateTime] / [validateDate]. Bounded to 366 entries
+     * per RFC 5545 §3.3.5 practical limit (one per day for a year is plenty
+     * before clients should switch to RRULE).
+     */
+    fun validateRecurrenceDateList(values: List<String>?, fieldName: String): ValidationResult {
+        if (values.isNullOrEmpty()) return ValidationResult.Valid
+        if (values.size > 366) {
+            return ValidationResult.Invalid("$fieldName has too many entries (max 366)")
+        }
+        for ((i, v) in values.withIndex()) {
+            // Each value is either a YYYY-MM-DD or a datetime string
+            val asDate = validateDate(v, "$fieldName[$i]")
+            if (asDate is ValidationResult.Valid) continue
+            val asDateTime = validateDateTime(v.removeSuffix("Z"), "$fieldName[$i]")
+            if (asDateTime is ValidationResult.Invalid) {
+                return asDateTime
+            }
+        }
+        return ValidationResult.Valid
+    }
+
     fun validateCalendarId(calendarId: String?, fieldName: String = "calendar_id"): ValidationResult {
         if (calendarId.isNullOrBlank()) {
             return ValidationResult.Invalid("$fieldName is required")

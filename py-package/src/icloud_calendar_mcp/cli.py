@@ -13,7 +13,7 @@ from pathlib import Path
 
 from icloud_calendar_mcp.downloader import ensure_jar
 
-JAR_NAME = "icloud-calendar-mcp-3.0.0-all.jar"
+JAR_NAME = "icloud-calendar-mcp-3.0.1-all.jar"
 MIN_JAVA_VERSION = 17
 
 

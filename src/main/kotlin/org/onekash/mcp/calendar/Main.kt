@@ -14,6 +14,7 @@ import kotlinx.serialization.json.*
 import org.onekash.mcp.calendar.caldav.CalDavCredentials
 import org.onekash.mcp.calendar.caldav.OkHttpCalDavClient
 import org.onekash.mcp.calendar.error.SecureErrorHandler
+import org.onekash.mcp.calendar.ics.AlarmSpec
 import org.onekash.mcp.calendar.security.CredentialManager
 import org.onekash.mcp.calendar.ratelimit.RateLimiter
 import org.onekash.mcp.calendar.service.CalendarService
@@ -108,6 +109,76 @@ fun main(args: Array<String>) {
  * Create CalendarService with iCloud CalDAV client.
  * Returns null if credentials are not configured.
  */
+/**
+ * Decode the `alarms` JSON-RPC argument into the validator-friendly map shape.
+ * Returns null when the field is absent or not an array — preserves
+ * "leave existing alarms untouched" semantics on update_event.
+ * Returns an empty list when the field is `[]` — caller asked to clear.
+ */
+private fun decodeAlarmsForValidation(args: JsonObject): List<Map<String, Any?>>? {
+    val arr = args["alarms"]?.jsonArray ?: return null
+    return arr.mapNotNull { it as? JsonObject }.map { obj ->
+        mapOf<String, Any?>(
+            "trigger" to obj["trigger"]?.jsonPrimitive?.contentOrNull,
+            "action" to obj["action"]?.jsonPrimitive?.contentOrNull,
+            "description" to obj["description"]?.jsonPrimitive?.contentOrNull,
+            "summary" to obj["summary"]?.jsonPrimitive?.contentOrNull,
+            "repeat_count" to obj["repeat_count"]?.jsonPrimitive?.intOrNull,
+            "repeat_duration" to obj["repeat_duration"]?.jsonPrimitive?.contentOrNull
+        )
+    }
+}
+
+/** Convert the validated alarm shape into AlarmSpec instances for the service layer. */
+private fun toAlarmSpecs(decoded: List<Map<String, Any?>>?): List<AlarmSpec>? {
+    if (decoded == null) return null
+    return decoded.map { entry ->
+        AlarmSpec(
+            trigger = entry["trigger"] as String,
+            action = entry["action"] as? String,
+            description = entry["description"] as? String,
+            summary = entry["summary"] as? String,
+            repeatCount = (entry["repeat_count"] as? Number)?.toInt(),
+            repeatDuration = entry["repeat_duration"] as? String
+        )
+    }
+}
+
+/**
+ * The single item-shape declaration for the `alarms` array, reused across the
+ * create_event/update_event input schemas and their output schemas.
+ */
+private fun alarmItemSchema(): JsonObject = buildJsonObject {
+    put("type", JsonPrimitive("object"))
+    put("properties", buildJsonObject {
+        put("trigger", buildJsonObject { put("type", JsonPrimitive("string")) })
+        put("action", buildJsonObject { put("type", JsonPrimitive("string")) })
+        put("description", buildJsonObject { put("type", JsonPrimitive("string")) })
+        put("summary", buildJsonObject { put("type", JsonPrimitive("string")) })
+        put("repeat_count", buildJsonObject { put("type", JsonPrimitive("integer")) })
+        put("repeat_duration", buildJsonObject { put("type", JsonPrimitive("string")) })
+    })
+    put("required", buildJsonArray { add(JsonPrimitive("trigger")) })
+}
+
+/**
+ * Encode parsed alarms into the MCP response JSON shape so external clients can
+ * verify what landed. Keys mirror the input schema (snake_case).
+ */
+private fun encodeAlarmsForResponse(alarms: List<org.onekash.mcp.calendar.ics.ParsedAlarm>): JsonArray =
+    buildJsonArray {
+        for (a in alarms) {
+            add(buildJsonObject {
+                put("trigger", JsonPrimitive(a.trigger))
+                put("action", JsonPrimitive(a.action))
+                a.description?.let { put("description", JsonPrimitive(it)) }
+                a.summary?.let { put("summary", JsonPrimitive(it)) }
+                a.repeatCount?.let { put("repeat_count", JsonPrimitive(it)) }
+                a.repeatDuration?.let { put("repeat_duration", JsonPrimitive(it)) }
+            })
+        }
+    }
+
 private fun createCalendarService(): Pair<CalendarService?, OkHttpCalDavClient?> {
     return try {
         val credentials = CredentialManager.loadFromEnvironment() ?: return Pair(null, null)
@@ -363,9 +434,28 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                     put("type", JsonPrimitive("string"))
                     put("description", JsonPrimitive("IANA timezone for non-UTC timed events (e.g., America/New_York)"))
                 })
+                put("end_timezone", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("Optional IANA timezone for DTEND when distinct from start (e.g., flights JFK->LAX). Falls back to timezone when omitted."))
+                })
                 put("rrule", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Recurrence rule (e.g., FREQ=WEEKLY;BYDAY=MO)"))
+                    put("description", JsonPrimitive("Recurrence rule (e.g., FREQ=WEEKLY;BYDAY=MO). For biweekly schedules whose BYDAY includes Sunday, set WKST=<two-letter-day> explicitly to avoid ical4j defaulting to MO and dropping occurrences."))
+                })
+                put("rdates", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("Optional additional occurrence dates (RFC 5545 RDATE). ISO 8601 instants for timed events; YYYY-MM-DD for all-day. One value per array element."))
+                    put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
+                })
+                put("exdates", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("Optional excluded occurrence dates (RFC 5545 EXDATE). Same format as rdates."))
+                    put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
+                })
+                put("alarms", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("Optional VALARM components (RFC 5545 §3.6.6). Each entry is an object with: trigger (required: '-PT15M' duration form or '20260115T093000Z' absolute), action (DISPLAY|AUDIO|EMAIL, default DISPLAY), description, summary (EMAIL only), repeat_count, repeat_duration."))
+                    put("items", alarmItemSchema())
                 })
             },
             required = listOf("calendar_id", "title")
@@ -376,6 +466,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                 put("uid", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("summary", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
+                put("alarms", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("VALARM components attached to the created event (RFC 5545 §3.6.6); present only when the event has alarms."))
+                    put("items", alarmItemSchema())
+                })
             },
             required = listOf("success", "uid", "summary", "message")
         ),
@@ -404,7 +499,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
             val startDate = args["start_date"]?.jsonPrimitive?.content
             val endDate = args["end_date"]?.jsonPrimitive?.content
             val timezone = args["timezone"]?.jsonPrimitive?.content
+            val endTimezone = args["end_timezone"]?.jsonPrimitive?.content
             val rrule = args["rrule"]?.jsonPrimitive?.content
+            val rdates = args["rdates"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            val exdates = args["exdates"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            val alarmsDecoded = decodeAlarmsForValidation(args)
 
             // Validate required inputs
             val errors = mutableListOf<String>()
@@ -436,7 +535,12 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
             // Validate optional inputs
             errors.addAll(InputValidator.collectErrors(
                 InputValidator.validateOptionalText(location, "location", maxLength = 500),
-                InputValidator.validateOptionalText(description, "description", maxLength = 5000)
+                InputValidator.validateOptionalText(description, "description", maxLength = 5000),
+                InputValidator.validateTimezone(timezone, "timezone"),
+                InputValidator.validateTimezone(endTimezone, "end_timezone"),
+                InputValidator.validateRecurrenceDateList(rdates, "rdates"),
+                InputValidator.validateRecurrenceDateList(exdates, "exdates"),
+                InputValidator.validateAlarmList(alarmsDecoded, "alarms")
             ))
 
             if (errors.isNotEmpty()) {
@@ -466,7 +570,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                 description = safeDescription,
                 location = safeLocation,
                 timezone = timezone,
-                rrule = rrule
+                rrule = rrule,
+                endTimezone = endTimezone,
+                rdates = rdates,
+                exdates = exdates,
+                alarms = toAlarmSpecs(alarmsDecoded)
             )
 
             when (result) {
@@ -481,6 +589,9 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                         put("uid", result.data.uid)
                         put("summary", result.data.summary)
                         put("message", "Event created successfully")
+                        if (result.data.alarms.isNotEmpty()) {
+                            put("alarms", encodeAlarmsForResponse(result.data.alarms))
+                        }
                     }
                     CallToolResult(
                         content = listOf(TextContent(text = eventJson.toString()))
@@ -549,9 +660,28 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                     put("type", JsonPrimitive("string"))
                     put("description", JsonPrimitive("IANA timezone for non-UTC timed events (e.g., America/New_York)"))
                 })
+                put("end_timezone", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("Optional IANA timezone for DTEND when distinct from start (e.g., flights JFK->LAX). Falls back to timezone when omitted."))
+                })
                 put("rrule", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Recurrence rule (e.g., FREQ=WEEKLY;BYDAY=MO)"))
+                    put("description", JsonPrimitive("Recurrence rule (e.g., FREQ=WEEKLY;BYDAY=MO). For biweekly schedules whose BYDAY includes Sunday, set WKST=<two-letter-day> explicitly to avoid ical4j defaulting to MO and dropping occurrences."))
+                })
+                put("rdates", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("Replace additional occurrence dates (RFC 5545 RDATE). ISO 8601 instants for timed; YYYY-MM-DD for all-day. Pass null/omit to leave existing untouched; pass empty array to clear."))
+                    put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
+                })
+                put("exdates", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("Replace excluded occurrence dates (RFC 5545 EXDATE). Same semantics as rdates."))
+                    put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
+                })
+                put("alarms", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("Replace VALARM components (RFC 5545 §3.6.6). Pass null/omit to preserve existing alarms; pass empty array to clear all; pass a list of alarm objects to replace. Each entry has: trigger (required), action (DISPLAY|AUDIO|EMAIL, default DISPLAY), description, summary (EMAIL only), repeat_count, repeat_duration."))
+                    put("items", alarmItemSchema())
                 })
             },
             required = listOf("event_id")
@@ -561,6 +691,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                 put("success", buildJsonObject { put("type", JsonPrimitive("boolean")) })
                 put("uid", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
+                put("alarms", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("description", JsonPrimitive("VALARM components attached to the updated event (RFC 5545 §3.6.6); present only when the event has alarms."))
+                    put("items", alarmItemSchema())
+                })
             },
             required = listOf("success", "uid", "message")
         ),
@@ -589,7 +724,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
             val startDate = args["start_date"]?.jsonPrimitive?.content
             val endDate = args["end_date"]?.jsonPrimitive?.content
             val timezone = args["timezone"]?.jsonPrimitive?.content
+            val endTimezone = args["end_timezone"]?.jsonPrimitive?.content
             val rrule = args["rrule"]?.jsonPrimitive?.content
+            val rdates = args["rdates"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            val exdates = args["exdates"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            val alarmsDecoded = decodeAlarmsForValidation(args)
 
             // Validate event ID (required)
             val errors = mutableListOf<String>()
@@ -630,7 +769,12 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
 
             errors.addAll(InputValidator.collectErrors(
                 InputValidator.validateOptionalText(location, "location", maxLength = 500),
-                InputValidator.validateOptionalText(description, "description", maxLength = 5000)
+                InputValidator.validateOptionalText(description, "description", maxLength = 5000),
+                InputValidator.validateTimezone(timezone, "timezone"),
+                InputValidator.validateTimezone(endTimezone, "end_timezone"),
+                InputValidator.validateRecurrenceDateList(rdates, "rdates"),
+                InputValidator.validateRecurrenceDateList(exdates, "exdates"),
+                InputValidator.validateAlarmList(alarmsDecoded, "alarms")
             ))
 
             if (errors.isNotEmpty()) {
@@ -660,7 +804,11 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                 description = safeDescription,
                 location = safeLocation,
                 timezone = timezone,
-                rrule = rrule
+                rrule = rrule,
+                endTimezone = endTimezone,
+                rdates = rdates,
+                exdates = exdates,
+                alarms = toAlarmSpecs(alarmsDecoded)
             )
 
             when (result) {
@@ -674,6 +822,9 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                         put("success", true)
                         put("uid", result.data.uid)
                         put("message", "Event updated successfully")
+                        if (result.data.alarms.isNotEmpty()) {
+                            put("alarms", encodeAlarmsForResponse(result.data.alarms))
+                        }
                     }
                     CallToolResult(
                         content = listOf(TextContent(text = eventJson.toString()))

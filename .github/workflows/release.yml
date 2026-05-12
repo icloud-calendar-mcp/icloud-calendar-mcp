@@ -120,6 +120,10 @@ jobs:
         working-directory: py-package
         run: sed -i "s/__version__ = \".*\"/__version__ = \"${{ steps.version.outputs.version }}\"/" src/icloud_calendar_mcp/__init__.py
 
+      - name: Update cli JAR_NAME version
+        working-directory: py-package
+        run: sed -i "s/JAR_NAME = \"icloud-calendar-mcp-.*-all.jar\"/JAR_NAME = \"icloud-calendar-mcp-${{ steps.version.outputs.version }}-all.jar\"/" src/icloud_calendar_mcp/cli.py
+
       - name: Build package
         working-directory: py-package
         run: uv build

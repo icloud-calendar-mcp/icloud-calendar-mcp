@@ -695,4 +695,183 @@ class IcsParserTest {
         val events = parser.parse(ics)
         assertTrue(events.isEmpty())
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // DISTINCT DTEND TIMEZONE EXTRACTION
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parse distinct DTEND timezone populates endTimezone field`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:flight@test
+            DTSTAMP:20260315T000000Z
+            DTSTART;TZID=America/New_York:20260315T080000
+            DTEND;TZID=America/Los_Angeles:20260315T110000
+            SUMMARY:JFK to LAX
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals("America/New_York", events[0].timezone)
+        assertEquals("America/Los_Angeles", events[0].endTimezone)
+    }
+
+    @Test
+    fun `parse same DTEND timezone yields null endTimezone`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:single-tz@test
+            DTSTAMP:20260315T000000Z
+            DTSTART;TZID=America/New_York:20260315T080000
+            DTEND;TZID=America/New_York:20260315T090000
+            SUMMARY:NY meeting
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        assertEquals("America/New_York", events[0].timezone)
+        assertNull(
+            events[0].endTimezone,
+            "When DTEND TZID matches DTSTART TZID, endTimezone should be null (per doc invariant)"
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // RDATE / EXDATE EXTRACTION
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parse extracts RDATE and EXDATE values`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:rdates@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            RRULE:FREQ=WEEKLY
+            RDATE:20260214T100000Z,20260314T100000Z
+            EXDATE:20260212T100000Z
+            SUMMARY:Recurring with extras
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        val event = events[0]
+        assertEquals(2, event.rdates.size, "Expected 2 RDATE values")
+        assertTrue(event.rdates.contains("2026-02-14T10:00:00Z"))
+        assertTrue(event.rdates.contains("2026-03-14T10:00:00Z"))
+        assertEquals(1, event.exdates.size)
+        assertTrue(event.exdates.contains("2026-02-12T10:00:00Z"))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // VALARM EXTRACTION (RFC 5545 §3.6.6)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `parse extracts a single VALARM with duration trigger`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:alarm-1@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            SUMMARY:With alarm
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER:-PT15M
+            DESCRIPTION:Reminder
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        val alarms = events[0].alarms
+        assertEquals(1, alarms.size)
+        assertEquals("-PT15M", alarms[0].trigger)
+        assertEquals("DISPLAY", alarms[0].action)
+        assertEquals("Reminder", alarms[0].description)
+    }
+
+    @Test
+    fun `parse extracts VALARM with absolute trigger`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:alarm-abs@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            SUMMARY:Absolute trigger
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER;VALUE=DATE-TIME:20260115T093000Z
+            DESCRIPTION:Reminder
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        val alarms = events[0].alarms
+        assertEquals(1, alarms.size)
+        assertEquals("20260115T093000Z", alarms[0].trigger)
+    }
+
+    @Test
+    fun `parse extracts two VALARMs in order`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:alarms-2@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            SUMMARY:Two alarms
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER:-PT15M
+            DESCRIPTION:Primary
+            END:VALARM
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER:-P1D
+            DESCRIPTION:Day before
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val events = parser.parse(ics)
+        assertEquals(1, events.size)
+        val alarms = events[0].alarms
+        assertEquals(2, alarms.size)
+        assertEquals(setOf("-PT15M", "-P1D"), alarms.map { it.trigger }.toSet())
+    }
 }

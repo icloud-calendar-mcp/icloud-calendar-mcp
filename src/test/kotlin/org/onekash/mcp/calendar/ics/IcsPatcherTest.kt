@@ -539,17 +539,58 @@ class IcsPatcherTest {
     }
 
     @Test
-    fun `patch falls back to IcsBuilder when existingIcs is invalid`() {
-        val result = patcher.patch(
-            existingIcs = "not valid ical data",
-            uid = "fallback-invalid@test",
-            summary = "Fallback Event",
-            startTime = "2025-12-25T10:00:00Z",
-            endTime = "2025-12-25T11:00:00Z"
+    fun `patch throws on unparseable existingIcs instead of silent buildFresh fallback`() {
+        // Issue #2 hardening: when existingIcs is non-blank but unparseable,
+        // returning a silently-rebuilt event was hiding data corruption from
+        // the caller. Now we surface the failure as a typed exception so the
+        // service layer can propagate a clean 422 to the LLM client.
+        val ex = assertFailsWith<IcsPatcher.UnparseableExistingIcsException> {
+            patcher.patch(
+                existingIcs = "not valid ical data",
+                uid = "fallback-invalid@test",
+                summary = "Fallback Event",
+                startTime = "2025-12-25T10:00:00Z",
+                endTime = "2025-12-25T11:00:00Z"
+            )
+        }
+        // Sanity: the exception carries a fingerprint of what failed
+        assertTrue(
+            ex.message!!.isNotBlank(),
+            "Exception should carry a non-empty diagnostic message"
         )
+    }
 
-        assertTrue(result.contains("BEGIN:VCALENDAR"))
-        assertTrue(result.contains("SUMMARY:Fallback Event"))
+    @Test
+    fun `patch throws when existing ICS uses LF-only folding that ical4j rejects`() {
+        // Reported via issue #2: when existing ICS came back from iCloud with
+        // bare LF instead of CRLF, ical4j's CalendarBuilder bailed; the
+        // pre-fix patcher silently returned a fresh "Untitled" event with the
+        // user-supplied description-only update — corrupting the SUMMARY.
+        // After this chunk, that case throws cleanly.
+        val descRaw = "DESCRIPTION:Send a short follow-up email with an attachment for a warm introduction. Frame around the pitch, not generic availability."
+        val foldedDescription = descRaw.substring(0, 75) + "\r\n " + descRaw.substring(75)
+        val lfOnly = listOf(
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Test//EN",
+            "BEGIN:VEVENT",
+            "UID:lf-fold@test",
+            "DTSTAMP:20260115T100000Z",
+            "DTSTART:20260120T140000Z",
+            "DTEND:20260120T150000Z",
+            "SUMMARY:Original SUMMARY value",
+            foldedDescription,
+            "END:VEVENT",
+            "END:VCALENDAR"
+        ).joinToString("\r\n").replace("\r\n", "\n")  // strip CRLF, leave bare LF
+
+        assertFailsWith<IcsPatcher.UnparseableExistingIcsException> {
+            patcher.patch(
+                existingIcs = lfOnly,
+                uid = "lf-fold@test",
+                description = "MCP TEST touch simple."  // description-only update
+            )
+        }
     }
 
     @Test
@@ -887,5 +928,244 @@ class IcsPatcherTest {
 
         // VALARM should still be preserved even with full update
         assertTrue(patched.contains("BEGIN:VALARM"), "VALARM preserved through full update")
+    }
+
+    // ========== CREATED + LAST-MODIFIED (RFC 5545 §3.8.7.1, §3.8.7.3) ==========
+
+    private val originalWithTimestamps = """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//Test//Test//EN
+        BEGIN:VEVENT
+        UID:lm-test@example.com
+        DTSTAMP:20240101T000000Z
+        CREATED:20240101T000000Z
+        LAST-MODIFIED:20240101T000000Z
+        DTSTART:20260115T100000Z
+        DTEND:20260115T110000Z
+        SUMMARY:Original
+        END:VEVENT
+        END:VCALENDAR
+    """.trimIndent().replace("\n", "\r\n")
+
+    @Test
+    fun `patch refreshes LAST-MODIFIED but preserves CREATED`() {
+        val patched = patcher.patch(
+            existingIcs = originalWithTimestamps,
+            uid = "lm-test@example.com",
+            summary = "Edited"
+        )
+
+        // CREATED must be byte-identical (RFC §3.8.7.1: never changes after first set)
+        assertTrue(
+            patched.contains("CREATED:20240101T000000Z"),
+            "CREATED should be preserved verbatim across patch:\n$patched"
+        )
+        // LAST-MODIFIED must have been refreshed (not the original 2024 value)
+        assertFalse(
+            patched.contains("LAST-MODIFIED:20240101T000000Z"),
+            "LAST-MODIFIED should NOT be the original value:\n$patched"
+        )
+        assertTrue(
+            patched.lineSequence().any { it.startsWith("LAST-MODIFIED:") },
+            "LAST-MODIFIED line should be present after patch:\n$patched"
+        )
+    }
+
+    @Test
+    fun `patch preserves CREATED across two consecutive patches`() {
+        val firstPatch = patcher.patch(
+            existingIcs = originalWithTimestamps,
+            uid = "lm-test@example.com",
+            summary = "First edit"
+        )
+        val secondPatch = patcher.patch(
+            existingIcs = firstPatch,
+            uid = "lm-test@example.com",
+            summary = "Second edit"
+        )
+
+        assertTrue(
+            secondPatch.contains("CREATED:20240101T000000Z"),
+            "CREATED should survive multiple patch cycles:\n$secondPatch"
+        )
+    }
+
+    // ========== RDATE / EXDATE patch path ==========
+
+    @Test
+    fun `patch replaces existing RDATE values`() {
+        val original = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:rdate-patch@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            RRULE:FREQ=WEEKLY
+            RDATE:20260214T100000Z
+            SUMMARY:Recurring
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent().replace("\n", "\r\n")
+
+        val patched = patcher.patch(
+            existingIcs = original,
+            uid = "rdate-patch@test",
+            rdates = listOf("2026-03-14T10:00:00Z", "2026-04-14T10:00:00Z")
+        )
+
+        // Old RDATE removed, new ones present
+        assertFalse(patched.contains("20260214T100000Z"), "Old RDATE should be removed:\n$patched")
+        assertTrue(patched.contains("20260314T100000Z"))
+        assertTrue(patched.contains("20260414T100000Z"))
+    }
+
+    @Test
+    fun `patch replaces existing EXDATE values`() {
+        val original = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:exdate-patch@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            RRULE:FREQ=WEEKLY
+            EXDATE:20260212T100000Z
+            SUMMARY:Recurring
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent().replace("\n", "\r\n")
+
+        val patched = patcher.patch(
+            existingIcs = original,
+            uid = "exdate-patch@test",
+            exdates = listOf("2026-02-19T10:00:00Z")
+        )
+
+        assertFalse(patched.contains("20260212T100000Z"), "Old EXDATE should be removed:\n$patched")
+        assertTrue(patched.contains("20260219T100000Z"))
+    }
+
+    @Test
+    fun `patch with null rdates leaves existing RDATE untouched`() {
+        val original = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//EN
+            BEGIN:VEVENT
+            UID:rdate-keep@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            RRULE:FREQ=WEEKLY
+            RDATE:20260214T100000Z
+            SUMMARY:Recurring
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent().replace("\n", "\r\n")
+
+        val patched = patcher.patch(
+            existingIcs = original,
+            uid = "rdate-keep@test",
+            summary = "Edited title only"
+            // rdates = null (default) — must NOT remove existing
+        )
+
+        assertTrue(patched.contains("20260214T100000Z"), "Existing RDATE must survive when rdates=null:\n$patched")
+    }
+
+    @Test
+    fun `patch does not synthesize CREATED when missing`() {
+        val originalWithoutCreated = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:no-created@example.com
+            DTSTAMP:20240101T000000Z
+            DTSTART:20260115T100000Z
+            DTEND:20260115T110000Z
+            SUMMARY:No CREATED here
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent().replace("\n", "\r\n")
+
+        val patched = patcher.patch(
+            existingIcs = originalWithoutCreated,
+            uid = "no-created@example.com",
+            summary = "Edited"
+        )
+
+        assertFalse(
+            patched.lineSequence().any { it.startsWith("CREATED:") },
+            "Patcher should not fabricate CREATED when source had none:\n$patched"
+        )
+    }
+
+    // ========== VALARM authoring (issue #1, RFC 5545 §3.6.6) ==========
+
+    private val originalWithTwoAlarms = """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//Test//EN
+        BEGIN:VEVENT
+        UID:alarm-patch@test
+        DTSTAMP:20260101T000000Z
+        DTSTART:20260115T100000Z
+        DTEND:20260115T110000Z
+        SUMMARY:With two alarms
+        BEGIN:VALARM
+        ACTION:DISPLAY
+        TRIGGER:-PT15M
+        DESCRIPTION:Primary
+        END:VALARM
+        BEGIN:VALARM
+        ACTION:DISPLAY
+        TRIGGER:-P1D
+        DESCRIPTION:Day before
+        END:VALARM
+        END:VEVENT
+        END:VCALENDAR
+    """.trimIndent().replace("\n", "\r\n")
+
+    @Test
+    fun `patch with non-null alarms replaces existing alarms`() {
+        val patched = patcher.patch(
+            existingIcs = originalWithTwoAlarms,
+            uid = "alarm-patch@test",
+            alarms = listOf(AlarmSpec(trigger = "-PT5M"))
+        )
+
+        val begins = "BEGIN:VALARM".toRegex().findAll(patched).count()
+        assertEquals(1, begins, "Replaced two alarms with one:\n$patched")
+        assertTrue(patched.contains("TRIGGER:-PT5M"), "New alarm trigger present:\n$patched")
+        assertFalse(patched.contains("TRIGGER:-PT15M"), "Old alarm trigger gone:\n$patched")
+        assertFalse(patched.contains("TRIGGER:-P1D"), "Old alarm trigger gone:\n$patched")
+    }
+
+    @Test
+    fun `patch with null alarms preserves existing alarms`() {
+        val patched = patcher.patch(
+            existingIcs = originalWithTwoAlarms,
+            uid = "alarm-patch@test",
+            summary = "Edit only"
+        )
+        val begins = "BEGIN:VALARM".toRegex().findAll(patched).count()
+        assertEquals(2, begins, "null alarms must preserve existing:\n$patched")
+    }
+
+    @Test
+    fun `patch with empty alarms list clears all existing alarms`() {
+        val patched = patcher.patch(
+            existingIcs = originalWithTwoAlarms,
+            uid = "alarm-patch@test",
+            alarms = emptyList()
+        )
+        assertFalse(patched.contains("BEGIN:VALARM"), "Empty list clears all:\n$patched")
     }
 }

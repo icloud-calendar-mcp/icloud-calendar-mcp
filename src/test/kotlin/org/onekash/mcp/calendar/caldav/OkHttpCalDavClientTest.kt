@@ -1,7 +1,9 @@
 package org.onekash.mcp.calendar.caldav
 
+import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -33,7 +35,16 @@ class OkHttpCalDavClientTest {
 
         val baseUrl = mockServer.url("/").toString().trimEnd('/')
         val creds = CalDavCredentials("test@icloud.com", "test-password")
-        client = OkHttpCalDavClient(baseUrl, creds)
+        // Tight timeouts so tests waiting on un-enqueued mock responses fail fast.
+        // Production timeouts in OkHttpCalDavClient.CONNECT/READ/WRITE_TIMEOUT_SECONDS
+        // remain at the original 15s/30s/30s.
+        val fastClient = OkHttpClient.Builder()
+            .connectTimeout(500, TimeUnit.MILLISECONDS)
+            .readTimeout(500, TimeUnit.MILLISECONDS)
+            .writeTimeout(500, TimeUnit.MILLISECONDS)
+            .followRedirects(true)
+            .build()
+        client = OkHttpCalDavClient(baseUrl, creds, fastClient)
         client.skipWellKnownDiscovery() // Skip for non-well-known tests
     }
 
@@ -312,6 +323,10 @@ class OkHttpCalDavClientTest {
 
     @Test
     fun `updateEvent handles 404`() {
+        // null etag triggers a PROPFIND probe before the PUT — enqueue the probe leg first.
+        // Probe returns 404 so recovery yields null; then the PUT also 404s and is the
+        // result we care about.
+        mockServer.enqueue(MockResponse().setResponseCode(404))
         mockServer.enqueue(MockResponse().setResponseCode(404))
 
         val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:test@test\nEND:VEVENT\nEND:VCALENDAR"
@@ -340,20 +355,27 @@ class OkHttpCalDavClientTest {
 
     @Test
     fun `deleteEvent without etag still works`() {
+        // null etag triggers a PROPFIND probe; here the probe finds nothing,
+        // so DELETE proceeds without If-Match (best-effort, no regression).
+        mockServer.enqueue(MockResponse().setResponseCode(404))
         mockServer.enqueue(MockResponse().setResponseCode(204))
 
         val result = client.deleteEvent("/cal/event.ics", null)
 
         assertIs<CalDavResult.Success<Unit>>(result)
 
-        // Verify no If-Match header
-        val request = mockServer.takeRequest()
-        assertEquals(null, request.getHeader("If-Match"))
+        // Skip the PROPFIND probe; the DELETE is the second request.
+        mockServer.takeRequest()
+        val deleteRequest = mockServer.takeRequest()
+        assertEquals("DELETE", deleteRequest.method)
+        assertEquals(null, deleteRequest.getHeader("If-Match"))
     }
 
     @Test
     fun `deleteEvent handles 404 as success`() {
-        // 404 on delete is often acceptable (already deleted)
+        // null etag triggers a PROPFIND probe; 404 there yields no etag, then DELETE
+        // proceeds and also 404s.
+        mockServer.enqueue(MockResponse().setResponseCode(404))
         mockServer.enqueue(MockResponse().setResponseCode(404))
 
         val result = client.deleteEvent("/cal/missing.ics", null)
@@ -371,6 +393,96 @@ class OkHttpCalDavClientTest {
 
         assertIs<CalDavResult.Error>(result)
         assertEquals(412, result.code)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ETAG PROPFIND RECOVERY (when caller's cached etag was null because
+    // the original REPORT response omitted <getetag> per server quirk)
+    // ═══════════════════════════════════════════════════════════════════
+
+    private val getetagPropfindBody = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <D:multistatus xmlns:D="DAV:">
+            <D:response>
+                <D:href>/cal/event.ics</D:href>
+                <D:propstat>
+                    <D:prop><D:getetag>"recovered-etag"</D:getetag></D:prop>
+                    <D:status>HTTP/1.1 200 OK</D:status>
+                </D:propstat>
+            </D:response>
+        </D:multistatus>
+    """.trimIndent()
+
+    @Test
+    fun `updateEvent with null etag recovers via PROPFIND and uses recovered etag as If-Match`() {
+        // Probe leg: PROPFIND returns the etag.
+        mockServer.enqueue(MockResponse().setResponseCode(207).setBody(getetagPropfindBody))
+        // Then the PUT succeeds with a fresh etag.
+        mockServer.enqueue(MockResponse().setResponseCode(204).addHeader("ETag", "\"new-etag\""))
+
+        val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:e@t\nEND:VEVENT\nEND:VCALENDAR"
+        val result = client.updateEvent("/cal/event.ics", ics, null)
+        assertIs<CalDavResult.Success<CalDavEvent>>(result)
+        assertEquals("new-etag", result.data.etag)
+
+        // First request must be a PROPFIND with Depth: 0 (proves the right helper is called).
+        val probe = mockServer.takeRequest()
+        assertEquals("PROPFIND", probe.method)
+        assertEquals("0", probe.getHeader("Depth"))
+
+        // Second request is the PUT, carrying the recovered etag as If-Match.
+        // Note: EtagUtils.normalizeEtag strips surrounding quotes, so the
+        // emitted If-Match is the bare value "recovered-etag" (sans quotes).
+        val put = mockServer.takeRequest()
+        assertEquals("PUT", put.method)
+        assertEquals("recovered-etag", put.getHeader("If-Match"))
+    }
+
+    @Test
+    fun `updateEvent with non-null etag does not issue a PROPFIND probe`() {
+        mockServer.enqueue(MockResponse().setResponseCode(204).addHeader("ETag", "\"new-etag\""))
+
+        val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:e@t\nEND:VEVENT\nEND:VCALENDAR"
+        val result = client.updateEvent("/cal/event.ics", ics, "\"caller-etag\"")
+        assertIs<CalDavResult.Success<CalDavEvent>>(result)
+
+        // Single request — no probe.
+        val put = mockServer.takeRequest()
+        assertEquals("PUT", put.method)
+        assertEquals("\"caller-etag\"", put.getHeader("If-Match"))
+        assertEquals(1, mockServer.requestCount)
+    }
+
+    @Test
+    fun `updateEvent with null etag falls through to PUT without If-Match when PROPFIND fails`() {
+        // Probe fails (server quirk or network error).
+        mockServer.enqueue(MockResponse().setResponseCode(500))
+        // PUT proceeds without If-Match (preserves prior best-effort behavior; no regression).
+        mockServer.enqueue(MockResponse().setResponseCode(204).addHeader("ETag", "\"new-etag\""))
+
+        val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:e@t\nEND:VEVENT\nEND:VCALENDAR"
+        val result = client.updateEvent("/cal/event.ics", ics, null)
+        assertIs<CalDavResult.Success<CalDavEvent>>(result)
+
+        mockServer.takeRequest()  // skip probe
+        val put = mockServer.takeRequest()
+        assertEquals("PUT", put.method)
+        assertEquals(null, put.getHeader("If-Match"))
+    }
+
+    @Test
+    fun `deleteEvent with null etag recovers via PROPFIND and uses it as If-Match`() {
+        mockServer.enqueue(MockResponse().setResponseCode(207).setBody(getetagPropfindBody))
+        mockServer.enqueue(MockResponse().setResponseCode(204))
+
+        val result = client.deleteEvent("/cal/event.ics", null)
+        assertIs<CalDavResult.Success<Unit>>(result)
+
+        val probe = mockServer.takeRequest()
+        assertEquals("PROPFIND", probe.method)
+        val delete = mockServer.takeRequest()
+        assertEquals("DELETE", delete.method)
+        assertEquals("recovered-etag", delete.getHeader("If-Match"))
     }
 
     // ═══════════════════════════════════════════════════════════════════

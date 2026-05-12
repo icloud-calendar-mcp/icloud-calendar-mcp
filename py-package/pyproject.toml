@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "icloud-calendar-mcp"
-version = "3.0.0"
+version = "3.0.1"
 description = "MCP server for iCloud Calendar access via CalDAV"
 readme = "README.md"
 license = "Apache-2.0"

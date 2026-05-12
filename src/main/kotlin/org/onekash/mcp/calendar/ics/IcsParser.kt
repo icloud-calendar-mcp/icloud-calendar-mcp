@@ -3,6 +3,7 @@ package org.onekash.mcp.calendar.ics
 import net.fortuna.ical4j.data.CalendarBuilder
 import net.fortuna.ical4j.model.Calendar
 import net.fortuna.ical4j.model.Property
+import net.fortuna.ical4j.model.component.VAlarm
 import net.fortuna.ical4j.model.component.VEvent
 import net.fortuna.ical4j.model.property.*
 import net.fortuna.ical4j.model.parameter.Cn
@@ -28,13 +29,33 @@ data class ParsedEvent(
     val endTime: String? = null,        // ISO 8601 UTC for timed events
     val startDate: String? = null,      // YYYY-MM-DD for all-day events
     val endDate: String? = null,        // YYYY-MM-DD for all-day events (inclusive)
+    val timezone: String? = null,       // IANA TZID from DTSTART; null for UTC/floating times
+    val endTimezone: String? = null,    // IANA TZID from DTEND when distinct from start; null when matching or absent
     val rrule: String? = null,          // Raw RRULE string if recurring
+    val rdates: List<String> = emptyList(),  // Additional occurrence dates (RFC 5545 §3.8.5.2 — RDATE).
+                                             // VALUE=DATE-TIME normalized to ISO 8601 UTC; VALUE=DATE to YYYY-MM-DD;
+                                             // VALUE=PERIOD: best-effort, only the start instant is preserved.
+    val exdates: List<String> = emptyList(), // Excluded occurrence dates (RFC 5545 §3.8.5.1 — EXDATE).
     val status: String? = null,         // TENTATIVE, CONFIRMED, CANCELLED
     val url: String? = null,            // URL property
     val categories: List<String> = emptyList(), // CATEGORIES
     val priority: Int? = null,          // PRIORITY (1=highest, 9=lowest)
     val organizer: String? = null,      // Formatted: "Name <email>" or just email
-    val attendeeCount: Int = 0          // Number of ATTENDEEs
+    val attendeeCount: Int = 0,         // Number of ATTENDEEs
+    val alarms: List<ParsedAlarm> = emptyList() // RFC 5545 §3.6.6 VALARM components
+)
+
+/**
+ * Parsed VALARM component (RFC 5545 §3.6.6).
+ * Mirrors the inputs accepted by [org.onekash.mcp.calendar.ics.AlarmSpec].
+ */
+data class ParsedAlarm(
+    val trigger: String,        // Either "-PT15M" form or absolute "20260115T093000Z"
+    val action: String,         // DISPLAY | AUDIO | EMAIL
+    val description: String? = null,
+    val summary: String? = null,
+    val repeatCount: Int? = null,
+    val repeatDuration: String? = null
 )
 
 /**
@@ -106,6 +127,10 @@ class IcsParser {
         val organizer = parseOrganizer(vevent)
         val attendeeCount = vevent.getProperties<Attendee>(Property.ATTENDEE).size
 
+        val rdates = parseDateList(vevent.getProperties<RDate>(Property.RDATE), isAllDay)
+        val exdates = parseDateList(vevent.getProperties<ExDate>(Property.EXDATE), isAllDay)
+        val alarms = vevent.alarms.mapNotNull { parseAlarm(it) }
+
         val base = if (isAllDay) {
             parseAllDayEvent(uid, summary, description, location, rrule, vevent)
         } else {
@@ -118,8 +143,62 @@ class IcsParser {
             categories = categories,
             priority = priority,
             organizer = organizer,
-            attendeeCount = attendeeCount
+            attendeeCount = attendeeCount,
+            rdates = rdates,
+            exdates = exdates,
+            alarms = alarms
         )
+    }
+
+    /**
+     * Convert an ical4j VAlarm into a ParsedAlarm. Returns null if the alarm
+     * is missing the required ACTION+TRIGGER (per RFC 5545 §3.6.6).
+     *
+     * Trigger is preserved in its original form: duration string ("-PT15M") or
+     * basic-format UTC instant ("20260115T093000Z"). The check leans on ical4j:
+     * a trigger with a TZID parameter or VALUE=DATE-TIME is absolute.
+     */
+    private fun parseAlarm(va: VAlarm): ParsedAlarm? {
+        val action = va.getProperty<Action>(Property.ACTION)?.value ?: return null
+        val triggerProp = va.getProperty<Trigger>(Property.TRIGGER) ?: return null
+        // Trigger string preservation:
+        //   - ical4j sets `value` to the basic-format UTC instant for absolute triggers,
+        //     or the duration string ("-PT15M", "+P1D", etc.) for relative triggers.
+        val triggerValue = triggerProp.value ?: return null
+
+        val description = va.getProperty<Description>(Property.DESCRIPTION)?.value
+        val summary = va.getProperty<Summary>(Property.SUMMARY)?.value
+        val repeatCount = va.getProperty<Repeat>(Property.REPEAT)?.count
+        val repeatDuration = va.getProperty<net.fortuna.ical4j.model.property.Duration>(Property.DURATION)
+            ?.duration?.toString()
+
+        return ParsedAlarm(
+            trigger = triggerValue,
+            action = action,
+            description = description,
+            summary = summary,
+            repeatCount = repeatCount,
+            repeatDuration = repeatDuration
+        )
+    }
+
+    /**
+     * Extract values from a list of date-list properties (RDATE, EXDATE).
+     * RFC 5545 §3.8.5.2: RDATE may carry DATE-TIME, DATE, or PERIOD values.
+     * For PERIOD we extract the start instant only (best-effort).
+     */
+    private fun parseDateList(
+        props: List<net.fortuna.ical4j.model.property.DateListProperty>,
+        isAllDay: Boolean
+    ): List<String> {
+        val out = mutableListOf<String>()
+        for (prop in props) {
+            val list = prop.dates ?: continue
+            for (date in list) {
+                out += if (isAllDay) parseDate(date.toString()) else formatInstant(date.toInstant())
+            }
+        }
+        return out
     }
 
     private fun parseOrganizer(vevent: VEvent): String? {
@@ -190,6 +269,13 @@ class IcsParser {
             else -> startInstant.plusSeconds(3600)  // Default: 1 hour
         }
 
+        // RFC 5545 §3.8.5.4: DTSTART and DTEND may carry distinct TZIDs (cross-tz
+        // events e.g. flights). Preserve both; normalize endTimezone to null when it
+        // matches the start (per ParsedEvent.endTimezone doc invariant).
+        val startTzid = dtStart.getParameter<TzId>(net.fortuna.ical4j.model.Parameter.TZID)?.value
+        val endTzid = dtEndProp?.getParameter<TzId>(net.fortuna.ical4j.model.Parameter.TZID)?.value
+        val endTimezone = endTzid?.takeIf { it != startTzid }
+
         return ParsedEvent(
             uid = uid,
             summary = summary,
@@ -198,6 +284,8 @@ class IcsParser {
             isAllDay = false,
             startTime = formatInstant(startInstant),
             endTime = formatInstant(endInstant),
+            timezone = startTzid,
+            endTimezone = endTimezone,
             rrule = rrule
         )
     }

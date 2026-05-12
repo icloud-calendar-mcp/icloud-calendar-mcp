@@ -6,12 +6,12 @@
     "url": "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp",
     "source": "github"
   },
-  "version": "3.0.0",
+  "version": "3.0.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@icloud-calendar-mcp/server",
-      "version": "3.0.0",
+      "version": "3.0.1",
       "transport": {
         "type": "stdio"
       },

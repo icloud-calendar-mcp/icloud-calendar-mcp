@@ -74,10 +74,10 @@ uvx icloud-calendar-mcp
 
 ```bash
 # Download from GitHub Releases
-curl -LO https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/latest/download/icloud-calendar-mcp-3.0.0-all.jar
+curl -LO https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/latest/download/icloud-calendar-mcp-3.0.1-all.jar
 
 # Run
-java -jar icloud-calendar-mcp-3.0.0-all.jar
+java -jar icloud-calendar-mcp-3.0.1-all.jar
 ```
 
 #### Option 4: Build from Source
@@ -86,7 +86,7 @@ java -jar icloud-calendar-mcp-3.0.0-all.jar
 git clone https://github.com/icloud-calendar-mcp/icloud-calendar-mcp.git
 cd icloud-calendar-mcp
 ./gradlew fatJar
-java -jar build/libs/icloud-calendar-mcp-3.0.0-all.jar
+java -jar build/libs/icloud-calendar-mcp-3.0.1-all.jar
 ```
 
 ### Configuration
@@ -158,7 +158,7 @@ Add to your Claude Desktop configuration:
   "mcpServers": {
     "icloud-calendar": {
       "command": "java",
-      "args": ["-jar", "/path/to/icloud-calendar-mcp-3.0.0-all.jar"],
+      "args": ["-jar", "/path/to/icloud-calendar-mcp-3.0.1-all.jar"],
       "env": {
         "ICLOUD_USERNAME": "your-apple-id@icloud.com",
         "ICLOUD_PASSWORD": "your-app-specific-password"
@@ -450,7 +450,7 @@ src/main/kotlin/org/onekash/mcp/calendar/
 ```bash
 ICLOUD_USERNAME="test@icloud.com" \
 ICLOUD_PASSWORD="test-app-password" \
-npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.0.0-all.jar
+npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.0.1-all.jar
 ```
 
 ---

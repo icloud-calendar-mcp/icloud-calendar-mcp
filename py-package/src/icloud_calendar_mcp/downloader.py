@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 JAR_NAME = f"icloud-calendar-mcp-{VERSION}-all.jar"
 DOWNLOAD_URL = f"https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/download/v{VERSION}/{JAR_NAME}"
 MIN_JAR_SIZE = 1_000_000  # 1MB minimum

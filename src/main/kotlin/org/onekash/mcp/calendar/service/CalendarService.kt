@@ -1,9 +1,11 @@
 package org.onekash.mcp.calendar.service
 
 import org.onekash.mcp.calendar.caldav.*
+import org.onekash.mcp.calendar.ics.AlarmSpec
 import org.onekash.mcp.calendar.ics.IcsBuilder
 import org.onekash.mcp.calendar.ics.IcsPatcher
 import org.onekash.mcp.calendar.ics.IcsParser
+import org.onekash.mcp.calendar.ics.ParsedAlarm
 import org.onekash.mcp.calendar.ics.ParsedEvent
 import java.util.concurrent.ConcurrentHashMap
 
@@ -48,7 +50,8 @@ data class EventInfo(
     val categories: List<String> = emptyList(),
     val priority: Int? = null,
     val organizer: String? = null,
-    val attendeeCount: Int = 0
+    val attendeeCount: Int = 0,
+    val alarms: List<ParsedAlarm> = emptyList()
 )
 
 /**
@@ -241,7 +244,11 @@ class CalendarService(
         description: String? = null,
         location: String? = null,
         timezone: String? = null,
-        rrule: String? = null
+        rrule: String? = null,
+        endTimezone: String? = null,
+        rdates: List<String>? = null,
+        exdates: List<String>? = null,
+        alarms: List<AlarmSpec>? = null
     ): ServiceResult<EventInfo> {
         // Check if calendar exists and is writable
         val calendarsResult = client.listCalendars()
@@ -257,7 +264,10 @@ class CalendarService(
             return ServiceResult.Error(403, "Calendar is read-only: ${calendar.displayName}")
         }
 
-        // Build ICS content
+        // Build ICS content. CREATED + LAST-MODIFIED set to "now" on first creation
+        // (RFC 5545 §3.8.7.1/.3); subsequent edits go through IcsPatcher which refreshes
+        // LAST-MODIFIED and preserves CREATED.
+        val now = java.time.Instant.now()
         val ics = builder.build(
             summary = summary,
             startTime = startTime,
@@ -268,7 +278,13 @@ class CalendarService(
             description = description,
             location = location,
             timezone = timezone,
-            rrule = rrule
+            rrule = rrule,
+            createdAt = now,
+            lastModified = now,
+            endTimezone = endTimezone,
+            rdates = rdates,
+            exdates = exdates,
+            alarms = alarms
         )
 
         // Create via CalDAV
@@ -324,27 +340,47 @@ class CalendarService(
         description: String? = null,
         location: String? = null,
         timezone: String? = null,
-        rrule: String? = null
+        rrule: String? = null,
+        endTimezone: String? = null,
+        rdates: List<String>? = null,
+        exdates: List<String>? = null,
+        alarms: List<AlarmSpec>? = null
     ): ServiceResult<EventInfo> {
         // Find existing event (checks TTL)
         val existing = getFromCache(eventId)
             ?: return ServiceResult.Error(404, "Event not found: $eventId")
 
-        // Use IcsPatcher to preserve VALARM, ATTENDEE, ORGANIZER, X-* properties
-        val ics = patcher.patch(
-            existingIcs = existing.icalData,
-            uid = eventId,
-            summary = summary,
-            startTime = startTime,
-            endTime = endTime,
-            startDate = startDate,
-            endDate = endDate,
-            isAllDay = isAllDay,
-            description = description,
-            location = location,
-            timezone = timezone,
-            rrule = rrule
-        )
+        // Use IcsPatcher to preserve VALARM, ATTENDEE, ORGANIZER, X-* properties.
+        // If the cached ICS is something ical4j can't re-parse (server quirk,
+        // weird CRLF/LF mix, etc.), fail loud rather than silently rebuilding
+        // a partial event — see issue #2.
+        val ics = try {
+            patcher.patch(
+                existingIcs = existing.icalData,
+                uid = eventId,
+                summary = summary,
+                startTime = startTime,
+                endTime = endTime,
+                startDate = startDate,
+                endDate = endDate,
+                isAllDay = isAllDay,
+                description = description,
+                location = location,
+                timezone = timezone,
+                rrule = rrule,
+                endTimezone = endTimezone,
+                rdates = rdates,
+                exdates = exdates,
+                alarms = alarms
+            )
+        } catch (e: IcsPatcher.UnparseableExistingIcsException) {
+            return ServiceResult.Error(
+                422,
+                "Could not patch event: existing ICS is unparseable. " +
+                    "This can happen with server-side line-ending quirks; " +
+                    "try a full update (sending all fields) instead of a partial one."
+            )
+        }
 
         // Update via CalDAV
         return when (val result = client.updateEvent(existing.href, ics, existing.etag)) {
@@ -430,7 +466,8 @@ class CalendarService(
             categories = parsed.categories,
             priority = parsed.priority,
             organizer = parsed.organizer,
-            attendeeCount = parsed.attendeeCount
+            attendeeCount = parsed.attendeeCount,
+            alarms = parsed.alarms
         )
     }
 }

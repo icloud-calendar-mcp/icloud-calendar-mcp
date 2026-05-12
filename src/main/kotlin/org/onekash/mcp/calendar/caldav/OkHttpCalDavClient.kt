@@ -34,6 +34,7 @@ class OkHttpCalDavClient(
 ) : CalDavClient, java.io.Closeable {
 
     private val xmlParser = ICloudXmlParser()
+    private val logger = org.slf4j.LoggerFactory.getLogger(OkHttpCalDavClient::class.java)
 
     // Cached discovery results
     // @Volatile: double-fetch under contention is acceptable (idempotent)
@@ -104,7 +105,11 @@ class OkHttpCalDavClient(
 
                     val peekBody = try {
                         response.peekBody((MAX_BODY_LOG_CHARS + 1).toLong()).string()
-                    } catch (_: Exception) { "" }
+                    } catch (e: Exception) {
+                        org.slf4j.LoggerFactory.getLogger(OkHttpCalDavClient::class.java)
+                            .debug("failed to peek response body for HTTP logging: {}", e.toString())
+                        ""
+                    }
 
                     val bodyLog = if (peekBody.length > MAX_BODY_LOG_CHARS) {
                         peekBody.take(MAX_BODY_LOG_CHARS) + "... [truncated]"
@@ -326,13 +331,19 @@ class OkHttpCalDavClient(
         val uid = xmlParser.extractUid(icalData)
             ?: return CalDavResult.Error.badRequestError("ICS data missing UID")
 
+        // When the caller has no etag (e.g. the original REPORT response omitted
+        // <getetag> per server quirk — RFC 4791 §5.3.4 SHOULD), probe via PROPFIND
+        // so the PUT can carry an If-Match instead of silently bypassing optimistic
+        // concurrency. PROPFIND failure falls through to no-If-Match (best-effort).
+        val effectiveEtag = etag ?: fetchEtag(url)
+
         val requestBuilder = Request.Builder()
             .url(url)
             .put(icalData.toRequestBody(ICS_MEDIA_TYPE))
             .addHeader("Authorization", basicAuth())
 
-        if (etag != null) {
-            requestBuilder.addHeader("If-Match", etag)
+        if (effectiveEtag != null) {
+            requestBuilder.addHeader("If-Match", effectiveEtag)
         }
 
         val request = requestBuilder.build()
@@ -353,13 +364,16 @@ class OkHttpCalDavClient(
     override fun deleteEvent(href: String, etag: String?): CalDavResult<Unit> {
         val url = if (href.startsWith("http")) href else "$baseUrl$href"
 
+        // Same PROPFIND-recovery logic as updateEvent — see comment there.
+        val effectiveEtag = etag ?: fetchEtag(url)
+
         val requestBuilder = Request.Builder()
             .url(url)
             .delete()
             .addHeader("Authorization", basicAuth())
 
-        if (etag != null) {
-            requestBuilder.addHeader("If-Match", etag)
+        if (effectiveEtag != null) {
+            requestBuilder.addHeader("If-Match", effectiveEtag)
         }
 
         val request = requestBuilder.build()
@@ -544,7 +558,8 @@ class OkHttpCalDavClient(
             }
 
             return null // Max hops exceeded
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logger.debug("well-known discovery failed for {}/.well-known/caldav: {}", baseUrl.trimEnd('/'), e.toString())
             return null // Well-known discovery is best-effort
         }
     }
@@ -577,7 +592,8 @@ class OkHttpCalDavClient(
                     null
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logger.debug("fetchEtag PROPFIND failed for {}: {}", eventUrl, e.toString())
             null
         }
     }
