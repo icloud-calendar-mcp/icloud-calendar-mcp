@@ -196,7 +196,7 @@ private fun createCalendarService(): Pair<CalendarService?, OkHttpCalDavClient?>
     }
 }
 
-private fun registerTools(server: Server, calendarService: CalendarService?, logger: McpLogger) {
+internal fun registerTools(server: Server, calendarService: CalendarService?, logger: McpLogger) {
     // ═══════════════════════════════════════════════════════════════════
     // TOOL: list_calendars
     // ═══════════════════════════════════════════════════════════════════
@@ -256,7 +256,8 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                         }
                     }
                     CallToolResult(
-                        content = listOf(TextContent(text = calendarsJson.toString()))
+                        content = listOf(TextContent(text = calendarsJson.toString())),
+                        structuredContent = calendarsJson
                     )
                 }
                 is ServiceResult.Error -> {
@@ -373,7 +374,8 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                         }
                     }
                     CallToolResult(
-                        content = listOf(TextContent(text = eventsJson.toString()))
+                        content = listOf(TextContent(text = eventsJson.toString())),
+                        structuredContent = eventsJson
                     )
                 }
                 is ServiceResult.Error -> {
@@ -594,7 +596,8 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                         }
                     }
                     CallToolResult(
-                        content = listOf(TextContent(text = eventJson.toString()))
+                        content = listOf(TextContent(text = eventJson.toString())),
+                        structuredContent = eventJson
                     )
                 }
                 is ServiceResult.Error -> {
@@ -827,7 +830,8 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                         }
                     }
                     CallToolResult(
-                        content = listOf(TextContent(text = eventJson.toString()))
+                        content = listOf(TextContent(text = eventJson.toString())),
+                        structuredContent = eventJson
                     )
                 }
                 is ServiceResult.Error -> {
@@ -908,7 +912,8 @@ private fun registerTools(server: Server, calendarService: CalendarService?, log
                         put("message", "Event deleted successfully")
                     }
                     CallToolResult(
-                        content = listOf(TextContent(text = responseJson.toString()))
+                        content = listOf(TextContent(text = responseJson.toString())),
+                        structuredContent = responseJson
                     )
                 }
                 is ServiceResult.Error -> {
