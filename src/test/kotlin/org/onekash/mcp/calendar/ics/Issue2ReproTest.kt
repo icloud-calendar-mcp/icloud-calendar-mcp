@@ -132,23 +132,29 @@ class Issue2ReproTest {
 
     /**
      * Probe the case where the ORIGINAL ICS has only LF line endings
-     * (no CRLF) — this is what KashCal-style producers, or our old pre-§3.1
-     * builder, would emit. ical4j is generally tolerant but iCloud might not be.
+     * (no CRLF) — this is what some producers, or our old pre-§3.1 builder,
+     * would emit. ical4j is generally tolerant but iCloud might not be.
      */
     @Test
-    fun `description-only patch on LF-only original throws typed exception (chunk 38)`() {
-        // Chunk 38 hardening: when ical4j can't parse the existing ICS, the
-        // patcher used to silently fall through to buildFresh, producing an
-        // Untitled-summary event that destroyed the original. The new behavior
-        // is a typed exception that the service layer turns into a 422.
+    fun `description-only patch on LF-only original preserves SUMMARY`() {
+        // The originally-reported corruption path: existing ICS with only LF line
+        // endings (some producers, or our old pre-folding builder). The
+        // old ical4j CalendarBuilder rejected it and the patcher silently rebuilt
+        // an "Untitled" event, destroying the SUMMARY. The vendored icaldav parser
+        // tolerates bare LF and recovers the event, so a description-only patch now
+        // keeps the original SUMMARY — the actual fix for issue #2.
         val lfOnly = buildOriginalIcsWithFoldedDescription().replace("\r\n", "\n")
-        kotlin.test.assertFailsWith<IcsPatcher.UnparseableExistingIcsException> {
-            patcher.patch(
-                existingIcs = lfOnly,
-                uid = "repro-issue2@test",
-                description = newDescription
-            )
-        }
+
+        val patched = patcher.patch(
+            existingIcs = lfOnly,
+            uid = "repro-issue2@test",
+            description = newDescription
+        )
+
+        val event = parser.parse(patched).single()
+        assertEquals(originalSummary, event.summary,
+            "SUMMARY corruption detected — issue #2 not fixed! Got: '${event.summary}'")
+        assertEquals(newDescription, event.description)
     }
 
     /**

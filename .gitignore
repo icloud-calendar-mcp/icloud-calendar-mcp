@@ -47,3 +47,6 @@ py-package/.venv/
 py-package/*.egg-info/
 __pycache__/
 *.pyc
+
+# MCP registry publisher tokens (secrets)
+.mcpregistry_*

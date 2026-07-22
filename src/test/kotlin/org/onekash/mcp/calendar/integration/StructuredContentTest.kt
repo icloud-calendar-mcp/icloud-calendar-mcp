@@ -2,6 +2,7 @@ package org.onekash.mcp.calendar.integration
 
 import io.mockk.every
 import io.mockk.mockk
+import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.types.*
@@ -76,7 +77,8 @@ class StructuredContentTest {
 
     private fun callTool(name: String, args: JsonObject): CallToolResult = runBlocking {
         val registered = server.tools[name] ?: error("tool $name not registered")
-        registered.handler(CallToolRequest(CallToolRequestParams(name = name, arguments = args)))
+        val connection = mockk<ClientConnection>(relaxed = true)
+        registered.handler(connection, CallToolRequest(CallToolRequestParams(name = name, arguments = args)))
     }
 
     /**
@@ -199,5 +201,75 @@ class StructuredContentTest {
         assertMatchesOutputSchema("delete_event", result)
         assertMirrorsTextContent("delete_event", result)
         assertEquals(true, result.structuredContent!!["success"]!!.jsonPrimitive.boolean)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Negative paths: error responses are exempt from the structuredContent
+    // requirement. They MUST set isError = true and MUST NOT carry
+    // structuredContent — attaching it to an isError response would be the
+    // mirror-image bug (a schema-less object on a response the client treats
+    // as an error). These tests lock that invariant in.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /** An error result must flag isError and omit structuredContent entirely. */
+    private fun assertErrorHasNoStructuredContent(name: String, result: CallToolResult) {
+        assertEquals(true, result.isError, "$name error path should set isError = true")
+        assertEquals(
+            null,
+            result.structuredContent,
+            "$name error response must not carry structuredContent"
+        )
+    }
+
+    @Test
+    fun `service error paths omit structuredContent and set isError`() {
+        every { service.listCalendars() } returns ServiceResult.Error(500, "boom")
+        every { service.getEvents(any(), any(), any()) } returns ServiceResult.Error(404, "no calendar")
+        every {
+            service.createEvent(
+                any(), any(), any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any(), any(), any()
+            )
+        } returns ServiceResult.Error(403, "read only")
+        every {
+            service.updateEvent(
+                any(), any(), any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any(), any(), any()
+            )
+        } returns ServiceResult.Error(404, "not found")
+        every { service.deleteEvent(any()) } returns ServiceResult.Error(404, "not found")
+
+        assertErrorHasNoStructuredContent("list_calendars", callTool("list_calendars", buildJsonObject { }))
+        assertErrorHasNoStructuredContent("get_events", callTool("get_events", buildJsonObject {
+            put("calendar_id", calendarId)
+            put("start_date", "2026-01-01")
+            put("end_date", "2026-01-31")
+        }))
+        assertErrorHasNoStructuredContent("create_event", callTool("create_event", buildJsonObject {
+            put("calendar_id", calendarId)
+            put("title", "Team Sync")
+            put("start_time", "2026-01-15T09:00:00")
+            put("end_time", "2026-01-15T10:00:00")
+        }))
+        assertErrorHasNoStructuredContent("update_event", callTool("update_event", buildJsonObject {
+            put("event_id", eventId)
+            put("title", "Renamed")
+        }))
+        assertErrorHasNoStructuredContent("delete_event", callTool("delete_event", buildJsonObject {
+            put("event_id", eventId)
+        }))
+    }
+
+    @Test
+    fun `validation error paths omit structuredContent and set isError`() {
+        // Malformed inputs are rejected before the service is ever called.
+        assertErrorHasNoStructuredContent("get_events", callTool("get_events", buildJsonObject {
+            put("calendar_id", calendarId)
+            put("start_date", "not-a-date")
+            put("end_date", "also-not-a-date")
+        }))
+        assertErrorHasNoStructuredContent("delete_event", callTool("delete_event", buildJsonObject {
+            put("event_id", "")
+        }))
     }
 }

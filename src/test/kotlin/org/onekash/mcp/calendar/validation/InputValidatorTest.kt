@@ -298,53 +298,61 @@ class InputValidatorTest {
     // ICS SANITIZATION TESTS
     // ═══════════════════════════════════════════════════════════════════
 
+    // NOTE: sanitizeForIcs ONLY neutralizes CRLF injection. RFC 5545 §3.3.11
+    // escaping of `\ , ;` is owned by the ICalGenerator on write; escaping here
+    // too caused a double-escape (clients saw literal `\,` `\;` `\\` in
+    // descriptions after a round-trip). See InputValidator.sanitizeForIcs KDoc.
+
     @Test
-    fun `sanitizeForIcs should escape backslashes`() {
+    fun `sanitizeForIcs leaves backslashes for the generator to escape`() {
         val result = InputValidator.sanitizeForIcs("path\\to\\file")
-        assertEquals("path\\\\to\\\\file", result)
+        assertEquals("path\\to\\file", result)
     }
 
     @Test
-    fun `sanitizeForIcs should escape semicolons`() {
+    fun `sanitizeForIcs leaves semicolons for the generator to escape`() {
         val result = InputValidator.sanitizeForIcs("item1;item2")
-        assertEquals("item1\\;item2", result)
+        assertEquals("item1;item2", result)
     }
 
     @Test
-    fun `sanitizeForIcs should escape commas`() {
+    fun `sanitizeForIcs leaves commas for the generator to escape`() {
         val result = InputValidator.sanitizeForIcs("item1,item2")
-        assertEquals("item1\\,item2", result)
+        assertEquals("item1,item2", result)
     }
 
     @Test
-    fun `sanitizeForIcs should escape newlines`() {
+    fun `sanitizeForIcs collapses newlines to spaces`() {
         val result = InputValidator.sanitizeForIcs("line1\nline2")
-        assertEquals("line1\\nline2", result)
+        assertEquals("line1 line2", result)
     }
 
     @Test
-    fun `sanitizeForIcs should remove carriage returns`() {
+    fun `sanitizeForIcs collapses CRLF to a single space`() {
         val result = InputValidator.sanitizeForIcs("line1\r\nline2")
-        assertEquals("line1\\nline2", result)
+        assertEquals("line1 line2", result)
     }
 
     @Test
     fun `sanitizeForIcs should handle ICS injection attempt`() {
-        // Attempt to inject an additional ICS property
+        // Attempt to inject an additional ICS property via a bare newline.
         val malicious = "Meeting\nATTENDEE:mailto:evil@hacker.com"
         val result = InputValidator.sanitizeForIcs(malicious)
-        // Newline should be escaped, preventing injection
-        assertEquals("Meeting\\nATTENDEE:mailto:evil@hacker.com", result)
+        // The newline must be gone so the value cannot break onto its own line.
+        assertFalse(result.contains("\n"))
+        assertFalse(result.contains("\r"))
+        assertEquals("Meeting ATTENDEE:mailto:evil@hacker.com", result)
     }
 
     @Test
     fun `sanitizeForIcs should handle complex injection`() {
         val malicious = "Title;ORGANIZER:mailto:evil@hacker.com\r\nATTENDEE:innocent@user.com"
         val result = InputValidator.sanitizeForIcs(malicious)
-        // All dangerous chars should be escaped
+        // No line breaks survive → cannot smuggle a separate property.
         assertFalse(result.contains("\n"))
         assertFalse(result.contains("\r"))
-        assertTrue(result.contains("\\;"))
+        // The semicolon is preserved verbatim; the generator escapes it on write.
+        assertTrue(result.contains(";"))
     }
 
     // ═══════════════════════════════════════════════════════════════════

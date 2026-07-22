@@ -12,14 +12,12 @@ import java.time.Instant
  * exercised by this MCP server. Each test cites the RFC clause it pins so any
  * failure points at a real compliance gap, not an implementation detail.
  *
- * Slim port of KashCal's Rfc5545ComplianceAuditTest — clauses included are
- * those touched by chunks 27-31 and 36 (VALARM authoring). Out of scope for
- * this audit (covered by the project's other test suites or deliberately
- * deferred):
+ * Clauses included are those exercised by the server's authoring path (including
+ * VALARM authoring). Out of scope for this audit (covered by the project's other
+ * test suites or deliberately deferred):
  *
- * - §3.3.10 RRULE corpus — RRULE strings pass through verbatim; client owns
- *   construction. KashCal has a parity harness for this; the MCP server does not
- *   expand recurrences server-side.
+ * - §3.3.10 RRULE corpus — RRULE strings pass through verbatim; the client owns
+ *   construction. The MCP server does not expand recurrences server-side.
  * - §3.8.4 relationships (RELATED-TO, ATTENDEE/ORGANIZER beyond preservation) —
  *   IcsPatcherTest covers ATTENDEE/ORGANIZER preservation; deeper semantics not
  *   modeled here.

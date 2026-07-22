@@ -478,7 +478,11 @@ class IcsBuilderTest {
             endTime = "2025-01-15T11:00:00Z"
         )
 
-        assertFalse(ics.contains("STATUS:"))
+        // STATUS and SEQUENCE are emitted unconditionally for iCloud compatibility
+        // (a missing STATUS triggers HTTP 400); with no caller value STATUS defaults
+        // to CONFIRMED. Genuinely optional properties are omitted when unset.
+        assertTrue(ics.contains("STATUS:CONFIRMED"))
+        assertTrue(ics.contains("SEQUENCE:"))
         assertFalse(ics.contains("URL:"))
         assertFalse(ics.contains("CATEGORIES:"))
         assertFalse(ics.contains("PRIORITY:"))

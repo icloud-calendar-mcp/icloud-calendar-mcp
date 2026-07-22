@@ -67,7 +67,7 @@ fun main(args: Array<String>) {
     val server = Server(
         serverInfo = Implementation(
             name = "icloud-calendar-mcp",
-            version = "3.0.0"
+            version = "3.1.0"
         ),
         options = ServerOptions(
             capabilities = ServerCapabilities(

@@ -3,7 +3,7 @@ package org.onekash.mcp.calendar.caldav
 /**
  * Utility functions for ETag handling per RFC 7232.
  *
- * Ported from KashCal's EtagUtils — normalizes ETags from various server formats.
+ * Normalizes ETags from the various formats CalDAV servers emit.
  */
 object EtagUtils {
     /**

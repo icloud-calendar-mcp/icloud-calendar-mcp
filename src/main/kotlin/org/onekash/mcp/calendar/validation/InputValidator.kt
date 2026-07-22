@@ -319,16 +319,22 @@ object InputValidator {
     }
 
     /**
-     * Sanitize text for ICS output.
-     * Escapes special characters to prevent injection.
+     * Sanitize text before it is handed to the ICS writer.
+     *
+     * This ONLY neutralizes CRLF injection (a value like
+     * "text\r\nX-EVIL:injected" must not smuggle a separate property onto the
+     * wire). It intentionally does NOT apply RFC 5545 §3.3.11 escaping of
+     * `\ , ;` — the vendored [org.onekash.icaldav.parser.ICalGenerator] owns
+     * that on write. Escaping here as well produced a double-escape
+     * (`,` -> `\,` -> `\\\,`), so clients saw literal backslashes in
+     * descriptions/titles after a create/update round-trip. Mirrors
+     * IcsPatcher.sanitize().
      */
     fun sanitizeForIcs(text: String): String {
         return text
-            .replace("\\", "\\\\")
-            .replace(";", "\\;")
-            .replace(",", "\\,")
-            .replace("\n", "\\n")
-            .replace("\r", "")
+            .replace("\r\n", " ")
+            .replace("\r", " ")
+            .replace("\n", " ")
     }
 
     /**

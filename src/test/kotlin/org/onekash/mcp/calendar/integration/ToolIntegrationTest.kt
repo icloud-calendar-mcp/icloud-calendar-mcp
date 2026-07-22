@@ -293,9 +293,10 @@ class ToolIntegrationTest {
 
         val safeTitle = InputValidator.sanitizeForIcs(title)
 
-        // Newline should be escaped
+        // Newline must be gone (CRLF-injection defense); the value can no longer
+        // break onto its own line. RFC 5545 escaping is the generator's job.
         assertFalse(safeTitle.contains("\n"))
-        assertTrue(safeTitle.contains("\\n"))
+        assertFalse(safeTitle.contains("\r"))
     }
 
     @Test
@@ -304,8 +305,38 @@ class ToolIntegrationTest {
 
         val safeLocation = InputValidator.sanitizeForIcs(location)
 
-        // Semicolon should be escaped
-        assertTrue(safeLocation.contains("\\;"))
+        // Semicolon is preserved verbatim (no double-escape); the generator
+        // escapes it on write. The injection defense is the CRLF stripping above.
+        assertTrue(safeLocation.contains(";"))
+        assertFalse(safeLocation.contains("\n"))
+    }
+
+    @Test
+    fun `special chars survive the full tool write-read round trip without double escaping`() {
+        // Regression for the escaping half of issue #2: the create/update tool path
+        // ran sanitizeForIcs (which used to RFC 5545-escape) AND then the generator
+        // escaped again, so clients saw literal "\," "\;" "\\" in descriptions after
+        // a round-trip. This exercises the SAME combined path the tools use —
+        // sanitizeForIcs -> IcsBuilder.build -> IcsParser.parse — which no prior test
+        // did (they tested the builder or the sanitizer in isolation).
+        val builder = org.onekash.mcp.calendar.ics.IcsBuilder()
+        val parser = org.onekash.mcp.calendar.ics.IcsParser()
+
+        val rawTitle = "Lunch, dinner; and a path C:\\Users\\Name"
+        val rawDescription = "warm intro, framed; not generic. path\\here"
+
+        val ics = builder.build(
+            uid = "roundtrip@test",
+            summary = InputValidator.sanitizeForIcs(rawTitle),
+            startTime = "2026-08-15T09:00:00",
+            endTime = "2026-08-15T10:00:00",
+            timezone = "UTC",
+            description = InputValidator.sanitizeForIcs(rawDescription)
+        )
+
+        val parsed = parser.parse(ics).single()
+        assertEquals(rawTitle, parsed.summary)
+        assertEquals(rawDescription, parsed.description)
     }
 
     // ═══════════════════════════════════════════════════════════════════

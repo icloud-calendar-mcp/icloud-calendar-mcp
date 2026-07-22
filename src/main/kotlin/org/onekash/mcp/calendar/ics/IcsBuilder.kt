@@ -1,11 +1,18 @@
 package org.onekash.mcp.calendar.ics
 
-import net.fortuna.ical4j.model.Property
-import net.fortuna.ical4j.model.TimeZoneRegistryFactory
+import org.onekash.icaldav.model.AlarmAction
+import org.onekash.icaldav.model.EventStatus
+import org.onekash.icaldav.model.ICalAlarm
+import org.onekash.icaldav.model.ICalDateTime
+import org.onekash.icaldav.model.ICalEvent
+import org.onekash.icaldav.model.RRule
+import org.onekash.icaldav.model.Transparency
+import org.onekash.icaldav.parser.ICalGenerator
+import org.onekash.icaldav.util.DurationUtils
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
-import java.time.ZoneOffset
-import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 
 /**
@@ -35,56 +42,55 @@ data class AlarmSpec(
 /**
  * Builds valid ICS content for CalDAV uploads.
  *
- * Handles:
- * - All-day vs timed events
- * - UTC and timezone-aware datetimes
- * - RFC 5545 text escaping
- * - Line folding at 75 octets (not chars)
- * - RRULE for recurring events
- * - VTIMEZONE generation via ical4j
+ * Full adoption of the vendored icaldav-core [ICalGenerator]: the MCP tool inputs
+ * are mapped onto an [ICalEvent] model and serialized by icaldav, which owns all
+ * RFC 5545 heavy lifting (CRLF folding, text escaping, VTIMEZONE generation, and
+ * Apple/iCloud extensions on VALARMs). ical4j is confined to :icaldav-core and is
+ * NOT on the write path.
  *
- * Line endings: every emitted contentline ends with CRLF per RFC 5545 §3.1
- * (the ABNF: contentline = name *(";" param ) ":" value CRLF). Kotlin's
- * StringBuilder.appendLine uses the platform line separator, which is LF on
- * Linux/Android — using it directly violates §3.1. We route every line through
- * [crlfLine] instead.
+ * icaldav always emits the properties iCloud requires (CALSCALE, STATUS, SEQUENCE),
+ * so those appear unconditionally — an improvement over the previous hand-written
+ * emitter which omitted them when the caller left them blank.
  */
 class IcsBuilder {
 
     companion object {
         private const val PRODID = "-//OnekashMCP//AppleCalendarMCP 1.0//EN"
-        private const val VERSION = "2.0"
-        private const val CALSCALE = "GREGORIAN"
-        private const val MAX_LINE_OCTETS = 75
-        private const val CRLF = "\r\n"
-
-        // Single registry shared across all builds. createRegistry() allocates a fresh
-        // ConcurrentHashMap per call; reusing one instance avoids reloading zoneinfo
-        // resources on first lookup of each new builder/patcher invocation.
-        internal val timeZoneRegistry: net.fortuna.ical4j.model.TimeZoneRegistry =
-            TimeZoneRegistryFactory.getInstance().createRegistry()
 
         /**
          * Single source of truth for the "is this VALARM TRIGGER an absolute UTC
-         * datetime?" check. Used by [IcsBuilder] (emit-side), [IcsPatcher.buildVAlarm]
-         * (ical4j conversion-side), and [org.onekash.mcp.calendar.validation.InputValidator]
-         * (boundary validation). Anchored, no backtracking risk.
+         * datetime?" check. Used by [IcsBuilder]/[IcsPatcher] (emit-side alarm mapping)
+         * and [org.onekash.mcp.calendar.validation.InputValidator] (boundary validation).
+         * Anchored, no backtracking risk.
          */
         internal val ICAL_ABSOLUTE_TRIGGER_REGEX = Regex("""^\d{8}T\d{6}Z$""")
+
+        /**
+         * Map an [AlarmSpec] (MCP wire shape) to an icaldav [ICalAlarm]. Shared with
+         * [IcsPatcher] so create and update paths emit identical VALARM structure.
+         *
+         * - Trigger: absolute UTC form (regex match) → [ICalAlarm.triggerAbsolute];
+         *   otherwise parsed as an RFC 5545 duration → [ICalAlarm.trigger].
+         * - REPEAT/DURATION are emitted only as an atomic pair (both present).
+         */
+        internal fun toICalAlarm(spec: AlarmSpec): ICalAlarm {
+            val action = AlarmAction.fromString(spec.action)
+            val absolute = ICAL_ABSOLUTE_TRIGGER_REGEX.matches(spec.trigger)
+            val repeatPair = spec.repeatCount != null && spec.repeatCount > 0 &&
+                !spec.repeatDuration.isNullOrBlank()
+            return ICalAlarm(
+                action = action,
+                trigger = if (absolute) null else DurationUtils.parse(spec.trigger),
+                triggerAbsolute = if (absolute) ICalDateTime.parse(spec.trigger) else null,
+                description = spec.description?.takeIf { it.isNotBlank() },
+                summary = spec.summary?.takeIf { it.isNotBlank() },
+                repeatCount = if (repeatPair) spec.repeatCount else 0,
+                repeatDuration = if (repeatPair) DurationUtils.parse(spec.repeatDuration) else null
+            )
+        }
     }
 
-    private fun StringBuilder.crlfLine(line: String): StringBuilder {
-        append(line)
-        append(CRLF)
-        return this
-    }
-
-    private val utcFormatter = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'")
-        .withZone(ZoneOffset.UTC)
-
-    private val localFormatter = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss")
-
-    private val dateFormatter = DateTimeFormatter.ofPattern("yyyyMMdd")
+    private val generator = ICalGenerator(prodId = PRODID, includeAppleExtensions = true)
 
     /**
      * Build ICS content for an event.
@@ -143,347 +149,159 @@ class IcsBuilder {
         alarms: List<AlarmSpec>? = null
     ): String {
         val effectiveUid = uid ?: "${UUID.randomUUID()}@icloud-calendar-mcp"
-        val dtstamp = utcFormatter.format(Instant.now())
+        val recurring = !rrule.isNullOrBlank()
 
-        // VTIMEZONE only matters for non-UTC timed events with a TZID.
-        val timedNonUtc = startTime != null && !startTime.endsWith("Z") &&
-            endTime != null && !endTime.endsWith("Z")
-        val effectiveEndTz = endTimezone?.takeIf { it != timezone }
-        val needsVtimezone = timezone != null && timedNonUtc
+        // Resolve DTSTART / DTEND / DURATION for the three supported shapes.
+        // RFC 5545 §3.8.5 convention: when RRULE is present, emit DTSTART + DURATION
+        // (each occurrence carries its own length) instead of DTSTART + DTEND.
+        val times = resolveTimes(
+            startTime = startTime,
+            endTime = endTime,
+            startDate = startDate,
+            endDate = endDate,
+            isAllDay = isAllDay,
+            timezone = timezone,
+            endTimezone = endTimezone,
+            recurring = recurring
+        )
 
-        return buildString {
-            crlfLine("BEGIN:VCALENDAR")
-            crlfLine("VERSION:$VERSION")
-            crlfLine("PRODID:$PRODID")
-            crlfLine("CALSCALE:$CALSCALE")
+        val event = ICalEvent(
+            uid = effectiveUid,
+            importId = ICalEvent.generateImportId(effectiveUid, null),
+            summary = summary,
+            description = description?.takeIf { it.isNotBlank() },
+            location = location?.takeIf { it.isNotBlank() },
+            dtStart = times.dtStart,
+            dtEnd = times.dtEnd,
+            duration = times.duration,
+            isAllDay = isAllDay,
+            // Null/blank status → leave STATUS absent in the model (RFC 5545
+            // §3.8.1.11 optional); the generator still emits a default line for
+            // iCloud. A caller-supplied value is honored verbatim.
+            status = status?.takeIf { it.isNotBlank() }?.let { EventStatus.fromString(it) },
+            sequence = 0,
+            rrule = if (recurring) parseRRuleOrNull(rrule) else null,
+            exdates = (exdates ?: emptyList()).map { toRecurrenceDateTime(it, isAllDay) },
+            rdates = (rdates ?: emptyList()).map { toRecurrenceDateTime(it, isAllDay) },
+            recurrenceId = null,
+            alarms = (alarms ?: emptyList()).map { toICalAlarm(it) },
+            categories = categories ?: emptyList(),
+            organizer = null,
+            attendees = emptyList(),
+            color = null,
+            dtstamp = null,
+            lastModified = lastModified?.let { toUtcICalDateTime(it) },
+            created = createdAt?.let { toUtcICalDateTime(it) },
+            transparency = Transparency.fromString(transp),
+            url = url?.takeIf { it.isNotBlank() },
+            priority = priority ?: 0,
+            rawProperties = emptyMap()
+        )
 
-            // VTIMEZONE must appear before VEVENT.
-            // When endTimezone is distinct, emit a second VTIMEZONE for it.
-            if (needsVtimezone) {
-                appendVtimezone(timezone!!)
-                if (effectiveEndTz != null) {
-                    appendVtimezone(effectiveEndTz)
-                }
-            }
-
-            crlfLine("BEGIN:VEVENT")
-            crlfLine("UID:$effectiveUid")
-            crlfLine("DTSTAMP:$dtstamp")
-
-            if (createdAt != null) {
-                crlfLine("CREATED:${utcFormatter.format(createdAt)}")
-            }
-            if (lastModified != null) {
-                crlfLine("LAST-MODIFIED:${utcFormatter.format(lastModified)}")
-            }
-
-            // Date/time properties.
-            // RFC 5545 §3.8.5 + Etar/Fossify/AOSP convention: when RRULE is present,
-            // emit DTSTART + DURATION instead of DTSTART + DTEND so each occurrence
-            // carries its length without re-deriving from DTEND. Avoids wire-format
-            // churn when servers normalize one form to the other on every push.
-            val recurring = !rrule.isNullOrBlank()
-            if (isAllDay && startDate != null) {
-                appendAllDayDateTimes(startDate, endDate ?: startDate, recurring)
-            } else if (startTime != null && endTime != null) {
-                appendTimedDateTimes(startTime, endTime, timezone, effectiveEndTz, recurring)
-            }
-
-            // Summary (title)
-            appendFoldedLine("SUMMARY:${escapeText(summary)}")
-
-            // Optional properties
-            if (!description.isNullOrBlank()) {
-                appendFoldedLine("DESCRIPTION:${escapeText(description)}")
-            }
-
-            if (!location.isNullOrBlank()) {
-                appendFoldedLine("LOCATION:${escapeText(location)}")
-            }
-
-            // Recurrence
-            if (!rrule.isNullOrBlank()) {
-                crlfLine("RRULE:$rrule")
-            }
-
-            // RDATE / EXDATE — one line per value (avoids comma-joining + line-folding interactions)
-            rdates?.forEach { value ->
-                crlfLine(formatRecurrenceDateLine(Property.RDATE, value, isAllDay))
-            }
-            exdates?.forEach { value ->
-                crlfLine(formatRecurrenceDateLine(Property.EXDATE, value, isAllDay))
-            }
-
-            // Extended properties
-            if (!status.isNullOrBlank()) {
-                crlfLine("STATUS:$status")
-            }
-
-            if (!url.isNullOrBlank()) {
-                appendFoldedLine("URL:$url")
-            }
-
-            if (!categories.isNullOrEmpty()) {
-                val escaped = categories.joinToString(",") { escapeText(it) }
-                appendFoldedLine("CATEGORIES:$escaped")
-            }
-
-            if (priority != null) {
-                crlfLine("PRIORITY:$priority")
-            }
-
-            if (!transp.isNullOrBlank()) {
-                crlfLine("TRANSP:$transp")
-            }
-
-            // VALARM blocks (RFC 5545 §3.6.6) — emitted as nested components
-            // INSIDE the VEVENT, before END:VEVENT.
-            alarms?.forEach { appendVAlarm(it) }
-
-            crlfLine("END:VEVENT")
-            crlfLine("END:VCALENDAR")
-        }.trimEnd()
+        // method = null → no METHOD line (plain CalDAV storage PUT, not an iTIP message).
+        return generator.generate(event, method = null, preserveDtstamp = false, includeVTimezone = true)
     }
 
-    /**
-     * Append VTIMEZONE component from ical4j registry.
-     *
-     * ical4j's [VTimeZone.toString] emits its own internal CRLF separators,
-     * but we re-split and re-emit each non-blank line via [crlfLine] to:
-     *   1. normalize line endings (defends against ical4j version drift),
-     *   2. avoid passing the multi-line block through crlfLine in one call,
-     *      which would leave existing CRLFs in place AND add a trailing CRLF,
-     *      producing the "double CRLF inside the block" bug.
-     */
-    private fun StringBuilder.appendVtimezone(timezoneId: String) {
-        try {
-            val tz = timeZoneRegistry.getTimeZone(timezoneId) ?: return
-            val vtimezone = tz.vTimeZone ?: return
-            vtimezone.toString()
-                .lineSequence()
-                .filter { it.isNotBlank() }
-                .forEach { crlfLine(it.trimEnd()) }
-        } catch (_: Exception) {
-            // If timezone lookup fails, skip VTIMEZONE (event still valid with TZID)
-        }
-    }
+    /** DTSTART / DTEND / DURATION resolved for one of the three supported event shapes. */
+    private data class ResolvedTimes(
+        val dtStart: ICalDateTime,
+        val dtEnd: ICalDateTime?,
+        val duration: Duration?
+    )
 
-    /**
-     * Append all-day DTSTART and DTEND.
-     * DTEND is exclusive per RFC 5545, so add 1 day to inclusive end.
-     */
-    private fun StringBuilder.appendAllDayDateTimes(startDate: String, endDate: String, recurring: Boolean) {
-        val start = LocalDate.parse(startDate)
-        val end = LocalDate.parse(endDate)
-        val exclusiveEnd = end.plusDays(1)  // RFC 5545: DTEND is exclusive
-
-        crlfLine("DTSTART;VALUE=DATE:${dateFormatter.format(start)}")
-        if (recurring) {
-            // Days from inclusive start to exclusive end, e.g. 2026-01-15..2026-01-15 -> P1D.
-            val days = java.time.temporal.ChronoUnit.DAYS.between(start, exclusiveEnd)
-            crlfLine("DURATION:P${days}D")
-        } else {
-            crlfLine("DTEND;VALUE=DATE:${dateFormatter.format(exclusiveEnd)}")
-        }
-    }
-
-    /**
-     * Append timed DTSTART and DTEND.
-     * Uses UTC (Z suffix) if times end with Z, otherwise uses TZID.
-     */
-    private fun StringBuilder.appendTimedDateTimes(
-        startTime: String,
-        endTime: String,
+    private fun resolveTimes(
+        startTime: String?,
+        endTime: String?,
+        startDate: String?,
+        endDate: String?,
+        isAllDay: Boolean,
         timezone: String?,
         endTimezone: String?,
         recurring: Boolean
-    ) {
-        if (startTime.endsWith("Z") && endTime.endsWith("Z")) {
-            // UTC times - use Z suffix
-            val startFormatted = formatIsoToIcalUtc(startTime)
-            crlfLine("DTSTART:$startFormatted")
-            if (recurring) {
-                crlfLine("DURATION:${computeDuration(startTime, endTime)}")
+    ): ResolvedTimes {
+        if (isAllDay && startDate != null) {
+            val start = LocalDate.parse(startDate)
+            val inclusiveEnd = LocalDate.parse(endDate ?: startDate)
+            val exclusiveEnd = inclusiveEnd.plusDays(1) // RFC 5545: DTEND is exclusive
+            val dtStart = ICalDateTime.fromLocalDate(start)
+            return if (recurring) {
+                val days = ChronoUnit.DAYS.between(start, exclusiveEnd)
+                ResolvedTimes(dtStart, null, Duration.ofDays(days))
             } else {
-                crlfLine("DTEND:${formatIsoToIcalUtc(endTime)}")
-            }
-        } else if (timezone != null) {
-            // Local times with timezone. DTEND uses endTimezone when distinct, else timezone.
-            val effectiveEndTz = endTimezone ?: timezone
-            val startFormatted = formatIsoToIcalLocal(startTime)
-            crlfLine("DTSTART;TZID=$timezone:$startFormatted")
-            if (recurring) {
-                crlfLine("DURATION:${computeDuration(asUtcInstant(startTime), asUtcInstant(endTime))}")
-            } else {
-                crlfLine("DTEND;TZID=$effectiveEndTz:${formatIsoToIcalLocal(endTime)}")
-            }
-        } else {
-            // Floating time (rare, treat as UTC)
-            val startFormatted = formatIsoToIcalUtc(asUtcInstant(startTime))
-            crlfLine("DTSTART:$startFormatted")
-            if (recurring) {
-                crlfLine("DURATION:${computeDuration(asUtcInstant(startTime), asUtcInstant(endTime))}")
-            } else {
-                crlfLine("DTEND:${formatIsoToIcalUtc(asUtcInstant(endTime))}")
+                ResolvedTimes(dtStart, ICalDateTime.fromLocalDate(exclusiveEnd), null)
             }
         }
-    }
 
-    /**
-     * RFC 5545 §3.8.2.5: DURATION value as ISO-8601 PT format.
-     * java.time.Duration.toString() emits exactly this format
-     * (e.g. PT1H, PT30M, PT1H30M, PT15S).
-     */
-    private fun computeDuration(startIso: String, endIso: String): String {
-        val start = Instant.parse(startIso)
-        val end = Instant.parse(endIso)
-        return java.time.Duration.between(start, end).toString()
-    }
-
-    /** Normalize a possibly-naked ISO 8601 string to UTC form (`...Z`) idempotently. */
-    private fun asUtcInstant(iso: String): String =
-        if (iso.endsWith("Z")) iso else "${iso}Z"
-
-    /**
-     * Format a single RDATE / EXDATE line. All-day events take VALUE=DATE
-     * with YYYYMMDD form; timed events take basic UTC instants (yyyyMMddTHHmmssZ).
-     */
-    private fun formatRecurrenceDateLine(name: String, value: String, isAllDay: Boolean): String {
-        return if (isAllDay) {
-            "$name;VALUE=DATE:${dateFormatter.format(LocalDate.parse(value))}"
-        } else {
-            "$name:${formatIsoToIcalUtc(if (value.endsWith("Z")) value else value + "Z")}"
-        }
-    }
-
-    /**
-     * Append a single VALARM block (RFC 5545 §3.6.6) inside the surrounding VEVENT.
-     * Mirrors the basic structure of KashCal's icaldav-core
-     * `ICalGenerator.appendVAlarm`, simplified for the MCP surface (no Apple
-     * X-WR-ALARMUID, no RFC 9074 extensions).
-     */
-    private fun StringBuilder.appendVAlarm(alarm: AlarmSpec) {
-        crlfLine("BEGIN:VALARM")
-
-        val action = alarm.action?.takeIf { it.isNotBlank() } ?: "DISPLAY"
-        crlfLine("ACTION:$action")
-
-        if (ICAL_ABSOLUTE_TRIGGER_REGEX.matches(alarm.trigger)) {
-            crlfLine("TRIGGER;VALUE=DATE-TIME:${alarm.trigger}")
-        } else {
-            crlfLine("TRIGGER:${alarm.trigger}")
-        }
-
-        // DESCRIPTION is required for DISPLAY (RFC 5545 §3.6.6); also valid on EMAIL.
-        // Default to "Reminder" when DISPLAY and the caller didn't supply one.
-        when (action) {
-            "DISPLAY" -> {
-                val desc = alarm.description?.takeIf { it.isNotBlank() } ?: "Reminder"
-                crlfLine("DESCRIPTION:${escapeText(desc)}")
-            }
-            "EMAIL" -> {
-                alarm.description?.takeIf { it.isNotBlank() }?.let {
-                    crlfLine("DESCRIPTION:${escapeText(it)}")
+        if (startTime != null && endTime != null) {
+            val utc = startTime.endsWith("Z") && endTime.endsWith("Z")
+            return when {
+                utc || timezone == null -> {
+                    // UTC times, or floating times treated as UTC (matches prior behavior).
+                    val startDt = utcICalDateTime(startTime)
+                    val endInstant = Instant.parse(asUtc(endTime))
+                    if (recurring) {
+                        ResolvedTimes(startDt, null, Duration.between(startDt.toInstant(), endInstant))
+                    } else {
+                        ResolvedTimes(startDt, utcICalDateTime(endTime), null)
+                    }
                 }
-                alarm.summary?.takeIf { it.isNotBlank() }?.let {
-                    crlfLine("SUMMARY:${escapeText(it)}")
+                else -> {
+                    // Local wall-clock times anchored to a TZID.
+                    val startDt = localICalDateTime(startTime, timezone)
+                    val effectiveEndTz = endTimezone ?: timezone
+                    val endDt = localICalDateTime(endTime, effectiveEndTz)
+                    if (recurring) {
+                        ResolvedTimes(startDt, null, Duration.between(startDt.toInstant(), endDt.toInstant()))
+                    } else {
+                        ResolvedTimes(startDt, endDt, null)
+                    }
                 }
             }
-            // AUDIO and others: no DESCRIPTION/SUMMARY
         }
 
-        // REPEAT requires DURATION (RFC 5545 §3.8.6.2) — emit the pair atomically.
-        if (alarm.repeatCount != null && alarm.repeatCount > 0 && !alarm.repeatDuration.isNullOrBlank()) {
-            crlfLine("REPEAT:${alarm.repeatCount}")
-            crlfLine("DURATION:${alarm.repeatDuration}")
-        }
-
-        crlfLine("END:VALARM")
-    }
-
-    /**
-     * Convert ISO 8601 UTC datetime to iCal format.
-     * Input: 2025-01-15T10:00:00Z
-     * Output: 20250115T100000Z
-     */
-    private fun formatIsoToIcalUtc(isoTime: String): String {
-        val instant = Instant.parse(isoTime)
-        return utcFormatter.format(instant)
-    }
-
-    /**
-     * Convert ISO 8601 local datetime to iCal format.
-     * Input: 2025-01-15T10:00:00
-     * Output: 20250115T100000
-     */
-    private fun formatIsoToIcalLocal(isoTime: String): String {
-        // Remove Z suffix if present, then format
-        val cleaned = isoTime.removeSuffix("Z")
-        val parts = cleaned.replace("-", "").replace(":", "")
-        return parts  // Already in YYYYMMDDTHHMMSS format after replacements
-    }
-
-    /**
-     * Escape special characters per RFC 5545.
-     * Order matters: backslash first!
-     */
-    private fun escapeText(text: String): String {
-        return text
-            .replace("\\", "\\\\")
-            .replace(";", "\\;")
-            .replace(",", "\\,")
-            .replace("\r\n", "\\n")
-            .replace("\n", "\\n")
-            .replace("\r", "\\n")
-    }
-
-    /**
-     * Append a line with RFC 5545 line folding.
-     * Lines longer than 75 octets are folded with CRLF + space.
-     * Counts UTF-8 byte length (octets), not chars.
-     * Multi-byte chars (including surrogate pairs) are never split across fold boundaries.
-     */
-    private fun StringBuilder.appendFoldedLine(line: String) {
-        val bytes = line.toByteArray(Charsets.UTF_8)
-        if (bytes.size <= MAX_LINE_OCTETS) {
-            crlfLine(line)
-            return
-        }
-
-        var charOffset = 0
-        var first = true
-
-        while (charOffset < line.length) {
-            val maxOctets = if (first) MAX_LINE_OCTETS else MAX_LINE_OCTETS - 1 // space prefix
-            var chunkOctets = 0
-            var chunkEnd = charOffset
-
-            while (chunkEnd < line.length) {
-                // Get the full Unicode code point (handles surrogate pairs)
-                val codePoint = line.codePointAt(chunkEnd)
-                val cpChars = Character.charCount(codePoint)
-                val cpBytes = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8).size
-
-                if (chunkOctets + cpBytes > maxOctets) break
-                chunkOctets += cpBytes
-                chunkEnd += cpChars
-            }
-
-            if (chunkEnd == charOffset) {
-                // Single code point exceeds limit — emit it anyway to avoid infinite loop
-                val codePoint = line.codePointAt(chunkEnd)
-                chunkEnd += Character.charCount(codePoint)
-            }
-
-            val chunk = line.substring(charOffset, chunkEnd)
-            if (first) {
-                crlfLine(chunk)
-                first = false
-            } else {
-                crlfLine(" $chunk")
-            }
-
-            charOffset = chunkEnd
+        // No usable times supplied (e.g. the patch-or-create fallback given only a
+        // summary). A VEVENT without METHOD still needs a DTSTART (RFC 5545 §3.6.1),
+        // so default to a one-hour timed event starting now rather than emitting a
+        // date-less, non-conformant component. Timed (not all-day) keeps the value
+        // type consistent with the isAllDay=false these callers pass.
+        val startInstant = Instant.now()
+        val dtStart = ICalDateTime.fromTimestamp(startInstant.toEpochMilli(), timezone = null, isDate = false)
+        return if (recurring) {
+            ResolvedTimes(dtStart, null, Duration.ofHours(1))
+        } else {
+            val dtEnd = ICalDateTime.fromTimestamp(
+                startInstant.plusSeconds(3600).toEpochMilli(), timezone = null, isDate = false
+            )
+            ResolvedTimes(dtStart, dtEnd, null)
         }
     }
+
+    /** Parse an RRULE value; on malformed input, fall back to a raw-preserving null (caller keeps verbatim). */
+    private fun parseRRuleOrNull(rrule: String): RRule? =
+        try {
+            RRule.parse(rrule)
+        } catch (_: Exception) {
+            null
+        }
+
+    /** ISO 8601 UTC (or Z-suffixed) → UTC [ICalDateTime]. */
+    private fun utcICalDateTime(iso: String): ICalDateTime {
+        val instant = Instant.parse(asUtc(iso))
+        return ICalDateTime.fromTimestamp(instant.toEpochMilli(), timezone = null, isDate = false)
+    }
+
+    /** ISO 8601 local wall-clock time + TZID → timezone-anchored [ICalDateTime]. */
+    private fun localICalDateTime(iso: String, tzid: String): ICalDateTime {
+        val basic = iso.removeSuffix("Z").replace("-", "").replace(":", "") // yyyyMMddTHHmmss
+        return ICalDateTime.parse(basic, tzid)
+    }
+
+    /** RDATE/EXDATE value → [ICalDateTime]: VALUE=DATE for all-day, UTC instant otherwise. */
+    private fun toRecurrenceDateTime(value: String, isAllDay: Boolean): ICalDateTime =
+        if (isAllDay) ICalDateTime.fromLocalDate(LocalDate.parse(value)) else utcICalDateTime(value)
+
+    private fun toUtcICalDateTime(instant: Instant): ICalDateTime =
+        ICalDateTime.fromTimestamp(instant.toEpochMilli(), timezone = null, isDate = false)
+
+    private fun asUtc(iso: String): String = if (iso.endsWith("Z")) iso else "${iso}Z"
 }

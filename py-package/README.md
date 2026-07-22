@@ -2,10 +2,10 @@
 
 [![PyPI](https://img.shields.io/pypi/v/icloud-calendar-mcp.svg)](https://pypi.org/project/icloud-calendar-mcp/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/blob/main/LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-768%20passing-brightgreen.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp)
+[![Tests](https://img.shields.io/badge/Tests-843%20passing-brightgreen.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp)
 [![Security](https://img.shields.io/badge/Security-OWASP%20MCP%20Top%2010-blue.svg)](https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/blob/main/SECURITY.md)
 
-A security-first MCP (Model Context Protocol) server for iCloud Calendar access via CalDAV.
+An MCP (Model Context Protocol) server for iCloud Calendar access via CalDAV.
 
 ## Installation
 
@@ -83,7 +83,7 @@ This server is designed with security as a primary concern:
 
 ## Test Coverage
 
-- **768 total tests**
+- **843 total tests**
 - **282 security tests** covering OWASP MCP Top 10
 - ReDoS, Unicode, SSRF, injection protection
 

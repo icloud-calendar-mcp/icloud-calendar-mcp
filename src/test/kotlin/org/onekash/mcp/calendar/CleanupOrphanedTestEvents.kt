@@ -1,35 +1,32 @@
 package org.onekash.mcp.calendar
 
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.onekash.mcp.calendar.caldav.CalDavCredentials
-import org.onekash.mcp.calendar.caldav.OkHttpCalDavClient
+import org.onekash.mcp.calendar.live.LiveTestSupport
 import org.onekash.mcp.calendar.service.CalendarService
 import org.onekash.mcp.calendar.service.ServiceResult
 import java.time.LocalDate
 
 /**
- * One-shot janitor that deletes any MCP-LIVE-prefixed test events left behind
- * by failed live runs. Not part of the normal suite — run manually with:
+ * One-shot janitor that deletes any MCP-LIVE- / MCP TEST-prefixed events left
+ * behind by a failed live run. Tagged @Tag("integration") so it only runs under
+ * `-Pintegration` — run manually with:
  *
- *   ICLOUD_USERNAME=… ICLOUD_PASSWORD=… ./gradlew test --tests "*CleanupOrphanedTestEvents*"
+ *   ./gradlew :test -Pintegration --tests "*CleanupOrphanedTestEvents*"
  *
- * Skipped silently when credentials aren't set, just like LiveCalDavTest.
+ * Credentials resolve through [LiveTestSupport] (env or local.properties, same
+ * as the rest of the live suite); skipped silently when none are available.
  */
+@Tag("integration")
 class CleanupOrphanedTestEvents {
-
-    private val username = System.getenv("ICLOUD_USERNAME")
-    private val password = System.getenv("ICLOUD_PASSWORD")
 
     @Test
     fun `delete orphaned MCP-LIVE events from all writable calendars`() {
-        assumeTrue(username != null && password != null, "Credentials not set")
+        assumeTrue(LiveTestSupport.available, "Credentials not set")
+        println("=== Janitor: ${LiveTestSupport.describe} ===")
 
-        val client = OkHttpCalDavClient(
-            baseUrl = "https://caldav.icloud.com",
-            credentials = CalDavCredentials(username!!, password!!)
-        )
-        val service = CalendarService(client)
+        val service = CalendarService(LiveTestSupport.newClient())
 
         val calendarsResult = service.listCalendars()
         if (calendarsResult !is ServiceResult.Success) {

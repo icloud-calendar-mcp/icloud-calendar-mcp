@@ -469,8 +469,9 @@ class UnicodeSecurityTest {
 
         val sanitized = InputValidator.sanitizeForIcs(unicodeText)
 
-        // Should escape newlines but preserve unicode
-        assertTrue(sanitized.contains("\\n"))
+        // Should collapse newlines (CRLF-injection defense) but preserve unicode.
+        // RFC 5545 escaping is the generator's job, so no "\n" escape appears here.
+        assertFalse(sanitized.contains("\n"))
         assertTrue(sanitized.contains("会議"))
         assertTrue(sanitized.contains("東京"))
     }

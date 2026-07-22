@@ -332,19 +332,23 @@ class IcsPatcherAdversarialTest {
     }
 
     @Test
-    fun `non-numeric SEQUENCE in existing ICS surfaces as a clean parse failure`() {
+    fun `non-numeric SEQUENCE in existing ICS recovers without losing data`() {
         val badSeqIcs = baseIcs.replace("SEQUENCE:0", "SEQUENCE:not-a-number")
 
-        // Issue #2 hardening: malformed existing ICS surfaces as a typed
-        // exception instead of the prior silent buildFresh fallback that
-        // could destroy user data on partial updates.
-        assertFailsWith<IcsPatcher.UnparseableExistingIcsException> {
-            patcher.patch(
-                existingIcs = badSeqIcs,
-                uid = "test-event-001",
-                summary = "Updated"
-            )
-        }
+        // A malformed SEQUENCE must not destroy the event. The relaxed icaldav
+        // parser treats an unparseable SEQUENCE as 0 and recovers the rest of the
+        // VEVENT, so the patch applies cleanly and the original data survives —
+        // strictly safer than the old silent "Untitled" rebuild it replaced.
+        val result = patcher.patch(
+            existingIcs = badSeqIcs,
+            uid = "test-event-001",
+            summary = "Updated"
+        )
+
+        assertTrue(result.contains("SUMMARY:Updated"))
+        assertTrue(result.contains("SEQUENCE:"))
+        // SEQUENCE recovered as 0, then incremented on patch.
+        assertTrue(result.contains("SEQUENCE:1"), "recovered SEQUENCE 0 should increment to 1 on patch")
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -868,11 +872,12 @@ class IcsPatcherAdversarialTest {
 
     @Test
     fun `patch with far-future date`() {
-        // Year 9999 is at the upper edge of ical4j's date parsing — the
-        // constructor uses `+yyyyMMdd` extended form internally and chokes on
-        // year > 9999. Either the patch succeeds (well within range) or it
-        // rejects the input loudly via java.text.ParseException — both are
-        // acceptable; the prior silent buildFresh fallback was not.
+        // Year 9999 is the upper edge of RFC 5545's 4-digit date-fullyear. An
+        // all-day DTEND is exclusive, so 9999-12-31 pushes the emitted DTEND to
+        // year 10000, which cannot be represented — the patch rejects it loudly
+        // via java.time.DateTimeException. Either a clean success (dates in range)
+        // or that loud rejection is acceptable; the prior silent buildFresh
+        // fallback that destroyed the original event was not.
         try {
             val result = patcher.patch(
                 existingIcs = baseIcs,
@@ -882,8 +887,8 @@ class IcsPatcherAdversarialTest {
                 isAllDay = true
             )
             assertNotNull(result)
-        } catch (_: java.text.ParseException) {
-            // ical4j rejects year overflow at construction time — safe failure.
+        } catch (_: java.time.DateTimeException) {
+            // Year overflow past 9999 rejected at construction time — safe failure.
         }
     }
 

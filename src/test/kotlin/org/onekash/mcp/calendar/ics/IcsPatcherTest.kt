@@ -6,14 +6,14 @@ import kotlin.test.*
  * Tests for IcsPatcher: verifies round-trip preservation when patching
  * existing ICS data and fresh generation for new events.
  *
- * Adapted from KashCal's IcsPatcherTest and IcsPatcherRfc5545Test patterns.
+ * Tests for IcsPatcher: VALARM/ATTENDEE/X-* preservation, SEQUENCE, round-trip fidelity.
  */
 class IcsPatcherTest {
 
     private val patcher = IcsPatcher()
     private val parser = IcsParser()
 
-    // ========== VALARM Preservation (KashCal pattern: preserve alarms) ==========
+    // ========== VALARM Preservation ==========
 
     @Test
     fun `patch preserves VALARM blocks`() {
@@ -61,7 +61,7 @@ class IcsPatcherTest {
         assertTrue(patched.contains("SUMMARY:Updated Title"), "Title should be updated")
     }
 
-    // ========== ATTENDEE/ORGANIZER Preservation (KashCal pattern) ==========
+    // ========== ATTENDEE/ORGANIZER Preservation ==========
 
     @Test
     fun `patch preserves attendees and organizer`() {
@@ -101,7 +101,7 @@ class IcsPatcherTest {
         assertNotNull(parsed[0].organizer, "Should preserve organizer")
     }
 
-    // ========== X-* Property Preservation (KashCal pattern: rawProperties) ==========
+    // ========== X-* Property Preservation ==========
 
     @Test
     fun `patch preserves X-APPLE and custom properties`() {
@@ -133,7 +133,7 @@ class IcsPatcherTest {
         assertTrue(patched.contains("X-CUSTOM-PROP"), "Custom property preserved")
     }
 
-    // ========== SEQUENCE Increment (KashCal pattern) ==========
+    // ========== SEQUENCE Increment ==========
 
     @Test
     fun `patch increments SEQUENCE number`() {
@@ -507,7 +507,7 @@ class IcsPatcherTest {
         assertFalse(patched.contains("RRULE:"), "RRULE should be removed")
     }
 
-    // ========== Fallback Tests (KashCal pattern) ==========
+    // ========== Fallback Tests ==========
 
     @Test
     fun `patch falls back to IcsBuilder when existingIcs is null`() {
@@ -561,12 +561,14 @@ class IcsPatcherTest {
     }
 
     @Test
-    fun `patch throws when existing ICS uses LF-only folding that ical4j rejects`() {
-        // Reported via issue #2: when existing ICS came back from iCloud with
-        // bare LF instead of CRLF, ical4j's CalendarBuilder bailed; the
-        // pre-fix patcher silently returned a fresh "Untitled" event with the
-        // user-supplied description-only update — corrupting the SUMMARY.
-        // After this chunk, that case throws cleanly.
+    fun `patch recovers original data when existing ICS uses LF-only folding`() {
+        // Reported via issue #2: when existing ICS came back from iCloud with bare
+        // LF instead of CRLF, the old ical4j CalendarBuilder bailed and the patcher
+        // silently returned a fresh "Untitled" event — corrupting the SUMMARY on a
+        // description-only update. The vendored icaldav parser is relaxed about
+        // line endings and recovers the event losslessly, so a description-only
+        // patch now preserves the original SUMMARY instead of destroying it. That
+        // is strictly better than the interim "throw a typed exception" behavior.
         val descRaw = "DESCRIPTION:Send a short follow-up email with an attachment for a warm introduction. Frame around the pitch, not generic availability."
         val foldedDescription = descRaw.substring(0, 75) + "\r\n " + descRaw.substring(75)
         val lfOnly = listOf(
@@ -584,13 +586,17 @@ class IcsPatcherTest {
             "END:VCALENDAR"
         ).joinToString("\r\n").replace("\r\n", "\n")  // strip CRLF, leave bare LF
 
-        assertFailsWith<IcsPatcher.UnparseableExistingIcsException> {
-            patcher.patch(
-                existingIcs = lfOnly,
-                uid = "lf-fold@test",
-                description = "MCP TEST touch simple."  // description-only update
-            )
-        }
+        val patched = patcher.patch(
+            existingIcs = lfOnly,
+            uid = "lf-fold@test",
+            description = "MCP TEST touch simple."  // description-only update
+        )
+
+        // The original SUMMARY survives (no "Untitled" corruption) and the new
+        // description is applied.
+        val event = parser.parse(patched).single()
+        assertEquals("Original SUMMARY value", event.summary)
+        assertEquals("MCP TEST touch simple.", event.description)
     }
 
     @Test
@@ -662,7 +668,7 @@ class IcsPatcherTest {
         assertFalse(patched.contains("DTSTAMP:20200101T000000Z"), "Old DTSTAMP should be replaced")
     }
 
-    // ========== Round-Trip Fidelity (KashCal pattern) ==========
+    // ========== Round-Trip Fidelity ==========
 
     @Test
     fun `round trip - patch then parse preserves all fields`() {

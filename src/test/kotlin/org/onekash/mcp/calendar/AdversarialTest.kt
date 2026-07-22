@@ -845,7 +845,10 @@ class AdversarialTest {
 
     @Test
     fun `extremely long RRULE is handled`() {
-        val longRrule = "FREQ=YEARLY;BYDAY=" + (1..100).joinToString(",") { "${it}MO" }
+        // A long but RFC 5545 §3.3.10-valid BYDAY list: ordinals are 1..53 (the
+        // spec's ordwk range) so every WeekdayNum parses. Exercises the multi-digit
+        // ordinal path (e.g. 53MO) that a single-digit parser would drop.
+        val longRrule = "FREQ=YEARLY;BYDAY=" + (1..53).joinToString(",") { "${it}MO" }
 
         val ics = builder.build(
             summary = "Complex Recurrence",
@@ -855,6 +858,8 @@ class AdversarialTest {
         )
 
         assertTrue(ics.contains("RRULE:"))
+        // The 2-digit ordinal must survive the round-trip, not be silently dropped.
+        assertTrue(ics.contains("53MO"), "multi-digit BYDAY ordinal should be preserved")
     }
 }
 

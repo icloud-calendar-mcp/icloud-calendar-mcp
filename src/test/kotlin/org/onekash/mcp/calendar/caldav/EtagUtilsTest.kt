@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Assertions.*
 /**
  * Tests for EtagUtils.normalizeEtag() — RFC 7232 ETag normalization.
  *
- * Ported from KashCal's EtagUtilsTest.
+ * Tests for RFC 7232 ETag normalization.
  */
 class EtagUtilsTest {
 

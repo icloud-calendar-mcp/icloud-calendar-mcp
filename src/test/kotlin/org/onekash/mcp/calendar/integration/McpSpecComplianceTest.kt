@@ -1,5 +1,7 @@
 package org.onekash.mcp.calendar.integration
 
+import io.mockk.mockk
+import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
 import io.modelcontextprotocol.kotlin.sdk.server.RegisteredResource
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
@@ -355,7 +357,10 @@ class McpSpecComplianceTest {
 
         val handler = server.resources["test://error"]!!.readHandler
         val ex = assertThrows<McpException> {
-            runBlocking { handler(ReadResourceRequest(ReadResourceRequestParams(uri = "test://error"))) }
+            runBlocking {
+                val connection = mockk<ClientConnection>(relaxed = true)
+                handler(connection, ReadResourceRequest(ReadResourceRequestParams(uri = "test://error")))
+            }
         }
         assertEquals(-32000, ex.code)
         assertTrue(ex.message!!.contains("test rate limit error"))

@@ -9,10 +9,10 @@
 [![PyPI](https://img.shields.io/pypi/v/icloud-calendar-mcp.svg)](https://pypi.org/project/icloud-calendar-mcp/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-green.svg)](https://registry.modelcontextprotocol.io/?search=org.onekash)
-[![Tests](https://img.shields.io/badge/Tests-768%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-843%20passing-brightgreen.svg)](#testing)
 [![Security](https://img.shields.io/badge/Security-OWASP%20MCP%20Top%2010-blue.svg)](#security)
 
-A **security-first** MCP (Model Context Protocol) server that provides AI assistants with secure access to iCloud Calendar via CalDAV. Built with comprehensive security controls aligned with the [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/).
+An MCP (Model Context Protocol) server that gives AI assistants access to iCloud Calendar via CalDAV, with security controls aligned with the [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/).
 
 > [!CAUTION]
 > **Never use your main Apple ID password.** This server requires an [app-specific password](https://support.apple.com/en-us/HT204397) which can be revoked independently without affecting your Apple ID.
@@ -74,10 +74,10 @@ uvx icloud-calendar-mcp
 
 ```bash
 # Download from GitHub Releases
-curl -LO https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/latest/download/icloud-calendar-mcp-3.0.1-all.jar
+curl -LO https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/releases/latest/download/icloud-calendar-mcp-3.1.0-all.jar
 
 # Run
-java -jar icloud-calendar-mcp-3.0.1-all.jar
+java -jar icloud-calendar-mcp-3.1.0-all.jar
 ```
 
 #### Option 4: Build from Source
@@ -86,7 +86,7 @@ java -jar icloud-calendar-mcp-3.0.1-all.jar
 git clone https://github.com/icloud-calendar-mcp/icloud-calendar-mcp.git
 cd icloud-calendar-mcp
 ./gradlew fatJar
-java -jar build/libs/icloud-calendar-mcp-3.0.1-all.jar
+java -jar build/libs/icloud-calendar-mcp-3.1.0-all.jar
 ```
 
 ### Configuration
@@ -158,7 +158,7 @@ Add to your Claude Desktop configuration:
   "mcpServers": {
     "icloud-calendar": {
       "command": "java",
-      "args": ["-jar", "/path/to/icloud-calendar-mcp-3.0.1-all.jar"],
+      "args": ["-jar", "/path/to/icloud-calendar-mcp-3.1.0-all.jar"],
       "env": {
         "ICLOUD_USERNAME": "your-apple-id@icloud.com",
         "ICLOUD_PASSWORD": "your-app-specific-password"
@@ -228,6 +228,16 @@ No parameters required.
 |-----------|------|----------|-------------|
 | `event_id` | string | Yes | Event to delete |
 
+> **Note — resolving an event by `event_id`:** `update_event` and `delete_event`
+> locate the target event in the current session's in-memory cache, which is
+> populated by `get_events` (and by the `create_event` that created it). Within a
+> session the usual flow — `get_events` → `update_event`/`delete_event` — works
+> without any extra step. If you start a fresh session and want to act on an
+> existing event, call `get_events` for its calendar first so the event is cached.
+> There is no per-request server-side lookup by UID: iCloud rejects a CalDAV
+> `calendar-query` UID `prop-filter` (HTTP 412), and an unfiltered query would
+> return the entire calendar, so a stateless UID lookup is not practical.
+
 ---
 
 ## Security
@@ -271,28 +281,29 @@ See [SECURITY.md](SECURITY.md) for full security documentation and vulnerability
 
 ## Testing
 
-The server includes **768 comprehensive tests** across 30 test suites:
+The MCP server has 843 tests. The vendored `icaldav-core` iCalendar library has a
+further 1714 tests. Both run with:
 
 ```bash
 ./gradlew test
 ```
 
-### Test Coverage
+### Test Coverage (MCP server)
 
 | Category | Tests | Description |
 |----------|-------|-------------|
 | **Security** | 282 | Adversarial inputs, OWASP MCP Top 10, ReDoS, Unicode |
-| **CalDAV Protocol** | 177 | XML parsing, HTTP client, models, ETag normalization |
-| **ICS Format** | 98 | RFC 5545 parsing, building, patching |
+| **CalDAV Protocol** | 181 | XML parsing, HTTP client, models, ETag normalization |
+| **ICS Format** | 150 | RFC 5545 parsing, building, patching |
 | **Error Handling** | 56 | Secure error responses, credential sanitization |
-| **Integration** | 40 | End-to-end tools, MCP spec compliance, annotations |
-| **Input Validation** | 39 | All parameter validation rules |
+| **Integration** | 45 | End-to-end tools, MCP spec compliance, annotations |
+| **Input Validation** | 44 | All parameter validation rules |
 | **Service Layer** | 26 | Calendar operations, caching |
-| **Rate Limiting** | 15 | Concurrent access, window reset |
+| **Rate Limiting** | 18 | Concurrent access, window reset |
 | **Cancellation** | 12 | Operation cancellation, cleanup |
 | **Logging** | 9 | MCP logging compliance |
 | **Progress** | 9 | Progress reporting |
-| **E2E** | 5 | Live CalDAV + end-to-end integration |
+| **E2E** | 11 | Live CalDAV + end-to-end integration |
 
 ### Security Test Categories
 
@@ -370,7 +381,7 @@ The server includes **768 comprehensive tests** across 30 test suites:
 |                                                                    |
 |  +-------------------+  +-------------------+  +----------------+  |
 |  | OkHttpCalDav      |  |  IcsParser        |  |  IcsBuilder    |  |
-|  | Client            |  |  (ical4j)         |  |  (RFC 5545)    |  |
+|  | Client            |  |  (icaldav-core)   |  |  (icaldav-core)|  |
 |  +-------------------+  +-------------------+  +----------------+  |
 |                                                                    |
 |  +-------------------+  +-------------------+  +----------------+  |
@@ -422,13 +433,12 @@ src/main/kotlin/org/onekash/mcp/calendar/
 │   ├── OkHttpCalDavClient.kt
 │   ├── ICloudXmlParser.kt
 │   └── EtagUtils.kt        # RFC 7232 ETag normalization
-├── ics/                    # ICS format handling
+├── ics/                    # ICS format handling (via icaldav-core)
 │   ├── IcsParser.kt        # Parse iCalendar data
 │   ├── IcsBuilder.kt       # Generate iCalendar data
 │   └── IcsPatcher.kt       # Patch existing events (CRLF-safe)
 ├── service/                # Business logic
-│   ├── CalendarService.kt
-│   └── EventCache.kt
+│   └── CalendarService.kt  # CalDAV orchestration + event cache
 ├── security/               # Security controls
 │   └── CredentialManager.kt
 ├── validation/             # Input validation
@@ -450,7 +460,7 @@ src/main/kotlin/org/onekash/mcp/calendar/
 ```bash
 ICLOUD_USERNAME="test@icloud.com" \
 ICLOUD_PASSWORD="test-app-password" \
-npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.0.1-all.jar
+npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.1.0-all.jar
 ```
 
 ---
@@ -475,6 +485,6 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 - [Model Context Protocol](https://modelcontextprotocol.io) by Anthropic
 - [MCP Kotlin SDK](https://github.com/modelcontextprotocol/kotlin-sdk) by Anthropic & JetBrains
-- [ical4j](https://www.ical4j.org/) for ICS parsing
+- [ical4j](https://www.ical4j.org/) for low-level ICS parsing (via the bundled icaldav-core library)
 - [OkHttp](https://square.github.io/okhttp/) for HTTP client
 - [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/) for security guidance

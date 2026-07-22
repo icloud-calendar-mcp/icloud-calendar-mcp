@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.onekash.mcp"
-version = "3.0.1"
+version = "3.1.0"
 
 repositories {
     mavenCentral()
@@ -46,8 +46,11 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
 
-    // ICS Parsing
-    implementation(libs.ical4j)
+    // ICS parsing/generation — vendored icaldav-core (ical4j 4.2.2 confined to that
+    // subproject). The MCP source depends on icaldav's API only; ical4j is NOT a
+    // direct dependency here and must not be re-added (two ical4j majors on one
+    // classpath collide on net.fortuna.ical4j.* classes).
+    implementation(project(":icaldav-core"))
 
     // Logging
     implementation(libs.slf4j.simple)
@@ -60,7 +63,31 @@ dependencies {
 }
 
 tasks.test {
-    useJUnitPlatform()
+    useJUnitPlatform {
+        // Live iCloud integration tests are tagged @Tag("integration") and hit the
+        // real caldav.icloud.com. They are EXCLUDED by default so `./gradlew test`
+        // stays hermetic and side-effect-free. Opt in with the -Pintegration flag:
+        //
+        //   ./gradlew test -Pintegration \
+        //     --tests "org.onekash.mcp.calendar.live.*"
+        //
+        // Even when included, each test self-skips (JUnit assumeTrue) unless iCloud
+        // credentials are present (env ICLOUD_USERNAME/ICLOUD_PASSWORD or
+        // ICLOUD_APP_PASSWORD, or a local.properties entry).
+        if (!project.hasProperty("integration")) {
+            excludeTags("integration")
+        }
+    }
+    // Integration tests share a single real iCloud account, so serialize them to
+    // avoid ETag races and cross-test event collisions on the same calendar.
+    if (project.hasProperty("integration")) {
+        maxParallelForks = 1
+    }
+    // Surface live-test stdout (cleanup summaries, wire dumps) when opted in, so
+    // integration runs are auditable. Off for the default hermetic run.
+    if (project.hasProperty("integration")) {
+        testLogging { showStandardStreams = true }
+    }
 }
 
 tasks.jar {

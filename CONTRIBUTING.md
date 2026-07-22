@@ -84,7 +84,7 @@ See [SECURITY.md](SECURITY.md) for security guidelines.
 
 ## Test Categories
 
-The project has 768 tests across these categories:
+The project has 843 tests across these categories (8 live/E2E tests are skipped automatically when iCloud credentials are not configured):
 
 ### Security Tests (282 tests)
 
@@ -100,21 +100,22 @@ The project has 768 tests across these categories:
 | `CancellationSecurityTest` | 22 | Replay attacks, race conditions |
 | `CredentialManagerTest` | 14 | Token masking, secure storage |
 
-### Functional Tests (486 tests)
+### Functional Tests (561 tests)
 
 | Category | Tests | Description |
 |----------|-------|-------------|
-| CalDAV Protocol | 177 | XML parsing, HTTP client, models, ETag normalization |
-| ICS Format | 98 | RFC 5545 parsing, building, patching |
+| CalDAV Protocol | 181 | Models, HTTP client, XML parsing, ETag normalization |
+| ICS Format | 143 | RFC 5545 parsing, building, patching |
 | Error Handling | 56 | Secure error responses, credential sanitization |
-| Integration | 40 | End-to-end tools, MCP spec compliance, annotations |
-| Input Validation | 39 | All parameter validation rules |
-| Service Layer | 26 | Calendar operations, caching |
+| Integration | 47 | End-to-end tools, MCP spec compliance, structuredContent, annotations |
+| Input Validation | 44 | All parameter validation rules (incl. alarms) |
+| Service Layer | 26 | Calendar operations, event caching |
 | Rate Limiting | 15 | Concurrent access, window reset |
 | Cancellation | 12 | Operation cancellation, cleanup |
 | Logging | 9 | MCP logging compliance |
 | Progress | 9 | Progress reporting |
-| E2E | 5 | Live CalDAV + end-to-end integration |
+| RFC Compliance | 7 | RFC 5545 property audit |
+| E2E / Live | 12 | Live CalDAV + end-to-end integration (skipped without credentials) |
 
 ## Pull Request Process
 
@@ -201,7 +202,7 @@ See [SECURITY.md](SECURITY.md) for responsible disclosure process.
 
 ```bash
 ./gradlew fatJar
-# Output: build/libs/icloud-calendar-mcp-3.0.0-all.jar
+# Output: build/libs/icloud-calendar-mcp-3.1.0-all.jar
 ```
 
 ### Testing with MCP Inspector
@@ -209,7 +210,7 @@ See [SECURITY.md](SECURITY.md) for responsible disclosure process.
 ```bash
 ICLOUD_USERNAME="test@icloud.com" \
 ICLOUD_PASSWORD="test-password" \
-npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.0.0-all.jar
+npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.1.0-all.jar
 ```
 
 ### Adding Security Tests
