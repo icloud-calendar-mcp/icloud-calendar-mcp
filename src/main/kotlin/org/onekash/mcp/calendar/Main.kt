@@ -18,6 +18,7 @@ import org.onekash.mcp.calendar.ics.AlarmSpec
 import org.onekash.mcp.calendar.security.CredentialManager
 import org.onekash.mcp.calendar.ratelimit.RateLimiter
 import org.onekash.mcp.calendar.service.CalendarService
+import org.onekash.mcp.calendar.service.EventInfo
 import org.onekash.mcp.calendar.service.ServiceResult
 import org.onekash.mcp.calendar.logging.McpLogger
 import org.onekash.mcp.calendar.validation.InputValidator
@@ -179,6 +180,46 @@ private fun encodeAlarmsForResponse(alarms: List<org.onekash.mcp.calendar.ics.Pa
         }
     }
 
+/**
+ * Encode one event as the get_events response JSON shape. Optional fields are
+ * omitted when absent so the payload stays compact for LLM consumption.
+ */
+internal fun encodeEventForResponse(event: EventInfo): JsonObject = buildJsonObject {
+    put("uid", event.uid)
+    put("summary", event.summary)
+    event.description?.let { put("description", it) }
+    event.location?.let { put("location", it) }
+    put("isAllDay", event.isAllDay)
+    if (event.isAllDay) {
+        event.startDate?.let { put("startDate", it) }
+        event.endDate?.let { put("endDate", it) }
+    } else {
+        event.startTime?.let { put("startTime", it) }
+        event.endTime?.let { put("endTime", it) }
+    }
+    event.timezone?.let { put("timezone", it) }
+    event.endTimezone?.let { put("endTimezone", it) }
+    event.rrule?.let { put("rrule", it) }
+    event.recurrenceId?.let { put("recurrenceId", it) }
+    if (event.rdates.isNotEmpty()) {
+        putJsonArray("rdates") { event.rdates.forEach { add(it) } }
+    }
+    if (event.exdates.isNotEmpty()) {
+        putJsonArray("exdates") { event.exdates.forEach { add(it) } }
+    }
+    event.status?.let { put("status", it) }
+    event.url?.let { put("url", it) }
+    if (event.categories.isNotEmpty()) {
+        putJsonArray("categories") {
+            event.categories.forEach { add(it) }
+        }
+    }
+    event.priority?.let { put("priority", it) }
+    event.organizer?.let { put("organizer", it) }
+    if (event.attendeeCount > 0) put("attendeeCount", event.attendeeCount)
+    if (event.alarms.isNotEmpty()) put("alarms", encodeAlarmsForResponse(event.alarms))
+}
+
 private fun createCalendarService(): Pair<CalendarService?, OkHttpCalDavClient?> {
     return try {
         val credentials = CredentialManager.loadFromEnvironment() ?: return Pair(null, null)
@@ -274,7 +315,8 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "get_events",
-        description = "Get events from a calendar within a date range",
+        description = "Get events from a calendar within a date range. Recurring events are expanded " +
+            "into their concrete occurrences within the range.",
         title = "Get Events",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
@@ -345,31 +387,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     val eventsJson = buildJsonObject {
                         putJsonArray("events") {
                             result.data.forEach { event ->
-                                addJsonObject {
-                                    put("uid", event.uid)
-                                    put("summary", event.summary)
-                                    event.description?.let { put("description", it) }
-                                    event.location?.let { put("location", it) }
-                                    put("isAllDay", event.isAllDay)
-                                    if (event.isAllDay) {
-                                        event.startDate?.let { put("startDate", it) }
-                                        event.endDate?.let { put("endDate", it) }
-                                    } else {
-                                        event.startTime?.let { put("startTime", it) }
-                                        event.endTime?.let { put("endTime", it) }
-                                    }
-                                    event.rrule?.let { put("rrule", it) }
-                                    event.status?.let { put("status", it) }
-                                    event.url?.let { put("url", it) }
-                                    if (event.categories.isNotEmpty()) {
-                                        putJsonArray("categories") {
-                                            event.categories.forEach { add(it) }
-                                        }
-                                    }
-                                    event.priority?.let { put("priority", it) }
-                                    event.organizer?.let { put("organizer", it) }
-                                    if (event.attendeeCount > 0) put("attendeeCount", event.attendeeCount)
-                                }
+                                add(encodeEventForResponse(event))
                             }
                         }
                     }
