@@ -51,7 +51,12 @@ data class EventInfo(
     val priority: Int? = null,
     val organizer: String? = null,
     val attendeeCount: Int = 0,
-    val alarms: List<ParsedAlarm> = emptyList()
+    val alarms: List<ParsedAlarm> = emptyList(),
+    val timezone: String? = null,
+    val endTimezone: String? = null,
+    val rdates: List<String> = emptyList(),
+    val exdates: List<String> = emptyList(),
+    val recurrenceId: String? = null
 )
 
 /**
@@ -185,20 +190,35 @@ class CalendarService(
 
     /**
      * Get events from a calendar within a date range.
+     *
+     * Recurring events are expanded into their concrete occurrences within the
+     * queried window (mirroring the CalDAV REPORT time-range filter), and the
+     * result is sorted by start ascending (uid, then recurrenceId break ties).
      */
     fun getEvents(calendarId: String, startDate: String, endDate: String): ServiceResult<List<EventInfo>> {
         return when (val result = client.getEvents(calendarId, startDate, endDate)) {
             is CalDavResult.Success -> {
+                // Expansion window matching the CalDAV REPORT bounds
+                // (<C:time-range start="{start}T000000Z" end="{end}T235959Z"/>).
+                val window = runCatching {
+                    java.time.Instant.parse("${startDate}T00:00:00Z") to
+                        java.time.Instant.parse("${endDate}T23:59:59Z")
+                }.getOrNull()
+
                 val events = result.data.flatMap { caldavEvent ->
                     // Cache event for future lookup (with TTL)
                     addToCache(caldavEvent.uid, caldavEvent)
 
-                    // Parse ICS content
-                    val parsed = parser.parse(caldavEvent.icalData)
+                    // Parse ICS content, expanding recurring events when the window is usable
+                    val parsed = if (window != null) {
+                        parser.parse(caldavEvent.icalData, window.first, window.second)
+                    } else {
+                        parser.parse(caldavEvent.icalData)
+                    }
                     parsed.map { p ->
                         toEventInfo(p, caldavEvent)
                     }
-                }
+                }.sortedWith(eventOrdering)
                 ServiceResult.Success(events)
             }
             is CalDavResult.Error -> {
@@ -467,7 +487,33 @@ class CalendarService(
             priority = parsed.priority,
             organizer = parsed.organizer,
             attendeeCount = parsed.attendeeCount,
-            alarms = parsed.alarms
+            alarms = parsed.alarms,
+            timezone = parsed.timezone,
+            endTimezone = parsed.endTimezone,
+            rdates = parsed.rdates,
+            exdates = parsed.exdates,
+            recurrenceId = parsed.recurrenceId
         )
+    }
+
+    companion object {
+        /**
+         * Deterministic event ordering: start ascending, then uid, then
+         * recurrenceId — stable across runs so pagination offsets are meaningful.
+         */
+        private val eventOrdering = compareBy<EventInfo>(
+            { startInstant(it) },
+            { it.uid },
+            { it.recurrenceId ?: "" }
+        )
+
+        /** Sort key: all-day events count as UTC midnight of their start date. */
+        private fun startInstant(event: EventInfo): java.time.Instant = runCatching {
+            if (event.isAllDay) {
+                java.time.LocalDate.parse(event.startDate).atStartOfDay(java.time.ZoneOffset.UTC).toInstant()
+            } else {
+                java.time.Instant.parse(event.startTime)
+            }
+        }.getOrDefault(java.time.Instant.EPOCH)
     }
 }

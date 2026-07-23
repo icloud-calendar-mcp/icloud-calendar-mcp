@@ -5,6 +5,7 @@ import org.onekash.icaldav.model.ICalAlarm
 import org.onekash.icaldav.model.ICalDateTime
 import org.onekash.icaldav.model.ICalEvent
 import org.onekash.icaldav.parser.ICalParser
+import org.onekash.icaldav.recurrence.RRuleExpander
 import org.onekash.icaldav.util.DurationUtils
 import java.time.Instant
 import java.time.format.DateTimeFormatter
@@ -31,6 +32,8 @@ data class ParsedEvent(
     val rdates: List<String> = emptyList(),  // Additional occurrence dates (RFC 5545 §3.8.5.2 — RDATE).
                                              // VALUE=DATE-TIME normalized to ISO 8601 UTC; VALUE=DATE to YYYY-MM-DD.
     val exdates: List<String> = emptyList(), // Excluded occurrence dates (RFC 5545 §3.8.5.1 — EXDATE).
+    val recurrenceId: String? = null,        // RECURRENCE-ID (RFC 5545 §3.8.4.4): identifies which occurrence of a
+                                             // recurring event this is. Same format as rdates/exdates values.
     val status: String? = null,         // TENTATIVE, CONFIRMED, CANCELLED
     val url: String? = null,            // URL property
     val categories: List<String> = emptyList(), // CATEGORIES
@@ -67,6 +70,7 @@ data class ParsedAlarm(
 class IcsParser {
 
     private val parser = ICalParser()
+    private val expander = RRuleExpander()
     private val dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
     /**
@@ -78,6 +82,53 @@ class IcsParser {
         if (icsContent.isBlank()) return emptyList()
         val events = parser.parseAllEvents(icsContent).getOrNull() ?: return emptyList()
         return events.mapNotNull { mapEvent(it) }
+    }
+
+    /**
+     * Parse ICS content and expand recurring events into their concrete occurrences
+     * within [rangeStart, rangeEnd).
+     *
+     * A single ICS body may carry several VEVENTs with the same UID: the master
+     * (no RECURRENCE-ID) plus modified instances (with RECURRENCE-ID). For each
+     * UID group with a recurring master, this applies the RFC 5545 recurrence
+     * formula — (DTSTART ∪ RRULE ∪ RDATE) − EXDATE — with RECURRENCE-ID override
+     * merging, and emits one [ParsedEvent] per occurrence. Each occurrence carries
+     * its concrete start/end, a [ParsedEvent.recurrenceId] identifying the
+     * occurrence, and the master's rrule string for context. A CANCELLED override
+     * removes its occurrence from the result. Non-recurring events pass through
+     * unchanged.
+     */
+    fun parse(icsContent: String, rangeStart: Instant, rangeEnd: Instant): List<ParsedEvent> {
+        if (icsContent.isBlank()) return emptyList()
+        val events = parser.parseAllEvents(icsContent).getOrNull() ?: return emptyList()
+        return events.groupBy { it.uid }.values.flatMap { group ->
+            expandGroup(group, rangeStart, rangeEnd)
+        }
+    }
+
+    /**
+     * Expand one UID group (master + RECURRENCE-ID overrides) into occurrences.
+     * Groups without a recurring master fall back to plain per-event mapping.
+     */
+    private fun expandGroup(group: List<ICalEvent>, rangeStart: Instant, rangeEnd: Instant): List<ParsedEvent> {
+        val master = group.firstOrNull { it.recurrenceId == null }
+        if (master == null || !master.isRecurring()) {
+            return group.mapNotNull { mapEvent(it) }
+        }
+
+        val overrides = RRuleExpander.buildOverrideMap(group.filter { it.recurrenceId != null })
+        val masterRrule = master.rrule?.toICalString()
+
+        return expander.expand(master, rangeStart, rangeEnd, overrides).mapNotNull { occurrence ->
+            // mapEvent returns null for CANCELLED overrides, excluding the occurrence.
+            mapEvent(occurrence)?.copy(
+                // Generated occurrences leave recurrenceId unset; derive it from the
+                // occurrence start so every emitted occurrence is addressable.
+                recurrenceId = occurrence.recurrenceId?.let { formatRecurrenceDate(it, occurrence.isAllDay) }
+                    ?: formatRecurrenceDate(occurrence.dtStart, occurrence.isAllDay),
+                rrule = masterRrule
+            )
+        }
     }
 
     private fun mapEvent(event: ICalEvent): ParsedEvent? {
@@ -118,6 +169,7 @@ class IcsParser {
             rrule = event.rrule?.toICalString(),
             rdates = event.rdates.map { formatRecurrenceDate(it, event.isAllDay) },
             exdates = event.exdates.map { formatRecurrenceDate(it, event.isAllDay) },
+            recurrenceId = event.recurrenceId?.let { formatRecurrenceDate(it, event.isAllDay) },
             alarms = event.alarms.mapNotNull { mapAlarm(it) }
         )
     }

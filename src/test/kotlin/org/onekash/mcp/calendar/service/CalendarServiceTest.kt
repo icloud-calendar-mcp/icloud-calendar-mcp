@@ -206,6 +206,73 @@ class CalendarServiceTest {
     }
 
     @Test
+    fun `get events expands recurring events and sorts by start ascending`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+
+        mockClient.eventsResponse = listOf(
+            CalDavEvent(
+                uid = "oneoff-001",
+                href = "/cal/oneoff.ics",
+                url = "https://test.com/cal/oneoff.ics",
+                etag = "\"etag-oneoff\"",
+                icalData = """
+                    BEGIN:VCALENDAR
+                    VERSION:2.0
+                    BEGIN:VEVENT
+                    UID:oneoff-001
+                    SUMMARY:One-off
+                    DTSTART:20260114T100000Z
+                    DTEND:20260114T110000Z
+                    END:VEVENT
+                    END:VCALENDAR
+                """.trimIndent()
+            ),
+            CalDavEvent(
+                uid = "weekly-001",
+                href = "/cal/weekly.ics",
+                url = "https://test.com/cal/weekly.ics",
+                etag = "\"etag-weekly\"",
+                icalData = """
+                    BEGIN:VCALENDAR
+                    VERSION:2.0
+                    BEGIN:VEVENT
+                    UID:weekly-001
+                    SUMMARY:Weekly Standup
+                    DTSTART:20260105T090000Z
+                    DTEND:20260105T091500Z
+                    RRULE:FREQ=WEEKLY;COUNT=3
+                    END:VEVENT
+                    END:VCALENDAR
+                """.trimIndent()
+            )
+        )
+
+        val result = service.getEvents("cal-1", "2026-01-01", "2026-01-31")
+
+        assertTrue(result is ServiceResult.Success)
+        val events = (result as ServiceResult.Success).data
+        assertEquals(4, events.size)
+        // Occurrences interleave with the one-off event, sorted by start ascending
+        assertEquals(
+            listOf(
+                "2026-01-05T09:00:00Z",
+                "2026-01-12T09:00:00Z",
+                "2026-01-14T10:00:00Z",
+                "2026-01-19T09:00:00Z"
+            ),
+            events.map { it.startTime }
+        )
+        // Expanded occurrences carry a recurrenceId and the master's rrule
+        val occurrences = events.filter { it.uid == "weekly-001" }
+        assertEquals(3, occurrences.size)
+        assertTrue(occurrences.all { it.recurrenceId != null })
+        assertTrue(occurrences.all { it.rrule?.contains("FREQ=WEEKLY") == true })
+        assertNull(events.first { it.uid == "oneoff-001" }.recurrenceId)
+    }
+
+    @Test
     fun `get events returns error for unknown calendar`() {
         mockClient.calendars = listOf(
             CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
