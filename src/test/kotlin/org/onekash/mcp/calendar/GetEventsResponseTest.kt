@@ -7,10 +7,13 @@ import org.onekash.mcp.calendar.ics.ParsedAlarm
 import org.onekash.mcp.calendar.service.EventInfo
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Tests for the get_events response building blocks:
+ * - [paginateEvents]: limit/offset math, hasMore, nextOffset
  * - [encodeEventForResponse]: completeness of the emitted JSON shape
  */
 class GetEventsResponseTest {
@@ -29,6 +32,70 @@ class GetEventsResponseTest {
         endDate = null,
         rrule = null
     )
+
+    private fun events(count: Int): List<EventInfo> = (1..count).map { event("event-$it") }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PAGINATION
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `no limit returns all events with hasMore false`() {
+        val page = paginateEvents(events(5), limit = null, offset = 0)
+
+        assertEquals(5, page.events.size)
+        assertEquals(5, page.totalCount)
+        assertFalse(page.hasMore)
+        assertNull(page.nextOffset)
+    }
+
+    @Test
+    fun `limit truncates and reports hasMore with nextOffset`() {
+        val page = paginateEvents(events(5), limit = 2, offset = 0)
+
+        assertEquals(2, page.events.size)
+        assertEquals(5, page.totalCount)
+        assertTrue(page.hasMore)
+        assertEquals(2, page.nextOffset)
+        assertEquals(listOf("event-1", "event-2"), page.events.map { it.uid })
+    }
+
+    @Test
+    fun `offset skips events and nextOffset advances`() {
+        val page = paginateEvents(events(5), limit = 2, offset = 2)
+
+        assertEquals(listOf("event-3", "event-4"), page.events.map { it.uid })
+        assertTrue(page.hasMore)
+        assertEquals(4, page.nextOffset)
+    }
+
+    @Test
+    fun `final page reports hasMore false`() {
+        val page = paginateEvents(events(5), limit = 2, offset = 4)
+
+        assertEquals(listOf("event-5"), page.events.map { it.uid })
+        assertEquals(5, page.totalCount)
+        assertFalse(page.hasMore)
+        assertNull(page.nextOffset)
+    }
+
+    @Test
+    fun `offset past the end yields an empty page`() {
+        val page = paginateEvents(events(3), limit = null, offset = 10)
+
+        assertTrue(page.events.isEmpty())
+        assertEquals(3, page.totalCount)
+        assertFalse(page.hasMore)
+        assertNull(page.nextOffset)
+    }
+
+    @Test
+    fun `offset without limit returns the remainder`() {
+        val page = paginateEvents(events(5), limit = null, offset = 3)
+
+        assertEquals(listOf("event-4", "event-5"), page.events.map { it.uid })
+        assertFalse(page.hasMore)
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // SERIALIZATION

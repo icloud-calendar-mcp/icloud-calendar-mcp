@@ -220,6 +220,37 @@ internal fun encodeEventForResponse(event: EventInfo): JsonObject = buildJsonObj
     if (event.alarms.isNotEmpty()) put("alarms", encodeAlarmsForResponse(event.alarms))
 }
 
+/**
+ * One page of get_events results.
+ *
+ * @property events The events in this page
+ * @property totalCount Total events available before pagination
+ * @property hasMore True when events beyond this page were truncated
+ * @property nextOffset Offset of the next page; null when [hasMore] is false
+ */
+internal data class EventPage(
+    val events: List<EventInfo>,
+    val totalCount: Int,
+    val hasMore: Boolean,
+    val nextOffset: Int?
+)
+
+/**
+ * Slice a sorted event list per the optional limit/offset pagination params.
+ * A null [limit] means unlimited; [offset] past the end yields an empty page.
+ */
+internal fun paginateEvents(events: List<EventInfo>, limit: Int?, offset: Int): EventPage {
+    val fromIndex = offset.coerceAtMost(events.size)
+    val toIndex = if (limit != null) minOf(fromIndex + limit, events.size) else events.size
+    val hasMore = toIndex < events.size
+    return EventPage(
+        events = events.subList(fromIndex, toIndex).toList(),
+        totalCount = events.size,
+        hasMore = hasMore,
+        nextOffset = if (hasMore) toIndex else null
+    )
+}
+
 private fun createCalendarService(): Pair<CalendarService?, OkHttpCalDavClient?> {
     return try {
         val credentials = CredentialManager.loadFromEnvironment() ?: return Pair(null, null)
@@ -332,6 +363,14 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     put("type", JsonPrimitive("string"))
                     put("description", JsonPrimitive("End date (YYYY-MM-DD)"))
                 })
+                put("limit", buildJsonObject {
+                    put("type", JsonPrimitive("integer"))
+                    put("description", JsonPrimitive("Maximum number of events to return (optional, default unlimited). Events are sorted by start time ascending; when truncated, the response carries hasMore and nextOffset for the next page."))
+                })
+                put("offset", buildJsonObject {
+                    put("type", JsonPrimitive("integer"))
+                    put("description", JsonPrimitive("Number of events to skip from the start of the sorted result (optional, default 0)."))
+                })
             },
             required = listOf("calendar_id", "start_date", "end_date")
         ),
@@ -342,8 +381,24 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     put("description", JsonPrimitive("List of events"))
                     put("items", buildJsonObject { put("type", JsonPrimitive("object")) })
                 })
+                put("totalCount", buildJsonObject {
+                    put("type", JsonPrimitive("integer"))
+                    put("description", JsonPrimitive("Total events in the range before pagination"))
+                })
+                put("returnedCount", buildJsonObject {
+                    put("type", JsonPrimitive("integer"))
+                    put("description", JsonPrimitive("Events returned in this response"))
+                })
+                put("hasMore", buildJsonObject {
+                    put("type", JsonPrimitive("boolean"))
+                    put("description", JsonPrimitive("True when the result was truncated by limit/offset"))
+                })
+                put("nextOffset", buildJsonObject {
+                    put("type", JsonPrimitive("integer"))
+                    put("description", JsonPrimitive("Offset to pass for the next page; present only when hasMore is true"))
+                })
             },
-            required = listOf("events")
+            required = listOf("events", "totalCount", "returnedCount", "hasMore")
         ),
         toolAnnotations = ToolAnnotations(
             readOnlyHint = true,
@@ -363,13 +418,22 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
             val calendarId = args["calendar_id"]?.jsonPrimitive?.content
             val startDate = args["start_date"]?.jsonPrimitive?.content
             val endDate = args["end_date"]?.jsonPrimitive?.content
+            val limit = args["limit"]?.jsonPrimitive?.intOrNull
+            val offset = args["offset"]?.jsonPrimitive?.intOrNull ?: 0
 
             // Validate inputs
             val errors = InputValidator.collectErrors(
                 InputValidator.validateCalendarId(calendarId),
                 InputValidator.validateDate(startDate, "start_date"),
                 InputValidator.validateDate(endDate, "end_date")
-            )
+            ).toMutableList()
+
+            if (args.containsKey("limit") && (limit == null || limit < 1)) {
+                errors.add("limit must be a positive integer")
+            }
+            if (offset < 0) {
+                errors.add("offset must be zero or a positive integer")
+            }
 
             if (errors.isNotEmpty()) {
                 return@safeExecute SecureErrorHandler.validationError(errors)
@@ -384,12 +448,18 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
 
             when (val result = calendarService.getEvents(calendarId!!, startDate!!, endDate!!)) {
                 is ServiceResult.Success -> {
+                    // Service returns events sorted by start ascending; slice per limit/offset.
+                    val page = paginateEvents(result.data, limit, offset)
                     val eventsJson = buildJsonObject {
                         putJsonArray("events") {
-                            result.data.forEach { event ->
+                            page.events.forEach { event ->
                                 add(encodeEventForResponse(event))
                             }
                         }
+                        put("totalCount", page.totalCount)
+                        put("returnedCount", page.events.size)
+                        put("hasMore", page.hasMore)
+                        page.nextOffset?.let { put("nextOffset", it) }
                     }
                     CallToolResult(
                         content = listOf(TextContent(text = eventsJson.toString())),
