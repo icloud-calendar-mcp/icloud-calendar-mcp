@@ -8,9 +8,9 @@ repositories {
 
 dependencies {
     // iCalendar parsing - handles RFC 5545 compliance.
-    // ical4j 4.2.2 is deliberately confined to THIS subproject; the MCP's own
+    // ical4j 4.3.0 is deliberately confined to THIS subproject; the MCP's own
     // source depends on :icaldav-core, never on ical4j directly.
-    implementation("org.mnode.ical4j:ical4j:4.2.2")
+    implementation("org.mnode.ical4j:ical4j:4.3.0")
 
     // Kotlin coroutines (aligned with the root version catalog)
     implementation(libs.kotlinx.coroutines.core)

@@ -73,6 +73,7 @@ fun main(args: Array<String>) {
             capabilities = ServerCapabilities(
                 tools = ServerCapabilities.Tools(listChanged = true),
                 resources = ServerCapabilities.Resources(listChanged = true),
+                prompts = ServerCapabilities.Prompts(listChanged = false),
                 logging = buildJsonObject { }  // Enable MCP logging capability
             )
         )
@@ -86,6 +87,9 @@ fun main(args: Array<String>) {
 
     // Register resources for browsing calendars
     registerResources(server, calendarService)
+
+    // Register user-initiated prompt templates
+    registerPrompts(server)
 
     // Start server with STDIO transport (for Claude Desktop)
     val transport = StdioServerTransport(
@@ -274,7 +278,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "get_events",
-        description = "Get events from a calendar within a date range",
+        description = "Get events from a calendar within a date range. Reflects iCloud's server state at query time. Note on read-after-write: iCloud has no immediate-visibility guarantee, so an event created moments ago may not appear in the very next get_events (CDN indexing lag) — this is NOT a deletion. If a create_event/update_event returned success, that write landed; do not treat a briefly-missing just-created event as failed or deleted, and do not recreate it (that duplicates the event). Use the returned uid/handle to reference it directly.",
         title = "Get Events",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
@@ -347,6 +351,9 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                             result.data.forEach { event ->
                                 addJsonObject {
                                     put("uid", event.uid)
+                                    // Self-contained reference for update/delete — works
+                                    // with a cold cache / fresh process (see EventHandle).
+                                    event.handle?.let { put("handle", it) }
                                     put("summary", event.summary)
                                     event.description?.let { put("description", it) }
                                     event.location?.let { put("location", it) }
@@ -392,7 +399,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "create_event",
-        description = "Create a new calendar event",
+        description = "Create a new calendar event. A success response is authoritative: the event was persisted on iCloud and the returned uid/handle can be used immediately for update_event/delete_event. Do NOT verify the write by re-listing with get_events and retrying on absence — iCloud's CDN may not surface a just-created event in the next listing for a short window, and a retry would create a duplicate.",
         title = "Create Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
@@ -466,6 +473,10 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
             properties = buildJsonObject {
                 put("success", buildJsonObject { put("type", JsonPrimitive("boolean")) })
                 put("uid", buildJsonObject { put("type", JsonPrimitive("string")) })
+                put("handle", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("Opaque, self-contained reference to pass to update_event/delete_event. Works even from a fresh process (no cache dependency)."))
+                })
                 put("summary", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("alarms", buildJsonObject {
@@ -589,6 +600,8 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     val eventJson = buildJsonObject {
                         put("success", true)
                         put("uid", result.data.uid)
+                        // Self-contained reference for later update/delete (see EventHandle).
+                        result.data.handle?.let { put("handle", it) }
                         put("summary", result.data.summary)
                         put("message", "Event created successfully")
                         if (result.data.alarms.isNotEmpty()) {
@@ -619,13 +632,13 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "update_event",
-        description = "Update an existing calendar event. First use get_events to find the event UID.",
+        description = "Update an existing calendar event. First use get_events (or create_event) to obtain the event's handle.",
         title = "Update Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 put("event_id", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Event UID to update"))
+                    put("description", JsonPrimitive("Event reference to update. Prefer the opaque `handle` from get_events/create_event (works even from a fresh process); a bare event UID is also accepted for recently-fetched events."))
                 })
                 put("title", buildJsonObject {
                     put("type", JsonPrimitive("string"))
@@ -693,6 +706,10 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
             properties = buildJsonObject {
                 put("success", buildJsonObject { put("type", JsonPrimitive("boolean")) })
                 put("uid", buildJsonObject { put("type", JsonPrimitive("string")) })
+                put("handle", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("Refreshed opaque reference (carries the new etag) for a subsequent update_event/delete_event."))
+                })
                 put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("alarms", buildJsonObject {
                     put("type", JsonPrimitive("array"))
@@ -824,6 +841,8 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     val eventJson = buildJsonObject {
                         put("success", true)
                         put("uid", result.data.uid)
+                        // Refreshed handle carrying the new etag for a follow-up edit.
+                        result.data.handle?.let { put("handle", it) }
                         put("message", "Event updated successfully")
                         if (result.data.alarms.isNotEmpty()) {
                             put("alarms", encodeAlarmsForResponse(result.data.alarms))
@@ -853,13 +872,13 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "delete_event",
-        description = "Delete a calendar event. First use get_events to find the event UID.",
+        description = "Delete a calendar event. First use get_events (or create_event) to obtain the event's handle.",
         title = "Delete Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 put("event_id", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Event UID to delete"))
+                    put("description", JsonPrimitive("Event reference to delete. Prefer the opaque `handle` from get_events/create_event (works even from a fresh process); a bare event UID is also accepted for recently-fetched events."))
                 })
             },
             required = listOf("event_id")
@@ -930,6 +949,117 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
         }
     }
 }
+
+/**
+ * Register user-initiated prompt templates (RFC-agnostic MCP prompts).
+ *
+ * Prompts are menu templates a client surfaces to its user — they are NOT
+ * consulted by the model during tool use. Each one expands, given its
+ * arguments, to a single user-role message that steers the client through the
+ * correct tool workflow. They are purely additive: the five tools and the
+ * calendar resource are untouched.
+ *
+ * Kept deliberately thin — a prompt's value is a good starting instruction, not
+ * business logic; the tools remain the source of truth for what actually
+ * happens against iCloud.
+ */
+internal fun registerPrompts(server: Server) {
+    // schedule_meeting: title + attendees + duration → a filled create_event call.
+    server.addPrompt(
+        name = "schedule_meeting",
+        description = "Draft a calendar event from a title, attendees, and duration, then create it with create_event.",
+        arguments = listOf(
+            PromptArgument(name = "title", description = "Meeting title", required = true),
+            PromptArgument(name = "attendees", description = "Comma-separated attendee emails", required = false),
+            PromptArgument(name = "duration", description = "Duration, e.g. 30m, 1h (default 30m)", required = false)
+        )
+    ) { request ->
+        val args = request.arguments ?: emptyMap()
+        val title = args["title"]?.takeIf { it.isNotBlank() } ?: "Untitled meeting"
+        val attendees = args["attendees"]?.takeIf { it.isNotBlank() } ?: "(none specified)"
+        val duration = args["duration"]?.takeIf { it.isNotBlank() } ?: "30m"
+        promptResult(
+            description = "Schedule a meeting via create_event",
+            text = """
+                Schedule a calendar meeting using the create_event tool.
+
+                Details:
+                - Title: $title
+                - Attendees: $attendees
+                - Duration: $duration
+
+                Steps:
+                1. If you don't already know the target calendar, call list_calendars and pick the user's default writable calendar.
+                2. Choose a concrete start_time from the conversation (ask if the user hasn't given one). Compute end_time from the $duration duration.
+                3. Call create_event with calendar_id, title="$title", start_time, end_time, and a sensible timezone (IANA, e.g. America/New_York) and a default reminder if the user wants one.
+                4. Mention the attendees ($attendees) in the description; note that this server does not send invitations.
+                5. Treat the create_event success response as authoritative — use the returned uid/handle and do NOT re-list to verify (that risks duplicates).
+            """.trimIndent()
+        )
+    }
+
+    // reschedule: walk the get_events → update_event handle round-trip.
+    server.addPrompt(
+        name = "reschedule",
+        description = "Move an existing event to a new time by looking it up with get_events and editing it with update_event.",
+        arguments = listOf(
+            PromptArgument(name = "event", description = "Title or description of the event to move", required = true),
+            PromptArgument(name = "new_time", description = "New start time (ISO 8601, e.g. 2026-02-01T15:00:00Z)", required = false)
+        )
+    ) { request ->
+        val args = request.arguments ?: emptyMap()
+        val event = args["event"]?.takeIf { it.isNotBlank() } ?: "(describe the event)"
+        val newTime = args["new_time"]?.takeIf { it.isNotBlank() } ?: "(ask the user for the new time)"
+        promptResult(
+            description = "Reschedule an event via the get_events → update_event handle round-trip",
+            text = """
+                Reschedule an existing calendar event.
+
+                Target event: $event
+                New start time: $newTime
+
+                Steps:
+                1. Call get_events over a date range that should contain "$event" and identify the matching event.
+                2. Take the opaque `handle` from that event in the get_events result — do NOT reconstruct an id yourself; the handle is what update_event needs and it survives a cold process.
+                3. Call update_event with event_id set to that handle and start_time=$newTime (adjust end_time to preserve the original duration).
+                4. update_event returns a refreshed handle carrying the new etag — keep it for any follow-up edit.
+                5. If update_event reports a conflict (stale etag), re-run get_events to get the current handle and retry once.
+            """.trimIndent()
+        )
+    }
+
+    // find_conflicts: get_events for a date + overlap reasoning.
+    server.addPrompt(
+        name = "find_conflicts",
+        description = "List a day's events with get_events and reason about overlapping/conflicting time slots.",
+        arguments = listOf(
+            PromptArgument(name = "date", description = "Day to check (YYYY-MM-DD)", required = true)
+        )
+    ) { request ->
+        val args = request.arguments ?: emptyMap()
+        val date = args["date"]?.takeIf { it.isNotBlank() } ?: "(ask the user which day)"
+        promptResult(
+            description = "Find scheduling conflicts on a given day",
+            text = """
+                Find scheduling conflicts on $date.
+
+                Steps:
+                1. Call get_events with start_date=$date and end_date=$date (or the day after, if the client treats end_date as exclusive) for the user's calendars.
+                2. Sort the returned events by start time and compare adjacent events.
+                3. Report any pairs whose time ranges overlap as conflicts, plus any back-to-back events with no gap that the user may want to space out.
+                4. For all-day events, note overlaps with timed events separately (they rarely constitute a hard conflict).
+                5. Present the conflicts clearly; do not modify anything unless the user asks.
+            """.trimIndent()
+        )
+    }
+}
+
+/** Build a single user-role GetPromptResult from a plain-text template. */
+private fun promptResult(description: String, text: String): GetPromptResult =
+    GetPromptResult(
+        description = description,
+        messages = listOf(PromptMessage(role = Role.User, content = TextContent(text = text)))
+    )
 
 /**
  * Register resources for browsing calendars.

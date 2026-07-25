@@ -337,6 +337,64 @@ class OkHttpCalDavClientTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // GET EVENT (single-resource fetch — cold-cache handle resolution)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `getEvent fetches a single event with uid and etag from the ETag header`() {
+        val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:solo@test\nSUMMARY:Solo\nEND:VEVENT\nEND:VCALENDAR"
+        mockServer.enqueue(MockResponse()
+            .setResponseCode(200)
+            .addHeader("ETag", "\"solo-etag\"")
+            .setBody(ics))
+
+        val result = client.getEvent("/123/calendars/home/solo.ics")
+
+        assertIs<CalDavResult.Success<CalDavEvent>>(result)
+        assertEquals("solo@test", result.data.uid)
+        assertEquals("solo-etag", result.data.etag)
+        assertEquals(ics, result.data.icalData)
+
+        val request = mockServer.takeRequest()
+        assertEquals("GET", request.method)
+    }
+
+    @Test
+    fun `getEvent falls back to PROPFIND when the GET omits an ETag header`() {
+        val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:noetag@test\nEND:VEVENT\nEND:VCALENDAR"
+        // GET with no ETag header, then a PROPFIND probe supplies the etag.
+        mockServer.enqueue(MockResponse().setResponseCode(200).setBody(ics))
+        mockServer.enqueue(MockResponse().setResponseCode(207).setBody("""
+            <?xml version="1.0" encoding="UTF-8"?>
+            <D:multistatus xmlns:D="DAV:">
+            <D:response>
+            <D:href>/123/calendars/home/noetag.ics</D:href>
+            <D:propstat><D:prop><D:getetag>"probed-etag"</D:getetag></D:prop>
+            <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+            </D:response>
+            </D:multistatus>
+        """.trimIndent()))
+
+        val result = client.getEvent("/123/calendars/home/noetag.ics")
+
+        assertIs<CalDavResult.Success<CalDavEvent>>(result)
+        assertEquals("noetag@test", result.data.uid)
+        assertEquals("probed-etag", result.data.etag)
+    }
+
+    @Test
+    fun `getEvent returns 404 when the event is gone`() {
+        // GET 404s. A PROPFIND fallback for the etag would also 404, but the missing
+        // body short-circuits to notFound.
+        mockServer.enqueue(MockResponse().setResponseCode(404))
+
+        val result = client.getEvent("/123/calendars/home/missing.ics")
+
+        assertIs<CalDavResult.Error>(result)
+        assertTrue(result.isNotFound)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // DELETE EVENT TESTS
     // ═══════════════════════════════════════════════════════════════════
 

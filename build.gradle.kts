@@ -46,7 +46,7 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
 
-    // ICS parsing/generation — vendored icaldav-core (ical4j 4.2.2 confined to that
+    // ICS parsing/generation — vendored icaldav-core (ical4j 4.3.0 confined to that
     // subproject). The MCP source depends on icaldav's API only; ical4j is NOT a
     // direct dependency here and must not be re-added (two ical4j majors on one
     // classpath collide on net.fortuna.ical4j.* classes).

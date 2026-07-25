@@ -215,7 +215,9 @@ class ICalGenerator(
         // STATUS / SEQUENCE would otherwise be emitted unconditionally below, so
         // REFRESH is handled as a dedicated minimal path.
         if (itipMethod == ITipMethod.REFRESH) {
-            event.recurrenceId?.let { recid -> appendDateTimeProperty("RECURRENCE-ID", recid) }
+            event.recurrenceId?.let { recid ->
+                appendDateTimeProperty("RECURRENCE-ID", recid, recurrenceIdRangeParams(event))
+            }
             event.organizer?.let { org -> crlfLine(formatOrganizer(org, isSchedulingMessage)) }
             event.attendees.forEach { att -> crlfLine(formatAttendee(att, isSchedulingMessage)) }
             crlfLine("END:VEVENT")
@@ -232,9 +234,10 @@ class ICalGenerator(
             crlfLine("DURATION:${ICalAlarm.formatDuration(dur)}")
         }
 
-        // RECURRENCE-ID for modified instances
+        // RECURRENCE-ID for modified instances, carrying its RANGE parameter
+        // (RFC 5545 §3.2.13) back out when one was present.
         event.recurrenceId?.let { recid ->
-            appendDateTimeProperty("RECURRENCE-ID", recid)
+            appendDateTimeProperty("RECURRENCE-ID", recid, recurrenceIdRangeParams(event))
         }
 
         // RRULE (only for master events, NOT modified instances)
@@ -443,22 +446,39 @@ class ICalGenerator(
     }
 
     /**
-     * Append datetime property with proper formatting.
+     * The RANGE parameter to emit on an event's RECURRENCE-ID line, if any
+     * (RFC 5545 §3.2.13). Empty when the event carries no range.
      */
-    private fun StringBuilder.appendDateTimeProperty(name: String, dt: ICalDateTime) {
+    private fun recurrenceIdRangeParams(event: ICalEvent): List<String> =
+        event.recurrenceIdRange?.let { listOf("RANGE=${it.toICalString()}") } ?: emptyList()
+
+    /**
+     * Append datetime property with proper formatting.
+     *
+     * [extraParams] holds any property parameters beyond VALUE/TZID (e.g.
+     * RANGE on a RECURRENCE-ID), each already formatted as "NAME=VALUE". They
+     * are inserted after the value-type/TZID parameter and before the ':' value
+     * separator, so the property stays RFC 5545 well-formed regardless of form.
+     */
+    private fun StringBuilder.appendDateTimeProperty(
+        name: String,
+        dt: ICalDateTime,
+        extraParams: List<String> = emptyList()
+    ) {
+        val extra = extraParams.joinToString("") { ";$it" }
         if (dt.isDate) {
             // DATE format for all-day
-            crlfLine("$name;VALUE=DATE:${dt.toICalString()}")
+            crlfLine("$name;VALUE=DATE$extra:${dt.toICalString()}")
         } else if (dt.isUtc) {
             // UTC format
-            crlfLine("$name:${dt.toICalString()}")
+            crlfLine("$name$extra:${dt.toICalString()}")
         } else if (dt.timezone != null) {
             // Local with TZID
             val tzid = dt.timezone.id
-            crlfLine("$name;TZID=$tzid:${dt.toICalString()}")
+            crlfLine("$name;TZID=$tzid$extra:${dt.toICalString()}")
         } else {
             // Floating (no timezone)
-            crlfLine("$name:${dt.toICalString()}")
+            crlfLine("$name$extra:${dt.toICalString()}")
         }
     }
 

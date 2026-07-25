@@ -898,6 +898,15 @@ class MockCalDavClient : CalDavClient {
         }
     }
 
+    override fun getEvent(href: String): CalDavResult<CalDavEvent> {
+        return if (shouldFail) {
+            CalDavResult.Error(failureCode, failureMessage)
+        } else {
+            events[href]?.let { CalDavResult.Success(it) }
+                ?: CalDavResult.Error(404, "Event not found: $href")
+        }
+    }
+
     override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
         return if (shouldFail) {
             CalDavResult.Error(failureCode, failureMessage)

@@ -276,8 +276,9 @@ class ICloudXmlParser {
         // Check status
         if (!hasSuccessStatus(response)) return null
 
-        // Get href
-        val href = getElementText(response, "href") ?: return null
+        // Get href — normalize regional iCloud partitions (p{N}-…, :443) to the
+        // canonical host so cache keys and minted handles are partition-independent.
+        val href = getElementText(response, "href")?.let { ICloudUrlNormalizer.normalize(it) } ?: return null
 
         // Get calendar-data (may be in CDATA)
         val calendarData = getCalendarData(response) ?: return null

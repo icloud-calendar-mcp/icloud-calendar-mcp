@@ -53,6 +53,18 @@ interface CalDavClient {
     fun getEvents(calendarId: String, startDate: String, endDate: String): CalDavResult<List<CalDavEvent>>
 
     /**
+     * Fetch a single event resource by its href (GET on the .ics URL).
+     *
+     * Used to resolve an event with NO cache dependency — e.g. when an update/delete
+     * arrives via a self-contained handle from a fresh process. Returns the current
+     * ICS body plus the server's current etag.
+     *
+     * @param href Event href (from CalDavEvent.href) or a full URL
+     * @return The event with its current icalData + etag, or error (404 if gone)
+     */
+    fun getEvent(href: String): CalDavResult<CalDavEvent>
+
+    /**
      * Create a new event in a calendar.
      *
      * Uses PUT to create a new .ics resource.

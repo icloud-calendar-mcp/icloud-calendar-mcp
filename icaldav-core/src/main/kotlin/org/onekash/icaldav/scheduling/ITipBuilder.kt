@@ -238,7 +238,9 @@ class ITipBuilder(
     // 2. Modifying all future instances (RANGE=THISANDFUTURE):
     //    - Include RANGE=THISANDFUTURE on RECURRENCE-ID
     //    - Changes apply from specified instance forward
-    //    - Note: RANGE parameter requires ICalEvent enhancement (future work)
+    //    - Set it via event.copy(recurrenceIdRange = RecurrenceRange.THISANDFUTURE);
+    //      the parser and generator preserve it on round-trip. (Expansion still
+    //      resolves the override to its single anchored instance.)
     //
     // 3. Cancelling a single instance:
     //    - Send CANCEL with RECURRENCE-ID for that instance

@@ -72,6 +72,14 @@ data class ICalEvent(
      */
     val recurrenceId: ICalDateTime?,
 
+    /**
+     * RANGE parameter of the RECURRENCE-ID (RFC 5545 §3.2.13). Non-null only on
+     * modified instances that carry one; THISANDFUTURE means the override applies
+     * to this occurrence and every later one. Preserved for round-trip fidelity —
+     * expansion still resolves the override to its single anchored instance.
+     */
+    val recurrenceIdRange: RecurrenceRange? = null,
+
     /** Alarms/reminders from VALARM components */
     val alarms: List<ICalAlarm>,
 
@@ -245,6 +253,25 @@ enum class Transparency {
                 "TRANSPARENT" -> TRANSPARENT
                 else -> OPAQUE
             }
+        }
+    }
+}
+
+/**
+ * RANGE parameter of a RECURRENCE-ID per RFC 5545 §3.2.13. THISANDFUTURE is the
+ * only value the spec defines: the referenced override applies to that
+ * recurrence instance and all subsequent ones. (RFC 2445 also defined
+ * THISANDPRIOR, deprecated and removed in 5545, so it is intentionally omitted.)
+ */
+enum class RecurrenceRange {
+    THISANDFUTURE;
+
+    fun toICalString(): String = name
+
+    companion object {
+        fun fromString(value: String?): RecurrenceRange? = when (value?.uppercase()) {
+            "THISANDFUTURE" -> THISANDFUTURE
+            else -> null
         }
     }
 }

@@ -43,6 +43,7 @@ import org.onekash.icaldav.model.Organizer
 import org.onekash.icaldav.model.ParseResult
 import org.onekash.icaldav.model.PartStat
 import org.onekash.icaldav.model.RRule
+import org.onekash.icaldav.model.RecurrenceRange
 import org.onekash.icaldav.model.ScheduleAgent
 import org.onekash.icaldav.model.ScheduleForceSend
 import org.onekash.icaldav.model.ScheduleStatus
@@ -752,9 +753,11 @@ class ICalParser(
                 (dtstartProp.value.length == 8 && dtstartProp.value.all { it.isDigit() }) ||
                 !dtstartProp.value.contains("T")
 
-            // Parse RECURRENCE-ID if present (modified instance)
-            val recurrenceId = vevent.getPropertyOrNull<Property>("RECURRENCE-ID")
-                ?.let { parseDateTimeFromProperty(it) }
+            // Parse RECURRENCE-ID if present (modified instance), preserving its
+            // RANGE parameter (RFC 5545 §3.2.13) for round-trip fidelity.
+            val recurrenceIdProp = vevent.getPropertyOrNull<Property>("RECURRENCE-ID")
+            val recurrenceId = recurrenceIdProp?.let { parseDateTimeFromProperty(it) }
+            val recurrenceIdRange = recurrenceIdProp?.let { parseRecurrenceRange(it) }
 
             // Generate unique importId
             val importId = ICalEvent.generateImportId(uid, recurrenceId)
@@ -904,6 +907,7 @@ class ICalParser(
                 rdates = rdates,
                 classification = classification,
                 recurrenceId = recurrenceId,
+                recurrenceIdRange = recurrenceIdRange,
                 alarms = alarms,
                 categories = categories,
                 organizer = organizer,
@@ -1053,6 +1057,14 @@ class ICalParser(
             ICalDateTime.parse(value, tzidParam)
         }
     }
+
+    /**
+     * Read the RANGE parameter (RFC 5545 §3.2.13) off a RECURRENCE-ID property.
+     * Parameter name and value are both matched case-insensitively per §3.2;
+     * anything other than THISANDFUTURE (the only value 5545 defines) yields null.
+     */
+    private fun parseRecurrenceRange(prop: Property): RecurrenceRange? =
+        RecurrenceRange.fromString(prop.getParameterIgnoreCase("RANGE")?.value)
 
     /**
      * Extract just the UID from iCal data (for delete detection during sync).

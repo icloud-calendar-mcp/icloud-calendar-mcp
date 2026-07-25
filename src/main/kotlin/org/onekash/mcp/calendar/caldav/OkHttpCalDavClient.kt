@@ -286,6 +286,32 @@ class OkHttpCalDavClient(
         }
     }
 
+    override fun getEvent(href: String): CalDavResult<CalDavEvent> {
+        val normalizedHref = ICloudUrlNormalizer.normalize(href) ?: href
+        val url = if (normalizedHref.startsWith("http")) normalizedHref else "$baseUrl$normalizedHref"
+
+        val request = Request.Builder()
+            .url(url)
+            .get()
+            .addHeader("Authorization", basicAuth())
+            .build()
+
+        return executeRequestWithHeaders(request) { body, headers ->
+            val uid = xmlParser.extractUid(body)
+                ?: return@executeRequestWithHeaders CalDavResult.Error.notFoundError(
+                    "Event body missing UID at $normalizedHref")
+            // Prefer the response ETag header; fall back to a PROPFIND probe.
+            val etag = EtagUtils.normalizeEtag(headers["ETag"]) ?: fetchEtag(url)
+            CalDavResult.Success(CalDavEvent(
+                uid = uid,
+                href = normalizedHref,
+                url = url,
+                etag = etag,
+                icalData = body
+            ))
+        }
+    }
+
     override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
         // Ensure we have calendar info
         val calendarsResult = listCalendars()

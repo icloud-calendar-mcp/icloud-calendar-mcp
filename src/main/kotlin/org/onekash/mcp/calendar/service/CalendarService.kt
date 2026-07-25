@@ -36,6 +36,13 @@ data class EventInfo(
     val uid: String,
     val href: String,
     val etag: String?,
+    /**
+     * Opaque, self-contained reference to this event (see [EventHandle]). Carries
+     * the normalized href + etag, so any process — even one with a cold cache — can
+     * update/delete the event with no cache dependency. Null only on EventInfo
+     * instances built outside the service (e.g. test fixtures).
+     */
+    val handle: String? = null,
     val summary: String,
     val description: String?,
     val location: String?,
@@ -126,6 +133,19 @@ class CalendarService(
      */
     private fun removeFromCache(uid: String) {
         eventCache.remove(uid)
+    }
+
+    /**
+     * Remove the cached entry for a given href, regardless of which UID it is keyed
+     * under. Needed on handle-based delete: the cache is keyed by UID, but a handle
+     * only carries the href, so a plain [removeFromCache] with the handle string
+     * evicts nothing and leaves a stale entry that a later UID-based update could
+     * resolve — issuing a PUT to a deleted href, which CalDAV treats as a recreate.
+     * Compares normalized hrefs so a partition difference can't hide the entry.
+     */
+    private fun removeFromCacheByHref(href: String) {
+        val target = ICloudUrlNormalizer.normalize(href)
+        eventCache.entries.removeIf { ICloudUrlNormalizer.normalize(it.value.event.href) == target }
     }
 
     /**
@@ -303,6 +323,7 @@ class CalendarService(
                         uid = created.uid,
                         href = created.href,
                         etag = created.etag,
+                        handle = EventHandle.encode(created.href, created.etag),
                         summary = summary,
                         description = description,
                         location = location,
@@ -328,6 +349,18 @@ class CalendarService(
     /**
      * Update an existing event.
      * Only provided fields are updated; others retain their values.
+     *
+     * [eventId] may be either:
+     *  - a self-contained handle ([EventHandle], `evt1_…`) minted by get_events /
+     *    create_event — resolved directly from the server with NO cache dependency,
+     *    so a fresh process / expired-TTL / different worker can still update; or
+     *  - a legacy bare UID — resolved from the in-memory cache (optimization only,
+     *    kept for backward-compat).
+     *
+     * On a 412 (stale etag: the resource advanced out from under us — shared
+     * calendar edit, iCloud housekeeping, or a concurrent write), we refetch the
+     * current state, re-patch onto it, and retry the PUT exactly ONCE before
+     * surfacing the conflict. No infinite loop.
      */
     fun updateEvent(
         eventId: String,
@@ -346,79 +379,121 @@ class CalendarService(
         exdates: List<String>? = null,
         alarms: List<AlarmSpec>? = null
     ): ServiceResult<EventInfo> {
-        // Find existing event (checks TTL)
-        val existing = getFromCache(eventId)
-            ?: return ServiceResult.Error(404, "Event not found: $eventId")
+        // Resolve the base event (href + current ICS body + etag). Handle path hits
+        // the server (cache-independent); legacy uid path uses the cache.
+        val baseResult = resolveForWrite(eventId)
+        if (baseResult is ServiceResult.Error) return baseResult
+        val base = (baseResult as ServiceResult.Success).data
 
-        // Use IcsPatcher to preserve VALARM, ATTENDEE, ORGANIZER, X-* properties.
-        // If the cached ICS is something ical4j can't re-parse (server quirk,
-        // weird CRLF/LF mix, etc.), fail loud rather than silently rebuilding
-        // a partial event — see issue #2.
-        val ics = try {
-            patcher.patch(
-                existingIcs = existing.icalData,
-                uid = eventId,
-                summary = summary,
-                startTime = startTime,
-                endTime = endTime,
-                startDate = startDate,
-                endDate = endDate,
-                isAllDay = isAllDay,
-                description = description,
-                location = location,
-                timezone = timezone,
-                rrule = rrule,
-                endTimezone = endTimezone,
-                rdates = rdates,
-                exdates = exdates,
-                alarms = alarms
-            )
-        } catch (e: IcsPatcher.UnparseableExistingIcsException) {
-            return ServiceResult.Error(
-                422,
-                "Could not patch event: existing ICS is unparseable. " +
-                    "This can happen with server-side line-ending quirks; " +
-                    "try a full update (sending all fields) instead of a partial one."
-            )
-        }
+        // Patch + PUT, with a single 412 refetch-and-retry. `allowRetry = true` on
+        // the first attempt only.
+        fun patchAndPut(target: CalDavEvent, allowRetry: Boolean): ServiceResult<EventInfo> {
+            // Use IcsPatcher to preserve VALARM, ATTENDEE, ORGANIZER, X-* properties.
+            // If the ICS is something ical4j can't re-parse (server quirk, weird
+            // CRLF/LF mix, etc.), fail loud rather than silently rebuilding a partial
+            // event.
+            val ics = try {
+                patcher.patch(
+                    existingIcs = target.icalData,
+                    uid = target.uid,
+                    summary = summary,
+                    startTime = startTime,
+                    endTime = endTime,
+                    startDate = startDate,
+                    endDate = endDate,
+                    isAllDay = isAllDay,
+                    description = description,
+                    location = location,
+                    timezone = timezone,
+                    rrule = rrule,
+                    endTimezone = endTimezone,
+                    rdates = rdates,
+                    exdates = exdates,
+                    alarms = alarms
+                )
+            } catch (e: IcsPatcher.UnparseableExistingIcsException) {
+                return ServiceResult.Error(
+                    422,
+                    "Could not patch event: existing ICS is unparseable. " +
+                        "This can happen with server-side line-ending quirks; " +
+                        "try a full update (sending all fields) instead of a partial one."
+                )
+            }
 
-        // Update via CalDAV
-        return when (val result = client.updateEvent(existing.href, ics, existing.etag)) {
-            is CalDavResult.Success -> {
-                val updated = result.data
-                addToCache(updated.uid, updated)
+            return when (val result = client.updateEvent(target.href, ics, target.etag)) {
+                is CalDavResult.Success -> {
+                    val updated = result.data
+                    addToCache(updated.uid, updated)
 
-                // Parse back
-                val parsedUpdated = parser.parse(updated.icalData)
-                if (parsedUpdated.isNotEmpty()) {
-                    ServiceResult.Success(toEventInfo(parsedUpdated[0], updated))
-                } else {
-                    // Fallback: parse the ICS we sent
-                    val sentParsed = parser.parse(ics)
-                    if (sentParsed.isNotEmpty()) {
-                        ServiceResult.Success(toEventInfo(sentParsed[0], updated))
+                    // Parse back
+                    val parsedUpdated = parser.parse(updated.icalData)
+                    if (parsedUpdated.isNotEmpty()) {
+                        ServiceResult.Success(toEventInfo(parsedUpdated[0], updated))
                     } else {
-                        ServiceResult.Success(EventInfo(
-                            uid = updated.uid,
-                            href = updated.href,
-                            etag = updated.etag,
-                            summary = summary ?: eventId,
-                            description = description,
-                            location = location,
-                            isAllDay = isAllDay ?: false,
-                            startTime = startTime,
-                            endTime = endTime,
-                            startDate = startDate,
-                            endDate = endDate,
-                            rrule = rrule
-                        ))
+                        // Fallback: parse the ICS we sent
+                        val sentParsed = parser.parse(ics)
+                        if (sentParsed.isNotEmpty()) {
+                            ServiceResult.Success(toEventInfo(sentParsed[0], updated))
+                        } else {
+                            ServiceResult.Success(EventInfo(
+                                uid = updated.uid,
+                                href = updated.href,
+                                etag = updated.etag,
+                                handle = EventHandle.encode(updated.href, updated.etag),
+                                summary = summary ?: updated.uid,
+                                description = description,
+                                location = location,
+                                isAllDay = isAllDay ?: false,
+                                startTime = startTime,
+                                endTime = endTime,
+                                startDate = startDate,
+                                endDate = endDate,
+                                rrule = rrule
+                            ))
+                        }
+                    }
+                }
+                is CalDavResult.Error -> {
+                    if (result.code == 412 && allowRetry) {
+                        // Stale etag: refetch the current server state and retry once.
+                        when (val fresh = client.getEvent(target.href)) {
+                            is CalDavResult.Success -> patchAndPut(fresh.data, allowRetry = false)
+                            is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+                        }
+                    } else {
+                        ServiceResult.Error(result.code, result.message)
                     }
                 }
             }
-            is CalDavResult.Error -> {
-                ServiceResult.Error(result.code, result.message)
+        }
+
+        return patchAndPut(base, allowRetry = true)
+    }
+
+    /**
+     * Resolve an [eventId] (handle or legacy uid) to the current [CalDavEvent] to
+     * write against. Handle path fetches fresh from the server (no cache needed);
+     * uid path uses the TTL cache.
+     */
+    private fun resolveForWrite(eventId: String): ServiceResult<CalDavEvent> {
+        val handle = EventHandle.decode(eventId)
+        if (handle != null) {
+            return when (val r = client.getEvent(handle.href)) {
+                // Patch onto the current server body, but carry the HANDLE's etag as
+                // the If-Match for the first PUT — that is the version the caller
+                // last saw, so a concurrent edit since the handle was minted trips a
+                // 412 (then refetch-and-retry-once), rather than being silently
+                // overwritten. This mirrors deleteEvent, which sends the handle's
+                // etag directly. When the handle carried no etag, fall back to the
+                // freshly fetched one (best-effort, matches the create path).
+                is CalDavResult.Success ->
+                    ServiceResult.Success(r.data.copy(etag = handle.etag ?: r.data.etag))
+                is CalDavResult.Error -> ServiceResult.Error(r.code, r.message)
             }
         }
+        val cached = getFromCache(eventId)
+            ?: return ServiceResult.Error(404, "Event not found: $eventId")
+        return ServiceResult.Success(cached)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -427,20 +502,51 @@ class CalendarService(
 
     /**
      * Delete an event by ID.
+     *
+     * [eventId] may be a self-contained handle ([EventHandle], `evt1_…`) — resolved
+     * from the server with NO cache dependency — or a legacy bare UID resolved from
+     * the TTL cache. On a 412 (stale etag) we refetch the current etag and retry the
+     * DELETE exactly ONCE before surfacing the conflict.
      */
     fun deleteEvent(eventId: String): ServiceResult<Unit> {
-        val existing = getFromCache(eventId)
-            ?: return ServiceResult.Error(404, "Event not found: $eventId")
+        // Resolve href + etag. Handle path is cache-independent; uid path uses cache.
+        val handle = EventHandle.decode(eventId)
+        val href: String
+        val etag: String?
+        if (handle != null) {
+            href = handle.href
+            etag = handle.etag
+        } else {
+            val existing = getFromCache(eventId)
+                ?: return ServiceResult.Error(404, "Event not found: $eventId")
+            href = existing.href
+            etag = existing.etag
+        }
 
-        return when (val result = client.deleteEvent(existing.href, existing.etag)) {
-            is CalDavResult.Success -> {
-                removeFromCache(eventId)
-                ServiceResult.Success(Unit)
-            }
-            is CalDavResult.Error -> {
-                ServiceResult.Error(result.code, result.message)
+        fun attempt(currentEtag: String?, allowRetry: Boolean): ServiceResult<Unit> {
+            return when (val result = client.deleteEvent(href, currentEtag)) {
+                is CalDavResult.Success -> {
+                    // Evict by href, not by eventId: on the handle path eventId is the
+                    // opaque token, but the cache is keyed by UID. Evicting by href
+                    // clears the entry regardless of which reference form was passed.
+                    removeFromCacheByHref(href)
+                    ServiceResult.Success(Unit)
+                }
+                is CalDavResult.Error -> {
+                    if (result.code == 412 && allowRetry) {
+                        // Stale etag: refetch current etag and retry the DELETE once.
+                        when (val fresh = client.getEvent(href)) {
+                            is CalDavResult.Success -> attempt(fresh.data.etag, allowRetry = false)
+                            is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+                        }
+                    } else {
+                        ServiceResult.Error(result.code, result.message)
+                    }
+                }
             }
         }
+
+        return attempt(etag, allowRetry = true)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -452,6 +558,7 @@ class CalendarService(
             uid = parsed.uid,
             href = caldav.href,
             etag = caldav.etag,
+            handle = EventHandle.encode(caldav.href, caldav.etag),
             summary = parsed.summary,
             description = parsed.description,
             location = parsed.location,

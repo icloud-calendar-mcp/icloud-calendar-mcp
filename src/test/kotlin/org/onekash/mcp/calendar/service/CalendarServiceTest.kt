@@ -355,6 +355,238 @@ class CalendarServiceTest {
         assertEquals(404, error.code)
     }
 
+    // ── Handle-based resolution (cache-independent) ─────────────────────────
+
+    @Test
+    fun `update event resolves by handle from a COLD cache without a 404`() {
+        // A fresh service that has never fetched this event — empty cache. The bare
+        // UID path would 404; the handle carries the href so getEvent resolves it.
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:cold-001
+            SUMMARY:Cold Title
+            DTSTART:20250115T100000Z
+            DTEND:20250115T110000Z
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+        val event = CalDavEvent(
+            uid = "cold-001",
+            href = "/cal/cold-001.ics",
+            url = "https://test.com/cal/cold-001.ics",
+            etag = "\"etag-cold\"",
+            icalData = ics
+        )
+        // Server can resolve it via getEvent(href); cache stays empty.
+        mockClient.registeredEvents["cold-001"] = event
+
+        val handle = EventHandle.encode(event.href, event.etag)
+        val result = service.updateEvent(eventId = handle, summary = "New Cold Title")
+
+        assertTrue(result is ServiceResult.Success, "handle update should succeed from cold cache: $result")
+        assertTrue(mockClient.getEventCallCount >= 1, "cold resolution must fetch via getEvent")
+        assertNotNull(mockClient.lastUpdatedIcs)
+        assertTrue(mockClient.lastUpdatedIcs!!.contains("SUMMARY:New Cold Title"))
+    }
+
+    @Test
+    fun `delete event resolves by handle from a COLD cache without a 404`() {
+        val event = CalDavEvent(
+            uid = "cold-del-001",
+            href = "/cal/cold-del-001.ics",
+            url = "https://test.com/cal/cold-del-001.ics",
+            etag = "\"etag-cd\"",
+            icalData = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:cold-del-001\nEND:VEVENT\nEND:VCALENDAR"
+        )
+        mockClient.registeredEvents["cold-del-001"] = event
+
+        val handle = EventHandle.encode(event.href, event.etag)
+        val result = service.deleteEvent(handle)
+
+        assertTrue(result is ServiceResult.Success, "handle delete should succeed from cold cache: $result")
+        assertEquals("/cal/cold-del-001.ics", mockClient.lastDeletedHref)
+        // Delete uses the etag straight from the handle — no getEvent needed on the happy path.
+        assertEquals("\"etag-cd\"", mockClient.deleteEtagsSeen.first())
+    }
+
+    @Test
+    fun `handle update sends the handle's etag as If-Match, not the refetched one`() {
+        // Optimistic concurrency: the handle's etag is the version the caller last
+        // saw. Even though resolveForWrite fetches the current body to patch onto,
+        // the first PUT must carry the HANDLE's etag so a concurrent edit trips a
+        // 412 — otherwise the caller silently overwrites a change they never saw.
+        val serverEvent = CalDavEvent(
+            uid = "oc-001",
+            href = "/cal/oc-001.ics",
+            url = "https://test.com/cal/oc-001.ics",
+            etag = "\"server-now\"", // the CURRENT server etag (advanced since minting)
+            icalData = """
+                BEGIN:VCALENDAR
+                VERSION:2.0
+                BEGIN:VEVENT
+                UID:oc-001
+                SUMMARY:Original
+                DTSTART:20250115T100000Z
+                DTEND:20250115T110000Z
+                END:VEVENT
+                END:VCALENDAR
+            """.trimIndent()
+        )
+        mockClient.registeredEvents["oc-001"] = serverEvent
+
+        // Handle was minted earlier, carrying the etag the caller last observed.
+        val handle = EventHandle.encode(serverEvent.href, "\"caller-saw\"")
+        val result = service.updateEvent(eventId = handle, summary = "Edited")
+
+        assertTrue(result is ServiceResult.Success, "update should succeed: $result")
+        assertEquals("\"caller-saw\"", mockClient.updateEtagsSeen.first(),
+            "first PUT must carry the handle's etag, not the refetched server etag")
+    }
+
+    @Test
+    fun `handle update falls back to the fetched etag when the handle carried none`() {
+        val serverEvent = CalDavEvent(
+            uid = "oc-002",
+            href = "/cal/oc-002.ics",
+            url = "https://test.com/cal/oc-002.ics",
+            etag = "\"server-etag\"",
+            icalData = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:oc-002\n" +
+                "SUMMARY:S\nDTSTART:20250115T100000Z\nDTEND:20250115T110000Z\nEND:VEVENT\nEND:VCALENDAR"
+        )
+        mockClient.registeredEvents["oc-002"] = serverEvent
+
+        val handle = EventHandle.encode(serverEvent.href, null) // no etag in the handle
+        val result = service.updateEvent(eventId = handle, summary = "Edited")
+
+        assertTrue(result is ServiceResult.Success, "update should succeed: $result")
+        assertEquals("\"server-etag\"", mockClient.updateEtagsSeen.first(),
+            "with no handle etag, the first PUT uses the freshly fetched etag")
+    }
+
+    // ── 412 refetch-and-retry-once ──────────────────────────────────────────
+
+    @Test
+    fun `update recovers from a stale-etag 412 by refetching and retrying once`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+        val ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:retry-001
+            SUMMARY:Retry Title
+            DTSTART:20250115T100000Z
+            DTEND:20250115T110000Z
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+        val staleEvent = CalDavEvent(
+            uid = "retry-001",
+            href = "/cal/retry-001.ics",
+            url = "https://test.com/cal/retry-001.ics",
+            etag = "\"stale-etag\"",
+            icalData = ics
+        )
+        // Warm the cache with the STALE etag via the legacy uid path. (The handle
+        // path refetches before the first PUT, so only the uid/cache path can carry
+        // a stale etag into the first attempt — which is exactly the reported bug.)
+        mockClient.eventsResponse = listOf(staleEvent)
+        mockClient.registeredEvents["retry-001"] = staleEvent
+        service.getEvents("cal-1", "2025-01-15", "2025-01-15")
+
+        // getEvent (the refetch on 412) returns the CURRENT server state, fresh etag.
+        val freshEvent = staleEvent.copy(etag = "\"fresh-etag\"")
+        mockClient.getEventResult = CalDavResult.Success(freshEvent)
+
+        // First PUT (with stale cached etag) 412s; the retry (after refetch) succeeds.
+        mockClient.fail412UpdatesRemaining = 1
+
+        val result = service.updateEvent(eventId = "retry-001", summary = "Reconciled")
+
+        assertTrue(result is ServiceResult.Success, "should recover from 412: $result")
+        assertEquals(2, mockClient.updateEventCallCount, "exactly one retry after the 412")
+        // First attempt carries the stale cached etag; retry carries the refetched one.
+        assertEquals("\"stale-etag\"", mockClient.updateEtagsSeen[0])
+        assertEquals("\"fresh-etag\"", mockClient.updateEtagsSeen[1])
+    }
+
+    @Test
+    fun `update does not retry more than once on repeated 412`() {
+        val event = CalDavEvent(
+            uid = "retry-002",
+            href = "/cal/retry-002.ics",
+            url = "https://test.com/cal/retry-002.ics",
+            etag = "\"e\"",
+            icalData = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:retry-002\nDTSTART:20250115T100000Z\nDTEND:20250115T110000Z\nEND:VEVENT\nEND:VCALENDAR"
+        )
+        mockClient.registeredEvents["retry-002"] = event
+        mockClient.getEventResult = CalDavResult.Success(event)
+        // Both the first PUT and the single retry 412 — must surface the conflict, not loop.
+        mockClient.fail412UpdatesRemaining = 5
+        val handle = EventHandle.encode(event.href, event.etag)
+
+        val result = service.updateEvent(eventId = handle, summary = "X")
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(412, (result as ServiceResult.Error).code)
+        assertEquals(2, mockClient.updateEventCallCount, "one initial + exactly one retry, then give up")
+    }
+
+    @Test
+    fun `delete recovers from a stale-etag 412 by refetching and retrying once`() {
+        val event = CalDavEvent(
+            uid = "retry-del-001",
+            href = "/cal/retry-del-001.ics",
+            url = "https://test.com/cal/retry-del-001.ics",
+            etag = "\"stale\"",
+            icalData = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:retry-del-001\nEND:VEVENT\nEND:VCALENDAR"
+        )
+        mockClient.registeredEvents["retry-del-001"] = event
+        mockClient.getEventResult = CalDavResult.Success(event.copy(etag = "\"fresh\""))
+        mockClient.fail412DeletesRemaining = 1
+        val handle = EventHandle.encode(event.href, "\"stale\"")
+
+        val result = service.deleteEvent(handle)
+
+        assertTrue(result is ServiceResult.Success, "delete should recover from 412: $result")
+        assertEquals(2, mockClient.deleteEventCallCount, "exactly one retry after the 412")
+        assertEquals("\"stale\"", mockClient.deleteEtagsSeen[0])
+        assertEquals("\"fresh\"", mockClient.deleteEtagsSeen[1])
+    }
+
+    // ── Cache eviction on handle-based delete (no resurrection) ──────────────
+
+    @Test
+    fun `handle-based delete evicts the UID-keyed cache entry`() {
+        // Warm the cache the normal way (keyed by UID) via getEvents.
+        val event = CalDavEvent(
+            uid = "evict-001",
+            href = "/cal/evict-001.ics",
+            url = "https://test.com/cal/evict-001.ics",
+            etag = "\"e-evict\"",
+            icalData = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:evict-001\nEND:VEVENT\nEND:VCALENDAR"
+        )
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+        mockClient.eventsResponse = listOf(event)
+        mockClient.registeredEvents["evict-001"] = event
+        service.getEvents("cal-1", "2025-01-15", "2025-01-15")
+        assertEquals(1, service.cacheSize(), "getEvents should have cached the event by UID")
+
+        // Delete by HANDLE (not the UID). Before the fix this evicted nothing because
+        // removeFromCache used the handle string, leaving the stale UID entry behind.
+        val handle = EventHandle.encode(event.href, event.etag)
+        val result = service.deleteEvent(handle)
+
+        assertTrue(result is ServiceResult.Success, "handle delete should succeed: $result")
+        assertEquals(0, service.cacheSize(),
+            "handle-based delete must evict the UID-keyed entry to prevent PUT-recreate resurrection")
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // DELETE EVENT
     // ═══════════════════════════════════════════════════════════════════════
@@ -721,6 +953,72 @@ class CalendarServiceTest {
         assertEquals("/cal/$eventUid.ics", mockClient.lastDeletedHref)
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // READ-AFTER-WRITE / EVENTUAL CONSISTENCY
+    //
+    // iCloud gives no immediate-visibility guarantee: an event just created via
+    // PUT may not appear in the very next calendar-query (CDN indexing lag). This
+    // stateless server never treats "absent from a listing" as "deleted" — it has
+    // no reconciler and no local store to prune. These tests pin that contract so a
+    // future refactor can't silently reintroduce a destructive prune.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `create success is authoritative even when the event is absent from the next listing`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+
+        // Create succeeds on the server.
+        val created = service.createEvent(
+            calendarId = "cal-1",
+            summary = "Fresh event",
+            startTime = "2025-01-15T09:00:00Z",
+            endTime = "2025-01-15T10:00:00Z"
+        )
+        assertTrue(created is ServiceResult.Success, "create must succeed")
+        val info = (created as ServiceResult.Success).data
+        assertNotNull(info.handle, "create returns an authoritative handle")
+
+        // Simulate CDN lag: the immediately-following listing does NOT include it.
+        mockClient.eventsResponse = emptyList()
+        val listing = service.getEvents("cal-1", "2025-01-15", "2025-01-15")
+        assertTrue(listing is ServiceResult.Success)
+        assertTrue((listing as ServiceResult.Success).data.isEmpty(),
+            "listing lags — event not surfaced yet")
+
+        // The write still landed: the returned handle resolves to the event with no
+        // dependency on the listing. A client must NOT read the empty listing as a
+        // failed/deleted create and recreate it (that would duplicate).
+        val fetched = mockClient.getEvent(EventHandle.decode(info.handle!!)!!.href)
+        assertTrue(fetched is CalDavResult.Success,
+            "the created event is reachable by handle despite listing lag")
+    }
+
+    @Test
+    fun `a lagging empty listing does not evict a cached just-created event`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+
+        val created = service.createEvent(
+            calendarId = "cal-1",
+            summary = "Cached event",
+            startTime = "2025-01-15T09:00:00Z",
+            endTime = "2025-01-15T10:00:00Z"
+        )
+        assertTrue(created is ServiceResult.Success)
+        val sizeAfterCreate = service.cacheSize()
+        assertTrue(sizeAfterCreate >= 1, "create warms the cache")
+
+        // A lagging listing returns nothing. getEvents must not interpret absence as
+        // deletion — the cache entry for the just-created event survives.
+        mockClient.eventsResponse = emptyList()
+        service.getEvents("cal-1", "2025-01-15", "2025-01-15")
+        assertEquals(sizeAfterCreate, service.cacheSize(),
+            "an empty (lagging) listing must not prune cached events")
+    }
+
     @Test
     fun `listCalendars caches connection validation`() {
         // First call succeeds (default is Success)
@@ -764,6 +1062,18 @@ class MockCalDavClient : CalDavClient {
         return CalDavResult.Success(eventsResponse)
     }
 
+    var getEventResult: CalDavResult<CalDavEvent>? = null
+    var getEventCallCount: Int = 0
+
+    override fun getEvent(href: String): CalDavResult<CalDavEvent> {
+        getEventCallCount++
+        getEventResult?.let { return it }
+        val event = registeredEvents.values.find { it.href == href }
+            ?: eventsResponse.find { it.href == href }
+            ?: return CalDavResult.Error(404, "Event not found: $href")
+        return CalDavResult.Success(event)
+    }
+
     override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
         lastCreatedIcs = icalData
 
@@ -782,8 +1092,24 @@ class MockCalDavClient : CalDavClient {
         return CalDavResult.Success(event)
     }
 
+    // When > 0, the next N update/delete calls return a 412 before succeeding.
+    // Lets tests exercise the service's refetch-and-retry-once path.
+    var fail412UpdatesRemaining: Int = 0
+    var fail412DeletesRemaining: Int = 0
+    var updateEtagsSeen: MutableList<String?> = mutableListOf()
+    var deleteEtagsSeen: MutableList<String?> = mutableListOf()
+    var updateEventCallCount: Int = 0
+    var deleteEventCallCount: Int = 0
+
     override fun updateEvent(href: String, icalData: String, etag: String?): CalDavResult<CalDavEvent> {
+        updateEventCallCount++
+        updateEtagsSeen.add(etag)
         lastUpdatedIcs = icalData
+
+        if (fail412UpdatesRemaining > 0) {
+            fail412UpdatesRemaining--
+            return CalDavResult.Error(412, "Precondition failed")
+        }
 
         // Find existing event
         val existing = registeredEvents.values.find { it.href == href }
@@ -798,7 +1124,14 @@ class MockCalDavClient : CalDavClient {
     }
 
     override fun deleteEvent(href: String, etag: String?): CalDavResult<Unit> {
+        deleteEventCallCount++
+        deleteEtagsSeen.add(etag)
         lastDeletedHref = href
+
+        if (fail412DeletesRemaining > 0) {
+            fail412DeletesRemaining--
+            return CalDavResult.Error(412, "Precondition failed")
+        }
 
         if (deleteEventResult != null) {
             return deleteEventResult!!
