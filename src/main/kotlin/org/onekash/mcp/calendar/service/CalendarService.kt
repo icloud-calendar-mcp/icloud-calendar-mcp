@@ -7,9 +7,11 @@ import org.onekash.mcp.calendar.ics.IcsPatcher
 import org.onekash.mcp.calendar.ics.IcsParser
 import org.onekash.mcp.calendar.ics.ParsedAlarm
 import org.onekash.mcp.calendar.ics.ParsedEvent
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneOffset
+import java.time.format.DateTimeParseException
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -212,11 +214,18 @@ class CalendarService(
     fun getEvents(calendarId: String, startDate: String, endDate: String): ServiceResult<List<EventInfo>> {
         return when (val result = client.getEvents(calendarId, startDate, endDate)) {
             is CalDavResult.Success -> {
+                // Already format-validated by the client call above.
+                val startDay = LocalDate.parse(startDate)
+                val endDay = LocalDate.parse(endDate)
+
                 // Mirror the window the CalDAV REPORT was built with so expansion
-                // yields exactly the occurrences the server matched. The dates are
-                // already format-validated by the client call above.
-                val rangeStart = LocalDate.parse(startDate).atStartOfDay(ZoneOffset.UTC).toInstant()
-                val rangeEnd = LocalDate.parse(endDate).atTime(LocalTime.of(23, 59, 59)).toInstant(ZoneOffset.UTC)
+                // yields exactly the occurrences the server matched.
+                val rangeStart = startDay.atStartOfDay(ZoneOffset.UTC).toInstant()
+                val rangeEnd = endDay.atTime(LocalTime.of(23, 59, 59)).toInstant(ZoneOffset.UTC)
+
+                // end_date names a day the caller wants included, so the exclusive
+                // bound for re-checking what came back is the day after it.
+                val queryEndExclusive = endDay.plusDays(1)
 
                 val events = result.data.flatMap { caldavEvent ->
                     // Cache event for future lookup (with TTL)
@@ -227,12 +236,65 @@ class CalendarService(
                     parsed.map { p ->
                         toEventInfo(p, caldavEvent)
                     }
-                }
+                }.filter { overlapsRequestedRange(it, startDay, queryEndExclusive) }
                 ServiceResult.Success(events)
             }
             is CalDavResult.Error -> {
                 ServiceResult.Error(result.code, result.message)
             }
+        }
+    }
+
+    /**
+     * True when [event] overlaps the half-open range
+     * [[queryStart], [queryEndExclusive]).
+     *
+     * A CalDAV server is expected to have filtered by the REPORT's time-range
+     * already, but iCloud returns all-day events whose *exclusive* DTEND lands
+     * exactly on the query start. RFC 4791 §9.9 defines the overlap test as
+     * `(DTSTART < end) AND (DTEND > start)`, so a DTEND that merely touches the
+     * start must not match — an event ending 7/27 belongs to 7/26, not 7/27.
+     * Without this check such events surface as belonging to a day they had
+     * already ended before.
+     *
+     * Events whose dates cannot be read are kept: dropping an event the caller
+     * might need is worse than passing one through.
+     */
+    private fun overlapsRequestedRange(
+        event: EventInfo,
+        queryStart: LocalDate,
+        queryEndExclusive: LocalDate
+    ): Boolean {
+        if (event.isAllDay) {
+            val start = event.startDate?.toLocalDateOrNull() ?: return true
+            // EventInfo.endDate is inclusive (IcsParser subtracts a day off the
+            // exclusive DTEND), so shift it back to a half-open bound.
+            val endExclusive = (event.endDate?.toLocalDateOrNull() ?: start).plusDays(1)
+            return start < queryEndExclusive && endExclusive > queryStart
+        }
+
+        val start = event.startTime?.toInstantOrNull() ?: return true
+        val end = event.endTime?.toInstantOrNull() ?: start
+        // A zero-length event still occupies its start instant.
+        val endExclusive = if (end.isAfter(start)) end else start.plusMillis(1)
+
+        return start.isBefore(queryEndExclusive.atStartOfDay(ZoneOffset.UTC).toInstant()) &&
+            endExclusive.isAfter(queryStart.atStartOfDay(ZoneOffset.UTC).toInstant())
+    }
+
+    private fun String.toLocalDateOrNull(): LocalDate? {
+        return try {
+            LocalDate.parse(this)
+        } catch (_: DateTimeParseException) {
+            null
+        }
+    }
+
+    private fun String.toInstantOrNull(): Instant? {
+        return try {
+            Instant.parse(this)
+        } catch (_: DateTimeParseException) {
+            null
         }
     }
 
