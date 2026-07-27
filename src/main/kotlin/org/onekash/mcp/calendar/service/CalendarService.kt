@@ -7,6 +7,9 @@ import org.onekash.mcp.calendar.ics.IcsPatcher
 import org.onekash.mcp.calendar.ics.IcsParser
 import org.onekash.mcp.calendar.ics.ParsedAlarm
 import org.onekash.mcp.calendar.ics.ParsedEvent
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneOffset
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -209,12 +212,18 @@ class CalendarService(
     fun getEvents(calendarId: String, startDate: String, endDate: String): ServiceResult<List<EventInfo>> {
         return when (val result = client.getEvents(calendarId, startDate, endDate)) {
             is CalDavResult.Success -> {
+                // Mirror the window the CalDAV REPORT was built with so expansion
+                // yields exactly the occurrences the server matched. The dates are
+                // already format-validated by the client call above.
+                val rangeStart = LocalDate.parse(startDate).atStartOfDay(ZoneOffset.UTC).toInstant()
+                val rangeEnd = LocalDate.parse(endDate).atTime(LocalTime.of(23, 59, 59)).toInstant(ZoneOffset.UTC)
+
                 val events = result.data.flatMap { caldavEvent ->
                     // Cache event for future lookup (with TTL)
                     addToCache(caldavEvent.uid, caldavEvent)
 
                     // Parse ICS content
-                    val parsed = parser.parse(caldavEvent.icalData)
+                    val parsed = parser.parseOccurrences(caldavEvent.icalData, rangeStart, rangeEnd)
                     parsed.map { p ->
                         toEventInfo(p, caldavEvent)
                     }
