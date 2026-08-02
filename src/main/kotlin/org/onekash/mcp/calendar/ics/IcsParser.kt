@@ -5,6 +5,7 @@ import org.onekash.icaldav.model.ICalAlarm
 import org.onekash.icaldav.model.ICalDateTime
 import org.onekash.icaldav.model.ICalEvent
 import org.onekash.icaldav.parser.ICalParser
+import org.onekash.icaldav.recurrence.RRuleExpander
 import org.onekash.icaldav.util.DurationUtils
 import java.time.Instant
 import java.time.format.DateTimeFormatter
@@ -67,6 +68,7 @@ data class ParsedAlarm(
 class IcsParser {
 
     private val parser = ICalParser()
+    private val expander = RRuleExpander()
     private val dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
     /**
@@ -78,6 +80,49 @@ class IcsParser {
         if (icsContent.isBlank()) return emptyList()
         val events = parser.parseAllEvents(icsContent).getOrNull() ?: return emptyList()
         return events.mapNotNull { mapEvent(it) }
+    }
+
+    /**
+     * Parse ICS content into the individual occurrences that fall within
+     * [rangeStart]..[rangeEnd], expanding RRULE/RDATE and honoring EXDATE and
+     * RECURRENCE-ID overrides.
+     *
+     * [parse] maps each VEVENT verbatim, which for a recurring series reports the
+     * master's DTSTART rather than the occurrence the caller asked about — a
+     * yearly event created in 2023 comes back dated 2023 no matter which year is
+     * queried. Range-aware read paths should use this instead.
+     *
+     * Non-recurring events are passed through unchanged, so callers can use this
+     * for mixed responses.
+     */
+    fun parseOccurrences(icsContent: String, rangeStart: Instant, rangeEnd: Instant): List<ParsedEvent> {
+        if (icsContent.isBlank()) return emptyList()
+        val events = parser.parseAllEvents(icsContent).getOrNull() ?: return emptyList()
+
+        // A VEVENT carrying RECURRENCE-ID is a modified instance of another VEVENT
+        // (RFC 5545 §3.8.4.4), not a series of its own; it is folded into its
+        // master below.
+        val masters = events.filter { it.recurrenceId == null }
+        // A response holding only overrides has no series to expand, so fall back
+        // to mapping what is there rather than returning nothing.
+        if (masters.isEmpty()) return events.mapNotNull { mapEvent(it) }
+
+        val overridesByUid = events.filter { it.recurrenceId != null }.groupBy { it.uid }
+
+        return masters
+            .flatMap { master ->
+                if (master.rrule == null && master.rdates.isEmpty()) {
+                    listOf(master)
+                } else {
+                    expander.expand(
+                        master,
+                        rangeStart,
+                        rangeEnd,
+                        RRuleExpander.buildOverrideMap(overridesByUid[master.uid].orEmpty())
+                    )
+                }
+            }
+            .mapNotNull { mapEvent(it) }
     }
 
     private fun mapEvent(event: ICalEvent): ParsedEvent? {
