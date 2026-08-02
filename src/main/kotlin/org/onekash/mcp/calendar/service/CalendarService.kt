@@ -7,9 +7,11 @@ import org.onekash.mcp.calendar.ics.IcsPatcher
 import org.onekash.mcp.calendar.ics.IcsParser
 import org.onekash.mcp.calendar.ics.ParsedAlarm
 import org.onekash.mcp.calendar.ics.ParsedEvent
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneOffset
+import java.time.format.DateTimeParseException
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -82,6 +84,34 @@ data class CachedEvent(
     val event: CalDavEvent,
     val cachedAt: Long = System.currentTimeMillis()
 )
+
+/**
+ * The UTC window a `get_events` query covers, in every form the query needs.
+ *
+ * `end_date` names a day the caller wants *included*, so the window runs up to
+ * the start of the day after it. Both bounds are UTC because that is what the
+ * REPORT this client builds asks for.
+ */
+private data class DayRangeUtc(val startDay: LocalDate, val endDay: LocalDate) {
+    /** First day after the window. */
+    val endDayExclusive: LocalDate get() = endDay.plusDays(1)
+
+    /** Start of the window, inclusive. */
+    val startInstant: Instant get() = startDay.atStartOfDay(ZoneOffset.UTC).toInstant()
+
+    /** End of the window, exclusive. */
+    val endInstantExclusive: Instant get() = endDayExclusive.atStartOfDay(ZoneOffset.UTC).toInstant()
+
+    /**
+     * Last instant inside the window. Recurrence expansion takes an inclusive
+     * upper bound, so it gets this rather than [endInstantExclusive].
+     */
+    val lastInstant: Instant get() = endDay.atTime(LocalTime.of(23, 59, 59)).toInstant(ZoneOffset.UTC)
+}
+
+/** Builds the [DayRangeUtc] for a query. Dates must already be format-validated. */
+private fun dayRangeUtc(startDate: String, endDate: String) =
+    DayRangeUtc(LocalDate.parse(startDate), LocalDate.parse(endDate))
 
 class CalendarService(
     private val client: CalDavClient,
@@ -212,27 +242,75 @@ class CalendarService(
     fun getEvents(calendarId: String, startDate: String, endDate: String): ServiceResult<List<EventInfo>> {
         return when (val result = client.getEvents(calendarId, startDate, endDate)) {
             is CalDavResult.Success -> {
-                // Mirror the window the CalDAV REPORT was built with so expansion
-                // yields exactly the occurrences the server matched. The dates are
-                // already format-validated by the client call above.
-                val rangeStart = LocalDate.parse(startDate).atStartOfDay(ZoneOffset.UTC).toInstant()
-                val rangeEnd = LocalDate.parse(endDate).atTime(LocalTime.of(23, 59, 59)).toInstant(ZoneOffset.UTC)
+                // Already format-validated by the client call above. Expansion and
+                // the re-check below share this window, so they agree on where the
+                // requested days begin and end.
+                val range = dayRangeUtc(startDate, endDate)
 
                 val events = result.data.flatMap { caldavEvent ->
                     // Cache event for future lookup (with TTL)
                     addToCache(caldavEvent.uid, caldavEvent)
 
-                    // Parse ICS content
-                    val parsed = parser.parseOccurrences(caldavEvent.icalData, rangeStart, rangeEnd)
+                    // Parse ICS content, mirroring the window the CalDAV REPORT was
+                    // built with so expansion yields the occurrences the server matched.
+                    val parsed = parser.parseOccurrences(caldavEvent.icalData, range.startInstant, range.lastInstant)
                     parsed.map { p ->
                         toEventInfo(p, caldavEvent)
                     }
-                }
+                }.filter { overlapsRequestedRange(it, range) }
                 ServiceResult.Success(events)
             }
             is CalDavResult.Error -> {
                 ServiceResult.Error(result.code, result.message)
             }
+        }
+    }
+
+    /**
+     * True when [event] overlaps the half-open window [range] describes.
+     *
+     * A CalDAV server is expected to have filtered by the REPORT's time-range
+     * already, but iCloud returns all-day events whose *exclusive* DTEND lands
+     * exactly on the query start. RFC 4791 §9.9 defines the overlap test as
+     * `(DTSTART < end) AND (DTEND > start)`, so a DTEND that merely touches the
+     * start must not match — an event ending 7/27 belongs to 7/26, not 7/27.
+     * Without this check such events surface as belonging to a day they had
+     * already ended before.
+     *
+     * Events whose dates cannot be read are kept: dropping an event the caller
+     * might need is worse than passing one through.
+     */
+    private fun overlapsRequestedRange(event: EventInfo, range: DayRangeUtc): Boolean {
+        if (event.isAllDay) {
+            val start = event.startDate?.toLocalDateOrNull() ?: return true
+            // EventInfo.endDate is inclusive (IcsParser subtracts a day off the
+            // exclusive DTEND), so shift it back to a half-open bound.
+            val endExclusive = (event.endDate?.toLocalDateOrNull() ?: start).plusDays(1)
+            return start < range.endDayExclusive && endExclusive > range.startDay
+        }
+
+        val start = event.startTime?.toInstantOrNull() ?: return true
+        val end = event.endTime?.toInstantOrNull() ?: start
+        // A zero-length event still occupies its start instant.
+        val endExclusive = if (end.isAfter(start)) end else start.plusMillis(1)
+
+        return start.isBefore(range.endInstantExclusive) &&
+            endExclusive.isAfter(range.startInstant)
+    }
+
+    private fun String.toLocalDateOrNull(): LocalDate? {
+        return try {
+            LocalDate.parse(this)
+        } catch (_: DateTimeParseException) {
+            null
+        }
+    }
+
+    private fun String.toInstantOrNull(): Instant? {
+        return try {
+            Instant.parse(this)
+        } catch (_: DateTimeParseException) {
+            null
         }
     }
 
