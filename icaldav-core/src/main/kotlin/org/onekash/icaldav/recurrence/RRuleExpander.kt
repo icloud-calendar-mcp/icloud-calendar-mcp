@@ -58,13 +58,17 @@ class RRuleExpander {
 
         val occurrences = mutableListOf<ICalEvent>()
 
-        // Get the event's timezone for calculations
-        // For all-day events (isDate=true), always use UTC to preserve calendar dates.
-        // DATE values are stored as UTC midnight, so expansion must use UTC consistently.
-        val eventZone = if (masterEvent.isAllDay) {
-            ZoneOffset.UTC
-        } else {
-            masterEvent.dtStart.timezone ?: ZoneId.systemDefault()
+        // Get the event's timezone for calculations. This MUST match the zone
+        // `ICalDateTime.toZonedDateTime()` resolves the master's DTSTART in, since
+        // the seed's local time is re-interpreted in this zone to build each
+        // occurrence. For all-day events (isDate=true) and UTC (Z-form) events,
+        // that zone is UTC — reading the nullable `timezone` field alone would fall
+        // back to the machine default and desync the seed from the occurrences on a
+        // non-UTC host.
+        val eventZone = when {
+            masterEvent.isAllDay -> ZoneOffset.UTC
+            masterEvent.dtStart.isUtc -> ZoneOffset.UTC
+            else -> masterEvent.dtStart.timezone ?: ZoneId.systemDefault()
         }
 
         // Calculate event duration for creating occurrence end times

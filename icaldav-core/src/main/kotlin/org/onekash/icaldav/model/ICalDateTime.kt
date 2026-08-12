@@ -37,8 +37,10 @@ data class ICalDateTime(
      * For DATE-TIME values: Uses stored timezone (or system default for floating).
      */
     fun toLocalDate(): LocalDate {
-        // DATE values must use UTC to preserve the calendar date
-        val zone = if (isDate) ZoneOffset.UTC else (timezone ?: ZoneId.systemDefault())
+        // DATE values, and DATE-TIME values originally specified as UTC (Z suffix),
+        // must resolve in UTC — never the machine's default zone — or the calendar
+        // date shifts on a non-UTC host (e.g. Jan 23 00:00 UTC → Jan 22 in KST).
+        val zone = if (isDate || isUtc) ZoneOffset.UTC else (timezone ?: ZoneId.systemDefault())
         return Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
     }
 
@@ -54,8 +56,10 @@ data class ICalDateTime(
      * For DATE-TIME values: Uses stored timezone (or system default for floating).
      */
     fun toZonedDateTime(): ZonedDateTime {
-        // DATE values must use UTC to preserve the calendar date
-        val zone = if (isDate) ZoneOffset.UTC else (timezone ?: ZoneId.systemDefault())
+        // DATE values, and DATE-TIME values originally specified as UTC (Z suffix),
+        // must resolve in UTC — never the machine's default zone — so a "…Z" instant
+        // reports the same wall-clock time regardless of the host's default zone.
+        val zone = if (isDate || isUtc) ZoneOffset.UTC else (timezone ?: ZoneId.systemDefault())
         return Instant.ofEpochMilli(timestamp).atZone(zone)
     }
 
