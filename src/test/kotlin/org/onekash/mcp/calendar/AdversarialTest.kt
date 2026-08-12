@@ -10,6 +10,7 @@ import org.onekash.mcp.calendar.service.CalendarService
 import org.onekash.mcp.calendar.service.ServiceResult
 import org.onekash.mcp.calendar.error.SecureErrorHandler
 import org.onekash.mcp.calendar.ratelimit.RateLimiter
+import org.onekash.mcp.calendar.testsupport.MockCalDavClient
 
 /**
  * Adversarial tests for security and robustness.
@@ -34,6 +35,18 @@ class AdversarialTest {
     @BeforeEach
     fun setup() {
         mockClient = MockCalDavClient()
+        // A default calendar so isolation checks see a non-empty starting state
+        // (the previous AdversarialTest-local fake seeded this by default).
+        mockClient.calendars = listOf(
+            CalDavCalendar(
+                id = "default",
+                href = "/calendars/default/",
+                url = "https://example.com/calendars/default/",
+                displayName = "Default Calendar",
+                color = "#0000FF",
+                ctag = "default-ctag"
+            )
+        )
         service = CalendarService(mockClient)
         parser = IcsParser()
         builder = IcsBuilder()
@@ -860,99 +873,5 @@ class AdversarialTest {
         assertTrue(ics.contains("RRULE:"))
         // The 2-digit ordinal must survive the round-trip, not be silently dropped.
         assertTrue(ics.contains("53MO"), "multi-digit BYDAY ordinal should be preserved")
-    }
-}
-
-/**
- * Mock CalDAV client for adversarial testing.
- */
-class MockCalDavClient : CalDavClient {
-    var calendars: List<CalDavCalendar> = listOf(
-        CalDavCalendar(
-            id = "default",
-            href = "/calendars/default/",
-            url = "https://example.com/calendars/default/",
-            displayName = "Default Calendar",
-            color = "#0000FF",
-            ctag = "default-ctag"
-        )
-    )
-    var events: MutableMap<String, CalDavEvent> = mutableMapOf()
-    var shouldFail = false
-    var failureCode = 500
-    var failureMessage = "Mock failure"
-
-    override fun listCalendars(): CalDavResult<List<CalDavCalendar>> {
-        return if (shouldFail) {
-            CalDavResult.Error(failureCode, failureMessage)
-        } else {
-            CalDavResult.Success(calendars)
-        }
-    }
-
-    override fun getEvents(calendarId: String, startDate: String, endDate: String): CalDavResult<List<CalDavEvent>> {
-        return if (shouldFail) {
-            CalDavResult.Error(failureCode, failureMessage)
-        } else {
-            CalDavResult.Success(events.values.toList())
-        }
-    }
-
-    override fun getEvent(href: String): CalDavResult<CalDavEvent> {
-        return if (shouldFail) {
-            CalDavResult.Error(failureCode, failureMessage)
-        } else {
-            events[href]?.let { CalDavResult.Success(it) }
-                ?: CalDavResult.Error(404, "Event not found: $href")
-        }
-    }
-
-    override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
-        return if (shouldFail) {
-            CalDavResult.Error(failureCode, failureMessage)
-        } else {
-            val uid = "event-${System.nanoTime()}"
-            val href = "/calendars/$calendarId/$uid.ics"
-            val url = "https://example.com$href"
-            val event = CalDavEvent(
-                uid = uid,
-                href = href,
-                url = url,
-                etag = "\"new-etag\"",
-                icalData = icalData
-            )
-            events[href] = event
-            CalDavResult.Success(event)
-        }
-    }
-
-    override fun updateEvent(href: String, icalData: String, etag: String?): CalDavResult<CalDavEvent> {
-        return if (shouldFail) {
-            CalDavResult.Error(failureCode, failureMessage)
-        } else {
-            val existing = events[href]
-            if (existing != null) {
-                val updated = existing.copy(icalData = icalData, etag = "\"updated-etag\"")
-                events[href] = updated
-                CalDavResult.Success(updated)
-            } else {
-                CalDavResult.Error(404, "Event not found")
-            }
-        }
-    }
-
-    override fun deleteEvent(href: String, etag: String?): CalDavResult<Unit> {
-        return if (shouldFail) {
-            CalDavResult.Error(failureCode, failureMessage)
-        } else {
-            events.remove(href)
-            CalDavResult.Success(Unit)
-        }
-    }
-
-    override fun checkConnection(): CalDavResult<Boolean> = CalDavResult.Success(true)
-
-    override fun fetchEtags(calendarId: String, startDate: String, endDate: String): CalDavResult<Map<String, String?>> {
-        return CalDavResult.Success(emptyMap())
     }
 }
