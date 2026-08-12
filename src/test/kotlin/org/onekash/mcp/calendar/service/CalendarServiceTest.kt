@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions.*
 import org.onekash.mcp.calendar.caldav.*
+import org.onekash.mcp.calendar.testsupport.MockCalDavClient
 
 /**
  * Tests for CalendarService using mocked CalDavClient.
@@ -1034,123 +1035,5 @@ class CalendarServiceTest {
 
         val result2 = service.listCalendars()
         assertTrue(result2 is ServiceResult.Success) // Uses cached validation
-    }
-}
-
-/**
- * Mock CalDavClient for testing CalendarService.
- */
-class MockCalDavClient : CalDavClient {
-    var calendars: List<CalDavCalendar> = emptyList()
-    var listCalendarsResult: CalDavResult<List<CalDavCalendar>>? = null
-    var eventsResponse: List<CalDavEvent> = emptyList()
-    var registeredEvents: MutableMap<String, CalDavEvent> = mutableMapOf()
-
-    var lastCreatedIcs: String? = null
-    var lastUpdatedIcs: String? = null
-    var lastDeletedHref: String? = null
-
-    var deleteEventResult: CalDavResult<Unit>? = null
-
-    override fun listCalendars(): CalDavResult<List<CalDavCalendar>> {
-        return listCalendarsResult ?: CalDavResult.Success(calendars)
-    }
-
-    override fun getEvents(calendarId: String, startDate: String, endDate: String): CalDavResult<List<CalDavEvent>> {
-        val calendar = calendars.find { it.id == calendarId }
-            ?: return CalDavResult.Error(404, "Calendar not found: $calendarId")
-        return CalDavResult.Success(eventsResponse)
-    }
-
-    var getEventResult: CalDavResult<CalDavEvent>? = null
-    var getEventCallCount: Int = 0
-
-    override fun getEvent(href: String): CalDavResult<CalDavEvent> {
-        getEventCallCount++
-        getEventResult?.let { return it }
-        val event = registeredEvents.values.find { it.href == href }
-            ?: eventsResponse.find { it.href == href }
-            ?: return CalDavResult.Error(404, "Event not found: $href")
-        return CalDavResult.Success(event)
-    }
-
-    override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
-        lastCreatedIcs = icalData
-
-        // Extract UID from ICS
-        val uidMatch = Regex("UID:([^\r\n]+)").find(icalData)
-        val uid = uidMatch?.groupValues?.get(1) ?: "generated-uid"
-
-        val event = CalDavEvent(
-            uid = uid,
-            href = "/cal/$uid.ics",
-            url = "https://test.com/cal/$uid.ics",
-            etag = "\"new-etag\"",
-            icalData = icalData
-        )
-        registeredEvents[uid] = event
-        return CalDavResult.Success(event)
-    }
-
-    // When > 0, the next N update/delete calls return a 412 before succeeding.
-    // Lets tests exercise the service's refetch-and-retry-once path.
-    var fail412UpdatesRemaining: Int = 0
-    var fail412DeletesRemaining: Int = 0
-    var updateEtagsSeen: MutableList<String?> = mutableListOf()
-    var deleteEtagsSeen: MutableList<String?> = mutableListOf()
-    var updateEventCallCount: Int = 0
-    var deleteEventCallCount: Int = 0
-
-    override fun updateEvent(href: String, icalData: String, etag: String?): CalDavResult<CalDavEvent> {
-        updateEventCallCount++
-        updateEtagsSeen.add(etag)
-        lastUpdatedIcs = icalData
-
-        if (fail412UpdatesRemaining > 0) {
-            fail412UpdatesRemaining--
-            return CalDavResult.Error(412, "Precondition failed")
-        }
-
-        // Find existing event
-        val existing = registeredEvents.values.find { it.href == href }
-            ?: return CalDavResult.Error(404, "Event not found")
-
-        val updated = existing.copy(
-            icalData = icalData,
-            etag = "\"updated-etag\""
-        )
-        registeredEvents[existing.uid] = updated
-        return CalDavResult.Success(updated)
-    }
-
-    override fun deleteEvent(href: String, etag: String?): CalDavResult<Unit> {
-        deleteEventCallCount++
-        deleteEtagsSeen.add(etag)
-        lastDeletedHref = href
-
-        if (fail412DeletesRemaining > 0) {
-            fail412DeletesRemaining--
-            return CalDavResult.Error(412, "Precondition failed")
-        }
-
-        if (deleteEventResult != null) {
-            return deleteEventResult!!
-        }
-
-        val event = registeredEvents.values.find { it.href == href }
-        if (event != null) {
-            registeredEvents.remove(event.uid)
-        }
-        return CalDavResult.Success(Unit)
-    }
-
-    var checkConnectionResult: CalDavResult<Boolean> = CalDavResult.Success(true)
-
-    override fun checkConnection(): CalDavResult<Boolean> = checkConnectionResult
-
-    override fun fetchEtags(calendarId: String, startDate: String, endDate: String): CalDavResult<Map<String, String?>> {
-        val calendar = calendars.find { it.id == calendarId }
-            ?: return CalDavResult.Error(404, "Calendar not found: $calendarId")
-        return CalDavResult.Success(eventsResponse.associate { it.href to it.etag })
     }
 }

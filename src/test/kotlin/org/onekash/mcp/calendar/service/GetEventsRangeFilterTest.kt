@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.onekash.mcp.calendar.caldav.CalDavCalendar
 import org.onekash.mcp.calendar.caldav.CalDavEvent
+import org.onekash.mcp.calendar.testsupport.MockCalDavClient
 
 /**
  * Tests that `get_events` re-checks what the server sent against the requested

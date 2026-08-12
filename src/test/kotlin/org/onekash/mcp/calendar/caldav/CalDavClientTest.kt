@@ -5,6 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import org.onekash.mcp.calendar.testsupport.MockCalDavClient
 
 /**
  * Tests for CalDavClient interface contract.
@@ -210,77 +211,5 @@ class CalDavClientTest {
         assertEquals("home", client.lastCalendarId)
         assertEquals("2025-06-01", client.lastStartDate)
         assertEquals("2025-06-30", client.lastEndDate)
-    }
-}
-
-/**
- * Mock implementation for testing the interface contract.
- */
-class MockCalDavClient : CalDavClient {
-
-    // Results to return
-    var calendarsToReturn: List<CalDavCalendar> = emptyList()
-    var eventsToReturn: List<CalDavEvent> = emptyList()
-    var createdEventToReturn: CalDavEvent? = null
-    var updatedEventToReturn: CalDavEvent? = null
-    var deleteSuccess: Boolean = true
-    var errorToReturn: CalDavResult.Error? = null
-
-    // Call tracking
-    var listCalendarsCalled = 0
-    var getEventsCalled = 0
-    var createEventCalled = 0
-    var updateEventCalled = 0
-    var deleteEventCalled = 0
-
-    // Last parameters
-    var lastCalendarId: String? = null
-    var lastStartDate: String? = null
-    var lastEndDate: String? = null
-
-    override fun listCalendars(): CalDavResult<List<CalDavCalendar>> {
-        listCalendarsCalled++
-        return errorToReturn ?: CalDavResult.Success(calendarsToReturn)
-    }
-
-    override fun getEvents(calendarId: String, startDate: String, endDate: String): CalDavResult<List<CalDavEvent>> {
-        getEventsCalled++
-        lastCalendarId = calendarId
-        lastStartDate = startDate
-        lastEndDate = endDate
-        return errorToReturn ?: CalDavResult.Success(eventsToReturn)
-    }
-
-    var getEventCalled = 0
-    var getEventToReturn: CalDavEvent? = null
-
-    override fun getEvent(href: String): CalDavResult<CalDavEvent> {
-        getEventCalled++
-        return errorToReturn ?: getEventToReturn?.let { CalDavResult.Success(it) }
-            ?: eventsToReturn.find { it.href == href }?.let { CalDavResult.Success(it) }
-            ?: CalDavResult.Error(404, "Event not found: $href")
-    }
-
-    override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
-        createEventCalled++
-        return errorToReturn ?: createdEventToReturn?.let { CalDavResult.Success(it) }
-            ?: CalDavResult.Error(500, "No event configured")
-    }
-
-    override fun updateEvent(href: String, icalData: String, etag: String?): CalDavResult<CalDavEvent> {
-        updateEventCalled++
-        return errorToReturn ?: updatedEventToReturn?.let { CalDavResult.Success(it) }
-            ?: CalDavResult.Error(500, "No event configured")
-    }
-
-    override fun deleteEvent(href: String, etag: String?): CalDavResult<Unit> {
-        deleteEventCalled++
-        return errorToReturn ?: if (deleteSuccess) CalDavResult.Success(Unit) else CalDavResult.Error(500, "Delete failed")
-    }
-
-    override fun checkConnection(): CalDavResult<Boolean> = CalDavResult.Success(true)
-
-    override fun fetchEtags(calendarId: String, startDate: String, endDate: String): CalDavResult<Map<String, String?>> {
-        return CalDavResult.Success(emptyMap())
     }
 }
