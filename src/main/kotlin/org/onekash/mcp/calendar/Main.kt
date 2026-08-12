@@ -47,6 +47,10 @@ private val rateLimiter = RateLimiter(readLimit = 60, writeLimit = 20, windowMs 
 private const val ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 
 fun main(args: Array<String>) {
+    // kotlin-logging's startup banner goes to System.out, which stdio reserves for JSON-RPC.
+    // Must run before the first MCP SDK class loads. See StdioPurityTest.
+    System.setProperty("kotlin-logging.logStartupMessage", "false")
+
     runBlocking {
     // Check credential configuration at startup (but don't expose them)
     val credentialsConfigured = CredentialManager.isConfigured()
