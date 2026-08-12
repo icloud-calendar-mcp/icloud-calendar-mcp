@@ -51,7 +51,7 @@ An MCP (Model Context Protocol) server that gives AI assistants access to iCloud
 
 ### Prerequisites
 
-- **Java 17+** (for all installation methods)
+- **Java 21+** (for all installation methods)
 - iCloud account with [app-specific password](https://support.apple.com/en-us/HT204397)
 
 ### Installation

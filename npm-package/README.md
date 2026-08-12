@@ -22,7 +22,7 @@ icloud-calendar-mcp
 
 ## Requirements
 
-- **Java 17+** (the server runs as a Java JAR)
+- **Java 21+** (the server runs as a Java JAR)
 - iCloud account with [app-specific password](https://support.apple.com/en-us/HT204397)
 
 ## Setup

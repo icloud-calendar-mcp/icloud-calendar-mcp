@@ -1,3 +1,5 @@
+import java.util.TimeZone
+
 plugins {
     kotlin("jvm") version libs.versions.kotlin
     kotlin("plugin.serialization") version libs.versions.kotlin
@@ -12,12 +14,12 @@ repositories {
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(21)
 }
 
 application {
@@ -78,6 +80,17 @@ tasks.test {
             excludeTags("integration")
         }
     }
+    // Forward the JVM default time zone to the forked test workers so that
+    // `-Duser.timezone=Asia/Seoul` (or any zone) actually reaches the tests.
+    // Without this, workers always run in the daemon's zone and timezone
+    // regressions stay hidden on a UTC CI box. `user.timezone` is only populated
+    // by an explicit `-Duser.timezone`; an ambient OS/`TZ` zone reads back blank,
+    // so fall back to the resolved default so those runs are exercised too.
+    systemProperty(
+        "user.timezone",
+        System.getProperty("user.timezone")?.takeIf { it.isNotBlank() }
+            ?: TimeZone.getDefault().id
+    )
     // Integration tests share a single real iCloud account, so serialize them to
     // avoid ETag races and cross-test event collisions on the same calendar.
     if (project.hasProperty("integration")) {

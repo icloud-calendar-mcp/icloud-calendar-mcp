@@ -10,7 +10,7 @@ Be respectful and constructive in all interactions. We welcome contributors of a
 
 ### Prerequisites
 
-- Java 17 or higher
+- Java 21 or higher
 - Gradle (wrapper included)
 - Git
 
