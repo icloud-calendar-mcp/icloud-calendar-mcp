@@ -4,6 +4,7 @@ import net.fortuna.ical4j.model.NumberList
 import net.fortuna.ical4j.model.Recur
 import net.fortuna.ical4j.model.WeekDay
 import net.fortuna.ical4j.model.WeekDayList
+import org.onekash.icaldav.model.Frequency
 import org.onekash.icaldav.model.ICalDateTime
 import org.onekash.icaldav.model.ICalEvent
 import org.onekash.icaldav.model.RRule
@@ -14,6 +15,7 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
+import java.time.temporal.ChronoUnit
 import net.fortuna.ical4j.transform.recurrence.Frequency as ICalFrequency
 
 /**
@@ -30,6 +32,17 @@ import net.fortuna.ical4j.transform.recurrence.Frequency as ICalFrequency
  * - Timezone-aware date matching
  */
 class RRuleExpander {
+
+    /**
+     * Thrown when expanding a single series would generate more than [MAX_ITERATIONS]
+     * instances. Carries the offending series [uid] and the [limit] that was hit.
+     *
+     * The `ics` bridge (IcsParser) catches this and rethrows its own bridge-level type
+     * so this core exception, and ical4j itself, stay confined to :icaldav-core.
+     */
+    class ExpansionLimitException(val uid: String, val limit: Int) : RuntimeException(
+        "Recurrence expansion for series '$uid' exceeded the limit of $limit occurrences"
+    )
 
     /**
      * Expand a recurring event into individual occurrences within a time range.
@@ -138,8 +151,21 @@ class RRuleExpander {
                 periodEnd.toLocalDateTime()
             }
 
-            // ical4j 4.x: getDates accepts LocalDateTime, returns List<LocalDateTime>
-            val dates: List<LocalDateTime> = recur.getDates(seed, rangeStartLdt, rangeEndLdt)
+            // Bound expansion to MAX_ITERATIONS generated instances per series (US2,
+            // CWE-400). Two parts:
+            //  1. Fast-forward the seed toward the window ourselves (fastForwardSeed):
+            //     ical4j 4.3.0's own fast-forward (RecurDateSpliterator) doubles an int
+            //     multiplier and overflows to 0 for a far-seed FREQ=SECONDLY, spinning
+            //     forever. Advancing the seed to the window sidesteps that loop.
+            //  2. Cap in-window generation with maxCount = MAX_ITERATIONS + 1; if the
+            //     count-limited result overflows the limit, abort rather than return a
+            //     truncated (silently wrong) list.
+            val effectiveSeed = fastForwardSeed(rrule, seed, rangeStartLdt)
+            val dates: List<LocalDateTime> =
+                recur.getDates(effectiveSeed, rangeStartLdt, rangeEndLdt, MAX_ITERATIONS + 1)
+            if (dates.size > MAX_ITERATIONS) {
+                throw ExpansionLimitException(masterEvent.uid, MAX_ITERATIONS)
+            }
 
             for (date in dates) {
                 val occurrenceZdt = date.atZone(eventZone)
@@ -246,6 +272,54 @@ class RRuleExpander {
     ): List<ICalEvent> = expand(masterEvent, range.start, range.end, overrides)
 
     /**
+     * Advance [seed] forward toward [rangeStart] by whole recurrence periods, so
+     * ical4j does not have to. Its own fast-forward has an int-overflow infinite loop
+     * for a far-seed FREQ=SECONDLY (a seed a large seconds-gap before the window);
+     * landing the seed inside one period of the window sidesteps that loop.
+     *
+     * Only FIXED-LENGTH frequencies are advanced (SECONDLY/MINUTELY/HOURLY/DAILY/
+     * WEEKLY). MONTHLY and YEARLY are left untouched on purpose: adding whole months
+     * or years day-clamps (Jan 31 + 1 month -> Feb 28), which would change the emitted
+     * day of a plain monthly/yearly rule; and they never trigger the overflow (their
+     * far-seed step count is tiny, so ical4j expands them correctly on its own).
+     *
+     * A COUNT rule is also left untouched: skipping leading occurrences would change
+     * which ones are the first COUNT. Returns [seed] unchanged whenever advancing is
+     * either unsafe (MONTHLY/YEARLY, COUNT) or unnecessary (seed already at/after the
+     * window). Because we advance by whole periods, [effectiveSeed] stays on the exact
+     * same recurrence lattice as [seed], so no in-window occurrence is lost or shifted.
+     */
+    private fun fastForwardSeed(rrule: RRule, seed: LocalDateTime, rangeStart: LocalDateTime): LocalDateTime {
+        if (rrule.count != null) return seed
+        if (!seed.isBefore(rangeStart)) return seed
+        val unit = fixedLengthUnit(rrule.freq) ?: return seed
+
+        val interval = maxOf(rrule.interval, 1).toLong()
+        // Whole periods between seed and the window start (floored). periodsToSkip *
+        // interval <= periodsBetween, so the product cannot overflow a Long for any
+        // representable LocalDateTime pair, and effectiveSeed lands at or before
+        // rangeStart.
+        val periodsBetween = unit.between(seed, rangeStart)
+        val periodsToSkip = periodsBetween / interval
+        if (periodsToSkip <= 0) return seed
+        return seed.plus(periodsToSkip * interval, unit)
+    }
+
+    /**
+     * The fixed-length [ChronoUnit] a frequency advances by, or null for MONTHLY and
+     * YEARLY (variable-length units that must not be used to fast-forward a seed;
+     * see [fastForwardSeed]).
+     */
+    private fun fixedLengthUnit(freq: Frequency): ChronoUnit? = when (freq) {
+        Frequency.SECONDLY -> ChronoUnit.SECONDS
+        Frequency.MINUTELY -> ChronoUnit.MINUTES
+        Frequency.HOURLY -> ChronoUnit.HOURS
+        Frequency.DAILY -> ChronoUnit.DAYS
+        Frequency.WEEKLY -> ChronoUnit.WEEKS
+        Frequency.MONTHLY, Frequency.YEARLY -> null
+    }
+
+    /**
      * Build ical4j Recur from our RRule model.
      * Uses ical4j 4.x API with generics and java.time.
      */
@@ -322,6 +396,15 @@ class RRuleExpander {
     }
 
     companion object {
+        /**
+         * Maximum number of instances a single series may generate during expansion.
+         * A DoS guard (CWE-400): a pathologically frequent rule (FREQ=SECONDLY) or a
+         * very wide window can otherwise force effectively unbounded work. On reaching
+         * this bound the expander aborts with [ExpansionLimitException] rather than
+         * returning a truncated (and silently wrong) list.
+         */
+        const val MAX_ITERATIONS = 10_000
+
         /**
          * Tolerance for matching an occurrence's instant against a RECURRENCE-ID's
          * instant. RECURRENCE-ID identifies the original occurrence's instant

@@ -73,6 +73,18 @@ class IcsPatcher(
     class FirstOccurrenceException(message: String) : RuntimeException(message)
 
     /**
+     * Thrown when reducing/truncating a series requires expanding it past the expander's
+     * per-series work-bound (CWE-400 guard): a this-and-future split or delete on a
+     * pathologically dense/long recurring series would enumerate its whole history up to
+     * the cut. Bridge-level mirror of [RRuleExpander.ExpansionLimitException] (see the
+     * ical4j confinement rule), matching [UnparseableExistingIcsException]; the caller
+     * should map it to a 413-shaped error steering to a narrower operation.
+     */
+    class ExpansionLimitException(val uid: String, val limit: Int) : RuntimeException(
+        "Recurring event '$uid' expands to more than $limit occurrences before the requested cut"
+    )
+
+    /**
      * The two resource bodies a this-and-future edit produces. CalDAV stores one UID per
      * resource, so the continuing series (fresh UID) cannot share the master's `.ics`:
      * [truncatedMaster] is PUT back to the existing href, [newSeries] is created as a new
@@ -435,7 +447,14 @@ class IcsPatcher(
         val source = if (applyExdates) master else master.copy(exdates = emptyList(), rdates = emptyList())
         val rangeStart = Instant.ofEpochMilli(minOf(master.dtStart.timestamp, targetTs))
         val rangeEnd = Instant.ofEpochMilli(targetTs)
-        return expander.expand(source, rangeStart, rangeEnd)
+        // Re-throw the expander's work-bound abort as the bridge-level exception, so the
+        // root-module caller never touches the ical4j-confined core type.
+        val expanded = try {
+            expander.expand(source, rangeStart, rangeEnd)
+        } catch (e: RRuleExpander.ExpansionLimitException) {
+            throw ExpansionLimitException(e.uid, e.limit)
+        }
+        return expanded
             .map { it.dtStart.timestamp }
             .filter { it < targetTs }
     }

@@ -48,6 +48,14 @@ object InputValidator {
     private const val MAX_LOCATION_LENGTH = 500
     private const val MAX_CALENDAR_ID_LENGTH = 500
 
+    /**
+     * Largest `get_events` window, in days between start_date and end_date
+     * inclusive of both endpoints (so a full leap year, 2024-01-01..2025-01-01,
+     * is 366 days and accepted). Caps the work a single read can request before
+     * any CalDAV fetch, the first of the three response-size guards.
+     */
+    const val MAX_RANGE_DAYS = 366L
+
     // Regex patterns
     private val DATE_PATTERN = Regex("""^\d{4}-\d{2}-\d{2}$""")
     private val DATETIME_PATTERN = Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$""")
@@ -78,6 +86,44 @@ object InputValidator {
             ValidationResult.Valid
         } catch (e: DateTimeParseException) {
             ValidationResult.Invalid("$fieldName is not a valid date")
+        }
+    }
+
+    /**
+     * Validate the span between a `get_events` start_date and end_date.
+     *
+     * This is a cross-field check, layered on top of the per-field
+     * [validateDate] calls: it rejects an inverted range (end before start) and
+     * a window wider than [MAX_RANGE_DAYS] days, before any CalDAV fetch runs.
+     *
+     * Defensive by design: if either date is null or unparseable, it returns
+     * [ValidationResult.Valid] and leaves the format error to [validateDate], so
+     * it composes in a [collectErrors] block without double-erroring or throwing.
+     */
+    fun validateDateSpan(startDate: String?, endDate: String?): ValidationResult {
+        val start = parseLocalDateOrNull(startDate) ?: return ValidationResult.Valid
+        val end = parseLocalDateOrNull(endDate) ?: return ValidationResult.Valid
+
+        val spanDays = java.time.temporal.ChronoUnit.DAYS.between(start, end)
+        if (spanDays < 0) {
+            return ValidationResult.Invalid("end_date must not precede start_date")
+        }
+        if (spanDays > MAX_RANGE_DAYS) {
+            return ValidationResult.Invalid(
+                "Date range is $spanDays days, which exceeds the maximum of $MAX_RANGE_DAYS days; " +
+                    "narrow the date range"
+            )
+        }
+        return ValidationResult.Valid
+    }
+
+    /** Parse a strict YYYY-MM-DD date, or null when it is absent or malformed. */
+    private fun parseLocalDateOrNull(date: String?): LocalDate? {
+        if (date.isNullOrBlank() || !DATE_PATTERN.matches(date)) return null
+        return try {
+            LocalDate.parse(date)
+        } catch (_: DateTimeParseException) {
+            null
         }
     }
 

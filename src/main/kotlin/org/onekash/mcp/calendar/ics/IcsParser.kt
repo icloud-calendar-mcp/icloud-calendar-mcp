@@ -76,6 +76,17 @@ class IcsParser {
     private val dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
     /**
+     * A recurring series in the requested range expands to more instances than the
+     * expander's per-series work-bound allows (CWE-400 guard). This is the bridge-level
+     * mirror of [RRuleExpander.ExpansionLimitException]: it lets the root module react
+     * to an over-large expansion without importing the ical4j-confined core exception
+     * (see the ical4j confinement rule), matching [IcsPatcher.UnparseableExistingIcsException].
+     */
+    class ExpansionLimitException(val uid: String, val limit: Int) : RuntimeException(
+        "Recurring event '$uid' expands to more than $limit occurrences in the requested range"
+    )
+
+    /**
      * Parse ICS content into a list of events. Returns an empty list on any parse
      * failure (the MCP read path treats an unparseable body as "no events" rather
      * than surfacing an error to the LLM).
@@ -122,12 +133,19 @@ class IcsParser {
                     // Recurring: each expanded occurrence is tagged with its series
                     // master so mapEvent can stamp the occurrence identity and retain
                     // the series rrule (the expander strips both from a plain occurrence).
-                    expander.expand(
-                        master,
-                        rangeStart,
-                        rangeEnd,
-                        RRuleExpander.buildOverrideMap(overridesByUid[master.uid].orEmpty())
-                    ).map { it to master }
+                    // Re-throw the expander's work-bound abort as the bridge-level
+                    // exception, so callers never touch the ical4j-confined core type.
+                    val expanded = try {
+                        expander.expand(
+                            master,
+                            rangeStart,
+                            rangeEnd,
+                            RRuleExpander.buildOverrideMap(overridesByUid[master.uid].orEmpty())
+                        )
+                    } catch (e: RRuleExpander.ExpansionLimitException) {
+                        throw ExpansionLimitException(e.uid, e.limit)
+                    }
+                    expanded.map { it to master }
                 }
             }
             .mapNotNull { (occurrence, seriesMaster) -> mapEvent(occurrence, seriesMaster) }

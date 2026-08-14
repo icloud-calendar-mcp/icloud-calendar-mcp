@@ -15,6 +15,7 @@ import java.time.DayOfWeek
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.util.concurrent.TimeUnit
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
@@ -104,8 +105,9 @@ class RecurrenceResourceExhaustionTest {
 
         @Test
         @Timeout(value = 10, unit = TimeUnit.SECONDS)
-        fun `HOURLY without limit completes over 100 years`() {
-            // FREQ=HOURLY over 100 years = ~876,000 potential occurrences
+        fun `HOURLY without limit over 100 years aborts at the expansion bound`() {
+            // FREQ=HOURLY over 100 years = ~876,000 potential occurrences, far past
+            // MAX_ITERATIONS. The expander aborts fast rather than materializing them.
             val rrule = RRule(
                 freq = Frequency.HOURLY,
                 interval = 1
@@ -117,20 +119,15 @@ class RecurrenceResourceExhaustionTest {
                 defaultStart.plusYears(100).toInstant()
             )
 
-            val startTime = System.currentTimeMillis()
-            val occurrences = expander.expand(event, hundredYearRange)
-            val duration = System.currentTimeMillis() - startTime
-
-            assertTrue(duration < 10000,
-                "Should complete in under 10 seconds, took ${duration}ms")
-
-            println("HOURLY over 100 years generated ${occurrences.size} occurrences in ${duration}ms")
+            assertFailsWith<RRuleExpander.ExpansionLimitException> {
+                expander.expand(event, hundredYearRange)
+            }
         }
 
         @Test
         @Timeout(value = 10, unit = TimeUnit.SECONDS)
-        fun `DAILY over 1000 years completes`() {
-            // FREQ=DAILY over 1000 years = ~365,000 occurrences
+        fun `DAILY over 1000 years aborts at the expansion bound`() {
+            // FREQ=DAILY over 1000 years = ~365,000 occurrences, far past MAX_ITERATIONS.
             val rrule = RRule(
                 freq = Frequency.DAILY,
                 interval = 1
@@ -142,14 +139,9 @@ class RecurrenceResourceExhaustionTest {
                 defaultStart.plusYears(1000).toInstant()
             )
 
-            val startTime = System.currentTimeMillis()
-            val occurrences = expander.expand(event, thousandYearRange)
-            val duration = System.currentTimeMillis() - startTime
-
-            assertTrue(duration < 10000,
-                "Should complete in under 10 seconds, took ${duration}ms")
-
-            println("DAILY over 1000 years generated ${occurrences.size} occurrences in ${duration}ms")
+            assertFailsWith<RRuleExpander.ExpansionLimitException> {
+                expander.expand(event, thousandYearRange)
+            }
         }
     }
 
@@ -159,8 +151,10 @@ class RecurrenceResourceExhaustionTest {
 
         @Test
         @Timeout(value = 30, unit = TimeUnit.SECONDS)
-        fun `high count limit does not cause OOM`() {
-            // COUNT=50000 to test memory usage without excessive time
+        fun `high count limit aborts before materializing 50K occurrences`() {
+            // COUNT=50000 far exceeds MAX_ITERATIONS. The expansion bound stops
+            // generation at the limit, so the huge list is never materialized (a
+            // stronger memory guard than the old "stays under 200MB" assertion).
             val rrule = RRule(
                 freq = Frequency.DAILY,
                 interval = 1,
@@ -174,22 +168,9 @@ class RecurrenceResourceExhaustionTest {
                 defaultStart.plusYears(150).toInstant()  // ~50K days
             )
 
-            // Get memory before
-            val runtime = Runtime.getRuntime()
-            runtime.gc()
-            val memBefore = runtime.totalMemory() - runtime.freeMemory()
-
-            val occurrences = expander.expand(event, range)
-
-            runtime.gc()
-            val memAfter = runtime.totalMemory() - runtime.freeMemory()
-            val memUsed = memAfter - memBefore
-
-            // Should not use more than 200MB for 50K events
-            assertTrue(memUsed < 200_000_000L,
-                "Memory usage should be reasonable: ${memUsed / 1_000_000}MB used")
-
-            println("COUNT=50K generated ${occurrences.size} occurrences, memory delta: ${memUsed / 1_000_000}MB")
+            assertFailsWith<RRuleExpander.ExpansionLimitException> {
+                expander.expand(event, range)
+            }
         }
 
         @Test

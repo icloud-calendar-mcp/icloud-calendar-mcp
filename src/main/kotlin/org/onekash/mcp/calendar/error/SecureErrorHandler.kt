@@ -24,6 +24,7 @@ object SecureErrorHandler {
         NOT_FOUND("NOT_FOUND", 404),
         CONFLICT("CONFLICT", 409),
         RATE_LIMITED("RATE_LIMITED", 429),
+        PAYLOAD_TOO_LARGE("PAYLOAD_TOO_LARGE", 413),
         CALDAV_ERROR("CALDAV_ERROR", 502),
         INTERNAL_ERROR("INTERNAL_ERROR", 500)
     }
@@ -182,6 +183,7 @@ object SecureErrorHandler {
             403 -> ErrorCode.AUTHORIZATION_ERROR
             404 -> ErrorCode.NOT_FOUND
             409 -> ErrorCode.CONFLICT
+            413 -> ErrorCode.PAYLOAD_TOO_LARGE
             429 -> ErrorCode.RATE_LIMITED
             in 500..599 -> ErrorCode.CALDAV_ERROR
             else -> ErrorCode.INTERNAL_ERROR

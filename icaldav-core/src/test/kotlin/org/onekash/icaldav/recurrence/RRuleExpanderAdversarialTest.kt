@@ -11,6 +11,7 @@ import org.onekash.icaldav.model.ICalEvent
 import org.onekash.icaldav.model.RRule
 import org.onekash.icaldav.model.Transparency
 import org.onekash.icaldav.model.WeekdayNum
+import kotlin.test.assertFailsWith
 import java.time.DayOfWeek
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -167,11 +168,11 @@ class RRuleExpanderAdversarialTest {
             defaultStart.plusYears(100).toInstant()
         )
 
-        val occurrences = expander.expand(event, hundredYearRange)
-
-        // Should be limited by internal MAX_ITERATIONS or time range
-        assertTrue(occurrences.size <= 1000 || occurrences.size <= 36525,
-            "Should be limited by MAX_ITERATIONS or time range")
+        // ~36,525 daily occurrences over 100 years exceeds MAX_ITERATIONS, so the
+        // expander aborts rather than returning a truncated list (US2 AC2).
+        assertFailsWith<RRuleExpander.ExpansionLimitException> {
+            expander.expand(event, hundredYearRange)
+        }
     }
 
     @Test
@@ -203,12 +204,11 @@ class RRuleExpanderAdversarialTest {
         )
         val event = createTestEvent(rrule = rrule)
 
-        val occurrences = expander.expand(event, oneYearRange)
-
-        // 1 year = ~525600 minutes - should complete (even if large)
-        // Just verify it completes without hanging
-        assertTrue(occurrences.isNotEmpty(),
-            "MINUTELY should generate some occurrences")
+        // 1 year = ~525,600 minutes, far past MAX_ITERATIONS: the expander aborts
+        // instead of materializing the series (US2 AC2).
+        assertFailsWith<RRuleExpander.ExpansionLimitException> {
+            expander.expand(event, oneYearRange)
+        }
     }
 
     // ==================== UNTIL Edge Cases ====================

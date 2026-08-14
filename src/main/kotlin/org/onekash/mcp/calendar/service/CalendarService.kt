@@ -247,6 +247,13 @@ class CalendarService(
 
     /**
      * Get events from a calendar within a date range.
+     *
+     * Two work-bounds fire here, both as a 413 (see [MAX_RETURNED_EVENTS] and the
+     * expander's per-series limit): a single series expanding past the expander's
+     * bound, and the assembled in-range result exceeding [MAX_RETURNED_EVENTS]. Both
+     * short-circuit rather than returning a truncated or oversize list, because a
+     * downstream consumer can silently corrupt an oversize JSON response. There is no
+     * pagination: the caller narrows the window.
      */
     fun getEvents(calendarId: String, startDate: String, endDate: String): ServiceResult<List<EventInfo>> {
         return when (val result = client.getEvents(calendarId, startDate, endDate)) {
@@ -256,17 +263,31 @@ class CalendarService(
                 // requested days begin and end.
                 val range = dayRangeUtc(startDate, endDate)
 
-                val events = result.data.flatMap { caldavEvent ->
+                val events = ArrayList<EventInfo>()
+                for (caldavEvent in result.data) {
                     // Cache event for future lookup (with TTL)
                     addToCache(caldavEvent.uid, caldavEvent)
 
                     // Parse ICS content, mirroring the window the CalDAV REPORT was
                     // built with so expansion yields the occurrences the server matched.
-                    val parsed = parser.parseOccurrences(caldavEvent.icalData, range.startInstant, range.lastInstant)
-                    parsed.map { p ->
-                        toEventInfo(p, caldavEvent)
+                    // A pathological series can trip the expander's work-bound; surface
+                    // that as a 413 rather than letting it escape get_events.
+                    val parsed = try {
+                        parser.parseOccurrences(caldavEvent.icalData, range.startInstant, range.lastInstant)
+                    } catch (e: IcsParser.ExpansionLimitException) {
+                        return expansionTooLargeError()
                     }
-                }.filter { overlapsRequestedRange(it, range) }
+                    for (p in parsed) {
+                        val info = toEventInfo(p, caldavEvent)
+                        if (!overlapsRequestedRange(info, range)) continue
+                        events.add(info)
+                        // Once past the cap the response would be oversize; stop and
+                        // signal instead of returning a list a consumer might truncate.
+                        if (events.size > MAX_RETURNED_EVENTS) {
+                            return ServiceResult.Error(413, TOO_MANY_EVENTS_MESSAGE)
+                        }
+                    }
+                }
                 ServiceResult.Success(events)
             }
             is CalDavResult.Error -> {
@@ -471,16 +492,20 @@ class CalendarService(
         val isOccurrenceRef = handle?.isOccurrenceRef() == true
         checkWriteScope(scope, isOccurrenceRef, rrule, rdates, exdates)?.let { return it }
         when (scope) {
-            EventScope.THIS_AND_FUTURE -> return updateThisAndFuture(
-                eventId, handle!!.recurrenceId!!,
-                summary, startTime, endTime, startDate, endDate, isAllDay,
-                description, location, timezone, endTimezone, alarms
-            )
-            EventScope.THIS_OCCURRENCE -> return updateSingleOccurrence(
-                eventId, handle!!.recurrenceId!!,
-                summary, startTime, endTime, startDate, endDate, isAllDay,
-                description, location, timezone, endTimezone, alarms
-            )
+            EventScope.THIS_AND_FUTURE -> return catchingExpansionLimit {
+                updateThisAndFuture(
+                    eventId, handle!!.recurrenceId!!,
+                    summary, startTime, endTime, startDate, endDate, isAllDay,
+                    description, location, timezone, endTimezone, alarms
+                )
+            }
+            EventScope.THIS_OCCURRENCE -> return catchingExpansionLimit {
+                updateSingleOccurrence(
+                    eventId, handle!!.recurrenceId!!,
+                    summary, startTime, endTime, startDate, endDate, isAllDay,
+                    description, location, timezone, endTimezone, alarms
+                )
+            }
             // ALL_EVENTS, or omitted on a master/legacy reference: whole-series edit
             // exactly as before.
             EventScope.ALL_EVENTS, null -> { /* fall through to the whole-series path */ }
@@ -659,8 +684,12 @@ class CalendarService(
         val isOccurrenceRef = handle?.isOccurrenceRef() == true
         checkWriteScope(scope, isOccurrenceRef, null, null, null)?.let { return it }
         when (scope) {
-            EventScope.THIS_AND_FUTURE -> return deleteThisAndFuture(eventId, handle!!.recurrenceId!!)
-            EventScope.THIS_OCCURRENCE -> return deleteSingleOccurrence(eventId, handle!!.recurrenceId!!)
+            EventScope.THIS_AND_FUTURE -> return catchingExpansionLimit {
+                deleteThisAndFuture(eventId, handle!!.recurrenceId!!)
+            }
+            EventScope.THIS_OCCURRENCE -> return catchingExpansionLimit {
+                deleteSingleOccurrence(eventId, handle!!.recurrenceId!!)
+            }
             // ALL_EVENTS, or omitted on a master/legacy reference: delete the whole
             // resource exactly as before.
             EventScope.ALL_EVENTS, null -> { /* fall through to the whole-resource delete */ }
@@ -1055,6 +1084,25 @@ class CalendarService(
         "Could not edit the occurrence: the existing event data could not be parsed."
     )
 
+    private fun expansionTooLargeError(): ServiceResult.Error =
+        ServiceResult.Error(413, EXPANSION_TOO_LARGE_MESSAGE)
+
+    /**
+     * Run an occurrence-scoped write, mapping an expander work-bound abort (from the
+     * occurrence-liveness check or a this-and-future split/truncate over a pathologically
+     * dense series) to a clean 413 rather than letting it escape as an INTERNAL_ERROR.
+     * Both bridge types are caught here so the root module never touches the ical4j-confined
+     * core exception (see the ical4j confinement rule).
+     */
+    private inline fun <T> catchingExpansionLimit(block: () -> ServiceResult<T>): ServiceResult<T> =
+        try {
+            block()
+        } catch (e: IcsParser.ExpansionLimitException) {
+            expansionTooLargeError()
+        } catch (e: IcsPatcher.ExpansionLimitException) {
+            expansionTooLargeError()
+        }
+
     /**
      * The occurrence written into [sentIcs] (server echo [updated.icalData] preferred),
      * as an [EventInfo]. Built EXPLICITLY from the occurrence matching [recurrenceId],
@@ -1134,5 +1182,24 @@ class CalendarService(
             attendeeCount = parsed.attendeeCount,
             alarms = parsed.alarms
         )
+    }
+
+    companion object {
+        /**
+         * Hard cap on the number of events [getEvents] assembles into one response.
+         * A larger result can overflow a downstream consumer's response size and be
+         * silently truncated into invalid JSON, so the service returns a 413 instead
+         * of an oversize (or truncated) list. No pagination: the caller narrows the
+         * window (the expansion work-bound in the expander is the per-series analog).
+         */
+        const val MAX_RETURNED_EVENTS = 1000
+
+        private const val TOO_MANY_EVENTS_MESSAGE =
+            "Too many events in range (exceeds $MAX_RETURNED_EVENTS). Narrow the date range " +
+                "(try a week or a month at a time)."
+
+        private const val EXPANSION_TOO_LARGE_MESSAGE =
+            "A recurring event in this range expands to too many occurrences. Narrow the date range " +
+                "(try a week or a month at a time)."
     }
 }

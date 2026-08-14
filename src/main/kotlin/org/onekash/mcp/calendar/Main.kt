@@ -283,7 +283,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "get_events",
-        description = "Get events from a calendar within a date range. Reflects iCloud's server state at query time. Note on read-after-write: iCloud has no immediate-visibility guarantee, so an event created moments ago may not appear in the very next get_events (CDN indexing lag) — this is NOT a deletion. If a create_event/update_event returned success, that write landed; do not treat a briefly-missing just-created event as failed or deleted, and do not recreate it (that duplicates the event). Use the returned uid/handle to reference it directly.",
+        description = "Get events from a calendar within a date range. Reflects iCloud's server state at query time. The range is capped at 366 days, and end_date must not precede start_date; a range past the cap or an inverted one is rejected up front. The response is also capped: a query that would return more than 1000 events, or a single recurring series that expands to too many occurrences in the range, is rejected rather than returned. Query a week or a month at a time to stay under the caps. Note on read-after-write: iCloud has no immediate-visibility guarantee, so an event created moments ago may not appear in the very next get_events (CDN indexing lag) — this is NOT a deletion. If a create_event/update_event returned success, that write landed; do not treat a briefly-missing just-created event as failed or deleted, and do not recreate it (that duplicates the event). Use the returned uid/handle to reference it directly.",
         title = "Get Events",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
@@ -297,7 +297,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 })
                 put("end_date", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("End date (YYYY-MM-DD)"))
+                    put("description", JsonPrimitive("End date (YYYY-MM-DD), inclusive. Must be on or after start_date, and within 366 days of it."))
                 })
             },
             required = listOf("calendar_id", "start_date", "end_date")
@@ -335,7 +335,11 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
             val errors = InputValidator.collectErrors(
                 InputValidator.validateCalendarId(calendarId),
                 InputValidator.validateDate(startDate, "start_date"),
-                InputValidator.validateDate(endDate, "end_date")
+                InputValidator.validateDate(endDate, "end_date"),
+                // Cross-field span cap (US1): reject inverted or > 366-day ranges
+                // before any CalDAV fetch. No-op when either date is malformed;
+                // the validateDate calls above own those errors.
+                InputValidator.validateDateSpan(startDate, endDate)
             )
 
             if (errors.isNotEmpty()) {

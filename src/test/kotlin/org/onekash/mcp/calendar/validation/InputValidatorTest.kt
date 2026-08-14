@@ -295,6 +295,58 @@ class InputValidatorTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // DATE SPAN VALIDATION TESTS (get_events range cap, US1)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `validateDateSpan accepts a 365-day span`() {
+        val result = InputValidator.validateDateSpan("2026-01-01", "2027-01-01")
+        assertTrue(result is ValidationResult.Valid)
+    }
+
+    @Test
+    fun `validateDateSpan accepts a 366-day span (boundary)`() {
+        // 2024 is a leap year, so 2024-01-01 .. 2024-12-31 is 365 days;
+        // 2024-01-01 .. 2025-01-01 is 366 days (the largest allowed span).
+        val result = InputValidator.validateDateSpan("2024-01-01", "2025-01-01")
+        assertTrue(result is ValidationResult.Valid)
+    }
+
+    @Test
+    fun `validateDateSpan rejects a 367-day span`() {
+        val result = InputValidator.validateDateSpan("2024-01-01", "2025-01-02")
+        assertTrue(result is ValidationResult.Invalid)
+        val message = (result as ValidationResult.Invalid).message
+        assertTrue(message.contains("366"), "message should name the 366-day limit: $message")
+        assertTrue(message.lowercase().contains("narrow"), "message should tell the caller to narrow the range: $message")
+    }
+
+    @Test
+    fun `validateDateSpan accepts a zero-day span (start equals end)`() {
+        val result = InputValidator.validateDateSpan("2026-05-10", "2026-05-10")
+        assertTrue(result is ValidationResult.Valid)
+    }
+
+    @Test
+    fun `validateDateSpan rejects an inverted range (end before start)`() {
+        val result = InputValidator.validateDateSpan("2026-05-10", "2026-05-09")
+        assertTrue(result is ValidationResult.Invalid)
+        val message = (result as ValidationResult.Invalid).message
+        assertTrue(message.contains("end_date"), "message should reference end_date: $message")
+        assertTrue(message.lowercase().contains("precede"), "message should say end_date must not precede start_date: $message")
+    }
+
+    @Test
+    fun `validateDateSpan returns Valid for a malformed date (defers to validateDate)`() {
+        // A cross-field check must not double-error or throw on a bad date;
+        // the per-field validateDate calls own format errors.
+        assertTrue(InputValidator.validateDateSpan("not-a-date", "2026-05-10") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateDateSpan("2026-05-10", "2026-13-40") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateDateSpan(null, "2026-05-10") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateDateSpan("2026-05-10", null) is ValidationResult.Valid)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // ICS SANITIZATION TESTS
     // ═══════════════════════════════════════════════════════════════════
 
