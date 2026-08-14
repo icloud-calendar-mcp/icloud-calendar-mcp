@@ -69,6 +69,8 @@ class MockCalDavClient : CalDavClient {
     var getEventResult: CalDavResult<CalDavEvent>? = null
     var createdEventToReturn: CalDavEvent? = null
     var updatedEventToReturn: CalDavEvent? = null
+    /** Canned override for [updateEvent] (e.g. to fail the master PUT while createEvent succeeds). */
+    var updateEventResult: CalDavResult<CalDavEvent>? = null
     var deleteEventResult: CalDavResult<Unit>? = null
 
     /** When false (and no other override applies), [deleteEvent] returns a 500. */
@@ -165,6 +167,7 @@ class MockCalDavClient : CalDavClient {
             fail412UpdatesRemaining--
             return CalDavResult.Error(412, "Precondition failed")
         }
+        updateEventResult?.let { return it }
         updatedEventToReturn?.let { return CalDavResult.Success(it) }
 
         val existing = registeredEvents.values.find { it.href == href }

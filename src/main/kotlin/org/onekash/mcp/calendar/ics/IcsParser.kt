@@ -29,6 +29,10 @@ data class ParsedEvent(
     val timezone: String? = null,       // IANA TZID from DTSTART; null for UTC/floating times
     val endTimezone: String? = null,    // IANA TZID from DTEND when distinct from start; null when matching or absent
     val rrule: String? = null,          // Raw RRULE string if recurring
+    val recurrenceId: String? = null,   // RFC 5545 §3.8.4.4 RECURRENCE-ID in iCal wire form
+                                         // (20260818T140000Z / 20260818): the instance this
+                                         // occurrence identifies within its series. Null for a
+                                         // standalone (non-recurring) event.
     val rdates: List<String> = emptyList(),  // Additional occurrence dates (RFC 5545 §3.8.5.2 — RDATE).
                                              // VALUE=DATE-TIME normalized to ISO 8601 UTC; VALUE=DATE to YYYY-MM-DD.
     val exdates: List<String> = emptyList(), // Excluded occurrence dates (RFC 5545 §3.8.5.1 — EXDATE).
@@ -112,20 +116,32 @@ class IcsParser {
         return masters
             .flatMap { master ->
                 if (master.rrule == null && master.rdates.isEmpty()) {
-                    listOf(master)
+                    // Non-recurring: pass through verbatim (no series identity).
+                    listOf(master to null)
                 } else {
+                    // Recurring: each expanded occurrence is tagged with its series
+                    // master so mapEvent can stamp the occurrence identity and retain
+                    // the series rrule (the expander strips both from a plain occurrence).
                     expander.expand(
                         master,
                         rangeStart,
                         rangeEnd,
                         RRuleExpander.buildOverrideMap(overridesByUid[master.uid].orEmpty())
-                    )
+                    ).map { it to master }
                 }
             }
-            .mapNotNull { mapEvent(it) }
+            .mapNotNull { (occurrence, seriesMaster) -> mapEvent(occurrence, seriesMaster) }
     }
 
-    private fun mapEvent(event: ICalEvent): ParsedEvent? {
+    /**
+     * Map an [ICalEvent] to a [ParsedEvent]. When [seriesMaster] is non-null, [event]
+     * is an expanded occurrence of a recurring series: its occurrence identity
+     * (RECURRENCE-ID) and the series rrule are stamped from the master, since the
+     * expander strips both from a plain occurrence. When [seriesMaster] is null the
+     * event is mapped verbatim (standalone event, or a raw VEVENT from [parse]),
+     * deriving any recurrence identity from the event's own RECURRENCE-ID.
+     */
+    private fun mapEvent(event: ICalEvent, seriesMaster: ICalEvent? = null): ParsedEvent? {
         // Skip cancelled events
         if (event.status == EventStatus.CANCELLED) return null
 
@@ -153,6 +169,18 @@ class IcsParser {
             mapTimed(event, uid, summary)
         }
 
+        // Occurrence identity: for an expanded occurrence, the identity is its own
+        // RECURRENCE-ID (an edited override carries the ORIGINAL instant) falling back
+        // to its start (a plain occurrence), and the rrule is the series master's. For
+        // a verbatim map, both come from the event itself (a standalone event has
+        // neither; a raw override VEVENT has its own RECURRENCE-ID).
+        val recurrenceId = if (seriesMaster != null) {
+            (event.recurrenceId ?: event.dtStart).toICalString()
+        } else {
+            event.recurrenceId?.toICalString()
+        }
+        val rrule = (seriesMaster?.rrule ?: event.rrule)?.toICalString()
+
         return base.copy(
             status = status,
             url = event.url,
@@ -160,7 +188,8 @@ class IcsParser {
             priority = event.priority.takeIf { it > 0 },
             organizer = organizer,
             attendeeCount = event.attendees.size,
-            rrule = event.rrule?.toICalString(),
+            rrule = rrule,
+            recurrenceId = recurrenceId,
             rdates = event.rdates.map { formatRecurrenceDate(it, event.isAllDay) },
             exdates = event.exdates.map { formatRecurrenceDate(it, event.isAllDay) },
             alarms = event.alarms.mapNotNull { mapAlarm(it) }

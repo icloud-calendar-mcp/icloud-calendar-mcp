@@ -5,6 +5,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions.*
 import org.onekash.mcp.calendar.caldav.*
 import org.onekash.mcp.calendar.testsupport.MockCalDavClient
+import org.onekash.mcp.calendar.validation.EventScope
 
 /**
  * Tests for CalendarService using mocked CalDavClient.
@@ -1035,5 +1036,471 @@ class CalendarServiceTest {
 
         val result2 = service.listCalendars()
         assertTrue(result2 is ServiceResult.Success) // Uses cached validation
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // OCCURRENCE IDENTITY (recurrenceId + per-occurrence handle)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `get events on a recurring series gives each occurrence a distinct occurrence handle`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+        mockClient.eventsResponse = listOf(
+            CalDavEvent(
+                uid = "daily-001",
+                href = "/cal/daily.ics",
+                url = "https://test.com/cal/daily.ics",
+                etag = "\"etag-daily\"",
+                icalData = """
+                    BEGIN:VCALENDAR
+                    VERSION:2.0
+                    BEGIN:VEVENT
+                    UID:daily-001
+                    SUMMARY:Daily standup
+                    DTSTART:20250115T090000Z
+                    DTEND:20250115T091500Z
+                    RRULE:FREQ=DAILY
+                    END:VEVENT
+                    END:VCALENDAR
+                """.trimIndent()
+            )
+        )
+
+        val result = service.getEvents("cal-1", "2025-01-15", "2025-01-17")
+
+        assertTrue(result is ServiceResult.Success)
+        val events = (result as ServiceResult.Success).data
+        assertEquals(3, events.size, "three daily occurrences in the window")
+
+        // Every occurrence carries its own recurrence identity and a handle that
+        // decodes to an occurrence reference pinning that instant.
+        val recids = events.map { it.recurrenceId!! }
+        assertEquals(
+            listOf("20250115T090000Z", "20250116T090000Z", "20250117T090000Z"),
+            recids.sorted(),
+            "each occurrence reports its own RECURRENCE-ID"
+        )
+
+        val handles = events.mapNotNull { it.handle }
+        assertEquals(events.size, handles.size, "every occurrence has a handle")
+        assertEquals(handles.size, handles.toSet().size, "occurrence handles are distinct")
+
+        events.forEach { e ->
+            val decoded = EventHandle.decode(e.handle!!)
+            assertNotNull(decoded)
+            assertTrue(decoded!!.isOccurrenceRef(), "handle decodes to an occurrence reference")
+            assertEquals(e.recurrenceId, decoded.recurrenceId, "handle pins the occurrence's instant")
+            // All occurrences share the one master resource.
+            assertEquals("/cal/daily.ics", decoded.href)
+            assertEquals("\"etag-daily\"", decoded.etag)
+        }
+    }
+
+    @Test
+    fun `get events on a standalone event gives a master handle with no recurrenceId`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+        mockClient.eventsResponse = listOf(
+            CalDavEvent(
+                uid = "single-001",
+                href = "/cal/single.ics",
+                url = "https://test.com/cal/single.ics",
+                etag = "\"etag-single\"",
+                icalData = """
+                    BEGIN:VCALENDAR
+                    VERSION:2.0
+                    BEGIN:VEVENT
+                    UID:single-001
+                    SUMMARY:One-off
+                    DTSTART:20250115T100000Z
+                    DTEND:20250115T110000Z
+                    END:VEVENT
+                    END:VCALENDAR
+                """.trimIndent()
+            )
+        )
+
+        val result = service.getEvents("cal-1", "2025-01-15", "2025-01-15")
+
+        assertTrue(result is ServiceResult.Success)
+        val event = (result as ServiceResult.Success).data.single()
+        assertNull(event.recurrenceId, "a standalone event is not a series instance")
+
+        val decoded = EventHandle.decode(event.handle!!)
+        assertNotNull(decoded)
+        assertFalse(decoded!!.isOccurrenceRef(), "standalone events get a master (evt1_) handle")
+        assertNull(decoded.recurrenceId)
+        assertEquals("/cal/single.ics", decoded.href)
+        assertEquals("\"etag-single\"", decoded.etag)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SCOPED WRITES (this_occurrence / all_events + fail-loud matrix)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /** A daily timed series (09:00-09:15Z, from 2025-01-15) stored so getEvent(href) finds it. */
+    private fun registerDailySeries(
+        href: String = "/cal/daily.ics",
+        etag: String = "\"e-series\"",
+        rrule: String = "RRULE:FREQ=DAILY"
+    ): CalDavEvent {
+        val event = CalDavEvent(
+            uid = "daily-series",
+            href = href,
+            url = "https://test.com$href",
+            etag = etag,
+            icalData = """
+                BEGIN:VCALENDAR
+                VERSION:2.0
+                PRODID:-//Test//Test//EN
+                BEGIN:VEVENT
+                UID:daily-series
+                SUMMARY:Daily standup
+                DTSTART:20250115T090000Z
+                DTEND:20250115T091500Z
+                $rrule
+                END:VEVENT
+                END:VCALENDAR
+            """.trimIndent()
+        )
+        mockClient.registeredEvents[event.uid] = event
+        return event
+    }
+
+    @Test
+    fun `update on an occurrence reference with omitted scope is rejected without writing`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+
+        val result = service.updateEvent(handle, summary = "Renamed", scope = null)
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(400, (result as ServiceResult.Error).code)
+        assertEquals(0, mockClient.updateEventCalled, "no write when scope is ambiguous")
+    }
+
+    @Test
+    fun `delete on an occurrence reference with omitted scope is rejected without writing`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+
+        val result = service.deleteEvent(handle, scope = null)
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(400, (result as ServiceResult.Error).code)
+        assertEquals(0, mockClient.updateEventCalled)
+        assertEquals(0, mockClient.deleteEventCalled)
+    }
+
+    @Test
+    fun `this_occurrence scope on a master reference is rejected without writing`() {
+        val event = registerDailySeries()
+        val masterHandle = EventHandle.encode(event.href, event.etag) // evt1_, no recurrenceId
+
+        val result = service.updateEvent(masterHandle, summary = "X", scope = EventScope.THIS_OCCURRENCE)
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(400, (result as ServiceResult.Error).code)
+        assertEquals(0, mockClient.updateEventCalled)
+    }
+
+    @Test
+    fun `this_occurrence scope on a legacy uid reference is rejected without writing`() {
+        registerDailySeries()
+
+        val result = service.updateEvent("daily-series", summary = "X", scope = EventScope.THIS_OCCURRENCE)
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(400, (result as ServiceResult.Error).code)
+        assertEquals(0, mockClient.updateEventCalled)
+    }
+
+    @Test
+    fun `series-level fields with this_occurrence scope are rejected without writing`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+
+        val result = service.updateEvent(handle, rrule = "FREQ=WEEKLY", scope = EventScope.THIS_OCCURRENCE)
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(400, (result as ServiceResult.Error).code)
+        assertEquals(0, mockClient.updateEventCalled)
+    }
+
+    @Test
+    fun `update this_occurrence writes an exception and leaves the master series untouched`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+
+        val result = service.updateEvent(
+            handle,
+            startTime = "2025-01-16T15:00:00Z",
+            endTime = "2025-01-16T16:00:00Z",
+            scope = EventScope.THIS_OCCURRENCE
+        )
+
+        assertTrue(result is ServiceResult.Success)
+        val ics = mockClient.lastUpdatedIcs!!
+        // Master survives with its RRULE and original DTSTART.
+        assertTrue(ics.contains("RRULE:FREQ=DAILY"), "master RRULE preserved:\n$ics")
+        assertTrue(ics.contains("DTSTART:20250115T090000Z"), "master DTSTART unchanged:\n$ics")
+        // A RECURRENCE-ID exception is added for the edited instance, moved to 15:00.
+        assertTrue(ics.contains("RECURRENCE-ID:20250116T090000Z"), "exception identifies the occurrence:\n$ics")
+        assertTrue(ics.contains("DTSTART:20250116T150000Z"), "exception moved to 15:00:\n$ics")
+
+        // The result reports the edited occurrence, not the master, via an evt2_ handle.
+        val info = (result as ServiceResult.Success).data
+        assertEquals("20250116T090000Z", info.recurrenceId)
+        assertTrue(info.startTime!!.startsWith("2025-01-16T15:00"), "result reflects the moved time: ${info.startTime}")
+        val decoded = EventHandle.decode(info.handle!!)!!
+        assertTrue(decoded.isOccurrenceRef())
+        assertEquals("20250116T090000Z", decoded.recurrenceId)
+        assertEquals("\"updated-etag\"", decoded.etag, "handle carries the refreshed etag")
+    }
+
+    @Test
+    fun `delete this_occurrence adds an EXDATE and keeps the rest of the series`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+
+        val result = service.deleteEvent(handle, scope = EventScope.THIS_OCCURRENCE)
+
+        assertTrue(result is ServiceResult.Success)
+        // Deleting one occurrence is a PUT of the master with an EXDATE, not a resource DELETE.
+        assertEquals(1, mockClient.updateEventCalled)
+        assertEquals(0, mockClient.deleteEventCalled)
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(ics.contains("RRULE:FREQ=DAILY"), "series survives:\n$ics")
+        assertTrue(ics.contains("DTSTART:20250115T090000Z"), "master DTSTART unchanged:\n$ics")
+        assertTrue(Regex("EXDATE[^\\n]*20250116").containsMatchIn(ics), "occurrence excluded:\n$ics")
+    }
+
+    @Test
+    fun `delete this_occurrence for an instant not in the series is rejected without writing`() {
+        val event = registerDailySeries(rrule = "RRULE:FREQ=DAILY;COUNT=3") // 15th, 16th, 17th only
+        val handle = EventHandle.encode(event.href, event.etag, "20250201T090000Z") // well past the series
+
+        val result = service.deleteEvent(handle, scope = EventScope.THIS_OCCURRENCE)
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(409, (result as ServiceResult.Error).code)
+        assertEquals(0, mockClient.updateEventCalled, "no write for a non-occurrence")
+    }
+
+    @Test
+    fun `a 412 on a this_occurrence delete refetches the master and re-applies the EXDATE before retrying`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+        mockClient.fail412UpdatesRemaining = 1 // first EXDATE PUT trips 412, retry succeeds
+
+        val result = service.deleteEvent(handle, scope = EventScope.THIS_OCCURRENCE)
+
+        assertTrue(result is ServiceResult.Success)
+        assertEquals(2, mockClient.updateEventCalled, "one failed PUT + one retried PUT")
+        assertEquals(0, mockClient.deleteEventCalled, "this_occurrence delete is a PUT, never a resource DELETE")
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(Regex("EXDATE[^\\n]*20250116").containsMatchIn(ics), "EXDATE re-applied on retry:\n$ics")
+        assertTrue(ics.contains("RRULE:FREQ=DAILY"), "series survives:\n$ics")
+    }
+
+    @Test
+    fun `a 412 on a this_and_future delete recomputes the truncation and retries once`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250117T090000Z") // third occurrence
+        mockClient.fail412UpdatesRemaining = 1 // first truncating PUT trips 412, retry succeeds
+
+        val result = service.deleteEvent(handle, scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Success)
+        assertEquals(2, mockClient.updateEventCalled, "one failed PUT + one retried PUT")
+        assertEquals(0, mockClient.deleteEventCalled, "this_and_future delete truncates, never DELETEs the resource")
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(ics.contains("UNTIL=20250116T090000Z"), "truncation recomputed on retry:\n$ics")
+        assertTrue(ics.contains("DTSTART:20250115T090000Z"), "master DTSTART unchanged:\n$ics")
+    }
+
+    @Test
+    fun `all_events scope on an occurrence reference edits the whole series`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+
+        val result = service.updateEvent(handle, summary = "Renamed series", scope = EventScope.ALL_EVENTS)
+
+        assertTrue(result is ServiceResult.Success)
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(ics.contains("SUMMARY:Renamed series"), "master summary changed:\n$ics")
+        assertTrue(ics.contains("RRULE:FREQ=DAILY"), "still a series:\n$ics")
+        assertFalse(ics.contains("RECURRENCE-ID"), "whole-series edit adds no exception:\n$ics")
+    }
+
+    @Test
+    fun `a 412 on an occurrence write refetches the master and re-applies the exception before retrying`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+        mockClient.fail412UpdatesRemaining = 1 // first PUT trips 412, retry succeeds
+
+        val result = service.updateEvent(
+            handle,
+            startTime = "2025-01-16T15:00:00Z",
+            endTime = "2025-01-16T16:00:00Z",
+            scope = EventScope.THIS_OCCURRENCE
+        )
+
+        assertTrue(result is ServiceResult.Success)
+        assertEquals(2, mockClient.updateEventCalled, "one failed PUT + one retried PUT")
+        // The retried body is recomputed onto the refetched master, so the exception is present.
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(ics.contains("RECURRENCE-ID:20250116T090000Z"), "exception re-applied on retry:\n$ics")
+        assertTrue(ics.contains("DTSTART:20250116T150000Z"), "edit preserved on retry:\n$ics")
+    }
+
+    @Test
+    fun `update this_and_future truncates the master and creates a new series with the patch applied`() {
+        val event = registerDailySeries() // FREQ=DAILY from 20250115T090000Z
+        val handle = EventHandle.encode(event.href, event.etag, "20250117T090000Z") // third occurrence
+
+        val result = service.updateEvent(handle, summary = "Renamed onward", scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Success)
+        // Two writes: PUT the truncated master, then create the new series as a fresh resource.
+        assertEquals(1, mockClient.updateEventCalled, "master truncated with one PUT")
+        assertEquals(1, mockClient.createEventCalled, "new series created as a separate resource")
+        assertEquals(0, mockClient.deleteEventCalled)
+
+        // Truncated master keeps its DTSTART/UID and gains an UNTIL at the last kept occurrence (16th).
+        val masterIcs = mockClient.lastUpdatedIcs!!
+        assertTrue(masterIcs.contains("UID:daily-series"), "master UID unchanged:\n$masterIcs")
+        assertTrue(masterIcs.contains("DTSTART:20250115T090000Z"), "master DTSTART unchanged:\n$masterIcs")
+        assertTrue(masterIcs.contains("UNTIL=20250116T090000Z"), "master RRULE capped at last kept:\n$masterIcs")
+        assertFalse(masterIcs.contains("SUMMARY:Renamed onward"), "master summary not touched:\n$masterIcs")
+
+        // New series starts at the occurrence, carries the patch, has a fresh UID and no RECURRENCE-ID.
+        val newIcs = mockClient.lastCreatedIcs!!
+        assertTrue(newIcs.contains("SUMMARY:Renamed onward"), "patch applied to the new series:\n$newIcs")
+        assertTrue(newIcs.contains("DTSTART:20250117T090000Z"), "new series starts at the occurrence:\n$newIcs")
+        assertTrue(newIcs.contains("RRULE:FREQ=DAILY"), "new series keeps the recurrence rule:\n$newIcs")
+        assertFalse(newIcs.contains("RECURRENCE-ID"), "new series is a master, not an exception:\n$newIcs")
+        assertFalse(newIcs.contains("UID:daily-series"), "new series carries a fresh UID:\n$newIcs")
+
+        val info = (result as ServiceResult.Success).data
+        assertEquals("Renamed onward", info.summary)
+    }
+
+    @Test
+    fun `delete this_and_future truncates the master and does not delete the resource`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250117T090000Z")
+
+        val result = service.deleteEvent(handle, scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Success)
+        // A this-and-future delete is a PUT of the master with a capped RRULE, not a resource DELETE.
+        assertEquals(1, mockClient.updateEventCalled)
+        assertEquals(0, mockClient.deleteEventCalled)
+        assertEquals(0, mockClient.createEventCalled)
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(ics.contains("DTSTART:20250115T090000Z"), "master DTSTART unchanged:\n$ics")
+        assertTrue(ics.contains("UNTIL=20250116T090000Z"), "series capped at the last kept occurrence:\n$ics")
+        assertFalse(ics.contains("RECURRENCE-ID"), "no exception written:\n$ics")
+    }
+
+    @Test
+    fun `update this_and_future at the first occurrence edits the whole series`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250115T090000Z") // the first occurrence
+
+        val result = service.updateEvent(handle, summary = "Renamed all", scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Success)
+        // "This and future" from the first occurrence is the whole series: one PUT, no split.
+        assertEquals(1, mockClient.updateEventCalled)
+        assertEquals(0, mockClient.createEventCalled, "no new series when the split is a no-op")
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(ics.contains("SUMMARY:Renamed all"), "whole series summary changed:\n$ics")
+        assertTrue(ics.contains("RRULE:FREQ=DAILY"), "still a series:\n$ics")
+        assertTrue(ics.contains("DTSTART:20250115T090000Z"), "master DTSTART unchanged:\n$ics")
+        assertFalse(ics.contains("RECURRENCE-ID"), "whole-series edit adds no exception:\n$ics")
+        assertFalse(ics.contains("UNTIL="), "whole-series edit does not cap the rule:\n$ics")
+    }
+
+    @Test
+    fun `delete this_and_future at the first occurrence deletes the whole resource`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250115T090000Z")
+
+        val result = service.deleteEvent(handle, scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Success)
+        // Deleting from the first occurrence removes the whole series (a resource DELETE).
+        assertEquals(1, mockClient.deleteEventCalled)
+        assertEquals(0, mockClient.updateEventCalled, "no truncating PUT when the whole series goes")
+    }
+
+    @Test
+    fun `this_and_future for an instant not in the series is rejected without writing`() {
+        val event = registerDailySeries(rrule = "RRULE:FREQ=DAILY;COUNT=3") // 15th, 16th, 17th only
+        val handle = EventHandle.encode(event.href, event.etag, "20250201T090000Z") // well past the series
+
+        val update = service.updateEvent(handle, summary = "x", scope = EventScope.THIS_AND_FUTURE)
+        assertTrue(update is ServiceResult.Error)
+        assertEquals(409, (update as ServiceResult.Error).code)
+
+        val delete = service.deleteEvent(handle, scope = EventScope.THIS_AND_FUTURE)
+        assertTrue(delete is ServiceResult.Error)
+        assertEquals(409, (delete as ServiceResult.Error).code)
+
+        assertEquals(0, mockClient.updateEventCalled, "no write for a non-occurrence")
+        assertEquals(0, mockClient.createEventCalled)
+        assertEquals(0, mockClient.deleteEventCalled)
+    }
+
+    @Test
+    fun `series-level fields with this_and_future scope are rejected without writing`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250117T090000Z")
+
+        val result = service.updateEvent(handle, rrule = "FREQ=WEEKLY", scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Error)
+        assertEquals(400, (result as ServiceResult.Error).code)
+        assertEquals(0, mockClient.updateEventCalled)
+        assertEquals(0, mockClient.createEventCalled)
+    }
+
+    @Test
+    fun `this_and_future edit that fails to truncate after creating the new series reports the duplicate`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250117T090000Z")
+        // The new series is created, but every master PUT fails (not a 412, so no retry salvages it).
+        mockClient.updateEventResult = CalDavResult.Error(507, "Insufficient storage")
+
+        val result = service.updateEvent(handle, summary = "Renamed onward", scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Error, "a failed truncation after a create is surfaced")
+        val error = result as ServiceResult.Error
+        assertEquals(507, error.code)
+        assertTrue(error.message.contains("duplicate"), "the message names the recoverable duplicate: ${error.message}")
+        // The continuing series WAS created (create-first ordering keeps the original series intact
+        // on a create failure; here the create succeeded and only the truncation failed).
+        assertEquals(1, mockClient.createEventCalled, "continuing series created before truncating")
+    }
+
+    @Test
+    fun `a 412 on a this_and_future master PUT recomputes the truncation and retries once`() {
+        val event = registerDailySeries()
+        val handle = EventHandle.encode(event.href, event.etag, "20250117T090000Z")
+        mockClient.fail412UpdatesRemaining = 1 // first master PUT trips 412, retry succeeds
+
+        val result = service.updateEvent(handle, summary = "Renamed onward", scope = EventScope.THIS_AND_FUTURE)
+
+        assertTrue(result is ServiceResult.Success)
+        assertEquals(2, mockClient.updateEventCalled, "one failed PUT + one retried PUT")
+        // The continuing series is created once, up front; the 412 retry only re-PUTs the master.
+        assertEquals(1, mockClient.createEventCalled, "continuing series created once, not per retry")
+        val masterIcs = mockClient.lastUpdatedIcs!!
+        assertTrue(masterIcs.contains("UNTIL=20250116T090000Z"), "truncation re-applied on retry:\n$masterIcs")
     }
 }

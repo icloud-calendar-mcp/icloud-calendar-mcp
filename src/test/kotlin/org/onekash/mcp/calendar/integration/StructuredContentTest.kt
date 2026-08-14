@@ -2,6 +2,7 @@ package org.onekash.mcp.calendar.integration
 
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.slot
 import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
@@ -169,6 +170,29 @@ class StructuredContentTest {
         assertMatchesOutputSchema("create_event", result)
         assertMirrorsTextContent("create_event", result)
         assertEquals(eventId, result.structuredContent!!["uid"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `create_event accepts summary as an alias for title`() {
+        // get_events and the create response echo the field back as `summary`, so a
+        // caller that round-trips a result must be able to recreate with `summary`.
+        val titleSlot = slot<String>()
+        every {
+            service.createEvent(
+                any(), capture(titleSlot), any(), any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any(), any(), any()
+            )
+        } returns ServiceResult.Success(sampleEvent)
+
+        val result = callTool("create_event", buildJsonObject {
+            put("calendar_id", calendarId)
+            put("summary", "Aliased Title")
+            put("start_time", "2026-01-15T09:00:00")
+            put("end_time", "2026-01-15T10:00:00")
+        })
+
+        assertEquals(null, result.isError, "summary-only create should succeed, got: ${result.content}")
+        assertEquals("Aliased Title", titleSlot.captured, "summary should flow through as the event title")
     }
 
     @Test

@@ -199,4 +199,92 @@ class EventHandleTest {
         assertNull(EventHandle.decode(""))
         assertNull(EventHandle.decode("   "))
     }
+
+    // ── Occurrence references (evt2_ handles carrying a RECURRENCE-ID) ─────────
+
+    @Test
+    fun `round-trips an occurrence handle with a recurrence id`() {
+        val handle = EventHandle.encode("/cal/series.ics", "\"etag-1\"", "20260818T140000Z")
+        assertTrue(handle.startsWith(EventHandle.PREFIX_V2), "occurrence handle uses the evt2_ prefix")
+        val decoded = EventHandle.decode(handle)
+        assertEquals("/cal/series.ics", decoded?.href)
+        assertEquals("\"etag-1\"", decoded?.etag)
+        assertEquals("20260818T140000Z", decoded?.recurrenceId)
+        assertTrue(decoded?.isOccurrenceRef() == true)
+    }
+
+    @Test
+    fun `round-trips an occurrence handle with an all-day DATE recurrence id`() {
+        val decoded = EventHandle.decode(EventHandle.encode("/cal/series.ics", "\"e\"", "20260818"))
+        assertEquals("20260818", decoded?.recurrenceId)
+        assertTrue(decoded?.isOccurrenceRef() == true)
+    }
+
+    @Test
+    fun `round-trips an occurrence handle with a null etag`() {
+        val decoded = EventHandle.decode(EventHandle.encode("/cal/series.ics", null, "20260818T140000Z"))
+        assertEquals("/cal/series.ics", decoded?.href)
+        assertNull(decoded?.etag)
+        assertEquals("20260818T140000Z", decoded?.recurrenceId)
+    }
+
+    @Test
+    fun `encode with a null recurrence id produces a master evt1_ handle`() {
+        // The 3-arg encode with a null recurrenceId must be byte-identical to the
+        // 2-arg (master) form, so a non-occurrence caller keeps today's handle.
+        val v1 = EventHandle.encode("/cal/x.ics", "\"e\"")
+        val v1ViaThreeArg = EventHandle.encode("/cal/x.ics", "\"e\"", null)
+        assertEquals(v1, v1ViaThreeArg)
+        assertTrue(v1ViaThreeArg.startsWith(EventHandle.PREFIX))
+    }
+
+    @Test
+    fun `decoding a legacy evt1_ handle yields a null recurrence id (master reference)`() {
+        val decoded = EventHandle.decode(EventHandle.encode("/cal/x.ics", "\"e\""))
+        assertNull(decoded?.recurrenceId, "an evt1_ handle is a master reference, not an occurrence")
+        assertFalse(decoded?.isOccurrenceRef() == true)
+    }
+
+    @Test
+    fun `occurrence handle body uses only url-safe base64 alphabet`() {
+        val handle = EventHandle.encode("https://p180-caldav.icloud.com/x/y z.ics", "\"e/+=\"", "20260818T140000Z")
+        val body = handle.removePrefix(EventHandle.PREFIX_V2)
+        assertTrue(body.all { it.isLetterOrDigit() || it == '-' || it == '_' },
+            "occurrence handle body must be url-safe base64 (no +,/,= or spaces): $body")
+    }
+
+    @Test
+    fun `looksLikeHandle recognizes occurrence handles`() {
+        assertTrue(EventHandle.looksLikeHandle(EventHandle.encode("/x.ics", null, "20260818T140000Z")))
+    }
+
+    @Test
+    fun `occurrence handle preserves the SSRF guard`() {
+        // A forged evt2_ pointing off-host must be rejected exactly like an evt1_.
+        val forged = EventHandle.PREFIX_V2 + java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("https://evil.com/steal.ics\n\"e\"\n20260818T140000Z".toByteArray(Charsets.UTF_8))
+        assertNull(EventHandle.decode(forged))
+    }
+
+    @Test
+    fun `occurrence handle is host-normalized across partitions`() {
+        val a = EventHandle.encode("https://p1-caldav.icloud.com/9/e.ics", "\"e\"", "20260818T140000Z")
+        val b = EventHandle.encode("https://p77-caldav.icloud.com/9/e.ics", "\"e\"", "20260818T140000Z")
+        assertEquals(a, b, "occurrence handles minted via different partitions must be identical")
+    }
+
+    @Test
+    fun `decode returns null for an evt2_ handle missing the recurrence id segment`() {
+        // Only two segments (href, etag) under the evt2_ prefix is malformed.
+        val malformed = EventHandle.PREFIX_V2 + java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("/cal/x.ics\n\"e\"".toByteArray(Charsets.UTF_8))
+        assertNull(EventHandle.decode(malformed))
+    }
+
+    @Test
+    fun `decode returns null for an evt2_ handle with a blank recurrence id`() {
+        val blankRecid = EventHandle.PREFIX_V2 + java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("/cal/x.ics\n\"e\"\n".toByteArray(Charsets.UTF_8))
+        assertNull(EventHandle.decode(blankRecid))
+    }
 }

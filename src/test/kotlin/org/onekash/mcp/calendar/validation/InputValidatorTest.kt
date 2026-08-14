@@ -390,4 +390,94 @@ class InputValidatorTest {
         )
         assertEquals(3, errors.size)
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SCOPE VALIDATION TESTS (single-occurrence edits)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `validateScope should accept each allowed scope value`() {
+        for (token in listOf("this_occurrence", "this_and_future", "all_events")) {
+            assertTrue(InputValidator.validateScope(token) is ValidationResult.Valid, "expected $token to be valid")
+        }
+    }
+
+    @Test
+    fun `validateScope should treat null and blank as valid (omitted, optional)`() {
+        assertTrue(InputValidator.validateScope(null) is ValidationResult.Valid)
+        assertTrue(InputValidator.validateScope("") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateScope("   ") is ValidationResult.Valid)
+    }
+
+    @Test
+    fun `validateScope should reject a value outside the allowed set`() {
+        val result = InputValidator.validateScope("everything")
+        assertTrue(result is ValidationResult.Invalid)
+    }
+
+    @Test
+    fun `validateScope invalid message names exactly the three allowed scopes`() {
+        val result = InputValidator.validateScope("nope") as ValidationResult.Invalid
+        assertTrue(result.message.contains("this_occurrence"), result.message)
+        assertTrue(result.message.contains("this_and_future"), result.message)
+        assertTrue(result.message.contains("all_events"), result.message)
+    }
+
+    @Test
+    fun `EventScope tokens map round-trip through fromToken`() {
+        assertEquals(EventScope.THIS_OCCURRENCE, EventScope.fromToken("this_occurrence"))
+        assertEquals(EventScope.THIS_AND_FUTURE, EventScope.fromToken("this_and_future"))
+        assertEquals(EventScope.ALL_EVENTS, EventScope.fromToken("all_events"))
+        assertEquals(null, EventScope.fromToken("bogus"))
+        assertEquals(null, EventScope.fromToken(null))
+    }
+
+    @Test
+    fun `validateOccurrenceScopeFields rejects a series rrule under this_occurrence`() {
+        val result = InputValidator.validateOccurrenceScopeFields(
+            scope = "this_occurrence",
+            rrule = "FREQ=WEEKLY",
+            rdates = null,
+            exdates = null
+        )
+        assertTrue(result is ValidationResult.Invalid)
+        assertTrue(result.message.contains("rrule"), result.message)
+    }
+
+    @Test
+    fun `validateOccurrenceScopeFields rejects rdates or exdates under this_and_future`() {
+        assertTrue(
+            InputValidator.validateOccurrenceScopeFields("this_and_future", null, listOf("2026-08-18"), null)
+                is ValidationResult.Invalid
+        )
+        assertTrue(
+            InputValidator.validateOccurrenceScopeFields("this_and_future", null, null, listOf("2026-08-18"))
+                is ValidationResult.Invalid
+        )
+    }
+
+    @Test
+    fun `validateOccurrenceScopeFields allows series fields under all_events`() {
+        assertTrue(
+            InputValidator.validateOccurrenceScopeFields("all_events", "FREQ=WEEKLY", listOf("2026-08-18"), null)
+                is ValidationResult.Valid
+        )
+    }
+
+    @Test
+    fun `validateOccurrenceScopeFields allows an occurrence scope with no series fields`() {
+        assertTrue(
+            InputValidator.validateOccurrenceScopeFields("this_occurrence", null, null, null)
+                is ValidationResult.Valid
+        )
+    }
+
+    @Test
+    fun `validateOccurrenceScopeFields is a no-op when scope is omitted`() {
+        // Omitted scope keeps whole-event behavior; series fields are not this check's concern.
+        assertTrue(
+            InputValidator.validateOccurrenceScopeFields(null, "FREQ=WEEKLY", null, null)
+                is ValidationResult.Valid
+        )
+    }
 }

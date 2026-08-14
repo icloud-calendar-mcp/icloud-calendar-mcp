@@ -236,6 +236,126 @@ class IcsParserOccurrenceTest {
         assertTrue(parser.parseOccurrences("not an ics at all", start, end).isEmpty())
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // OCCURRENCE IDENTITY (recurrenceId + retained rrule)
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `a timed occurrence carries its own RECURRENCE-ID and retains the series rrule`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:weekly-timed@example.com
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            RRULE:FREQ=WEEKLY;BYDAY=MO
+            SUMMARY:Weekly sync
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-02-02") // a later Monday
+        val e = parser.parseOccurrences(ics, start, end).single()
+
+        assertEquals("20260202T090000Z", e.recurrenceId, "recurrence identifier is the occurrence instant in iCal form")
+        assertNotNull(e.rrule, "an occurrence of a series retains the rrule so it is distinguishable from standalone")
+        assertTrue(e.rrule!!.contains("FREQ=WEEKLY"), e.rrule!!)
+    }
+
+    @Test
+    fun `an all-day occurrence carries a DATE-form RECURRENCE-ID`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:yearly-allday@example.com
+            DTSTART;VALUE=DATE:20230517
+            DTEND;VALUE=DATE:20230518
+            RRULE:FREQ=YEARLY
+            SUMMARY:Recurring yearly event
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-05-17")
+        val e = parser.parseOccurrences(ics, start, end).single()
+
+        assertEquals("20260517", e.recurrenceId, "all-day occurrence uses the DATE value form")
+        assertNotNull(e.rrule)
+    }
+
+    @Test
+    fun `a standalone non-recurring event carries no recurrenceId`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:single@example.com
+            DTSTART;VALUE=DATE:20260725
+            DTEND;VALUE=DATE:20260727
+            SUMMARY:Two-day all-day event
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-07-25")
+        val e = parser.parseOccurrences(ics, start, end).single()
+
+        assertNull(e.recurrenceId, "a standalone event is not a series instance")
+        assertNull(e.rrule)
+    }
+
+    @Test
+    fun `two occurrences of the same series carry distinct recurrenceIds`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:daily@example.com
+            DTSTART;VALUE=DATE:20260101
+            DTEND;VALUE=DATE:20260102
+            RRULE:FREQ=DAILY
+            SUMMARY:Daily standup
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val start = LocalDate.parse("2026-03-01").atStartOfDay(ZoneOffset.UTC).toInstant()
+        val end = LocalDate.parse("2026-03-03").atTime(LocalTime.of(23, 59, 59)).toInstant(ZoneOffset.UTC)
+
+        val recids = parser.parseOccurrences(ics, start, end).map { it.recurrenceId!! }
+        assertEquals(listOf("20260301", "20260302", "20260303"), recids.sorted())
+        assertEquals(recids.size, recids.toSet().size, "recurrenceIds must be distinct per occurrence")
+    }
+
+    @Test
+    fun `an edited occurrence carries the original RECURRENCE-ID, not its moved start`() {
+        // The override moves 2026-01-07 from 09:00 to 15:00; its identity stays the
+        // original 09:00 instant (RFC 5545 §3.8.4.4), while its start reflects 15:00.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:series@example.com
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Daily
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:series@example.com
+            RECURRENCE-ID:20260107T090000Z
+            DTSTART:20260107T150000Z
+            DTEND:20260107T160000Z
+            SUMMARY:Moved to the afternoon
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-01-07")
+        val e = parser.parseOccurrences(ics, start, end).single()
+
+        assertEquals("Moved to the afternoon", e.summary)
+        assertEquals("20260107T090000Z", e.recurrenceId, "identity stays the original instant")
+        assertTrue(e.startTime!!.startsWith("2026-01-07T15:00"), "start reflects the moved time: ${e.startTime}")
+    }
+
     @Test
     fun `orphaned override without its master is still mapped`() {
         // A response holding only a modified instance has no series to expand,

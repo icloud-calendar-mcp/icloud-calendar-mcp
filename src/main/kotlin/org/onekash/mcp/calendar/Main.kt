@@ -20,6 +20,7 @@ import org.onekash.mcp.calendar.ratelimit.RateLimiter
 import org.onekash.mcp.calendar.service.CalendarService
 import org.onekash.mcp.calendar.service.ServiceResult
 import org.onekash.mcp.calendar.logging.McpLogger
+import org.onekash.mcp.calendar.validation.EventScope
 import org.onekash.mcp.calendar.validation.InputValidator
 import org.onekash.mcp.calendar.validation.InputValidator.ValidationResult
 
@@ -370,6 +371,11 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                                         event.endTime?.let { put("endTime", it) }
                                     }
                                     event.rrule?.let { put("rrule", it) }
+                                    // RECURRENCE-ID of this instance (RFC 5545 §3.8.4.4),
+                                    // present only for one occurrence of a series. Marks the
+                                    // event as a series instance and identifies which one; the
+                                    // handle already encodes it for scoped update/delete.
+                                    event.recurrenceId?.let { put("recurrenceId", it) }
                                     event.status?.let { put("status", it) }
                                     event.url?.let { put("url", it) }
                                     if (event.categories.isNotEmpty()) {
@@ -415,13 +421,17 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     put("type", JsonPrimitive("string"))
                     put("description", JsonPrimitive("Event title"))
                 })
+                put("summary", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("description", JsonPrimitive("Alias for 'title' (the field get_events and the create response echo back). Used only when 'title' is omitted."))
+                })
                 put("start_time", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Start time (ISO 8601, e.g., 2025-01-15T09:00:00Z)"))
+                    put("description", JsonPrimitive("Start time (ISO 8601 local, no zone suffix, e.g., 2025-01-15T09:00:00). Interpreted as UTC unless 'timezone' is set."))
                 })
                 put("end_time", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("End time (ISO 8601, e.g., 2025-01-15T10:00:00Z)"))
+                    put("description", JsonPrimitive("End time (ISO 8601 local, no zone suffix, e.g., 2025-01-15T10:00:00). Interpreted as UTC unless 'timezone' is set."))
                 })
                 put("location", buildJsonObject {
                     put("type", JsonPrimitive("string"))
@@ -507,7 +517,11 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
 
             val args = request.arguments ?: buildJsonObject { }
             val calendarId = args["calendar_id"]?.jsonPrimitive?.content
+            // Accept `summary` as an alias for `title` on input: get_events and the
+            // create response echo the field back as `summary`, so a caller that
+            // round-trips a result would otherwise hit "title is required".
             val title = args["title"]?.jsonPrimitive?.content
+                ?: args["summary"]?.jsonPrimitive?.content
             val startTime = args["start_time"]?.jsonPrimitive?.content
             val endTime = args["end_time"]?.jsonPrimitive?.content
             val location = args["location"]?.jsonPrimitive?.content
@@ -636,7 +650,10 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "update_event",
-        description = "Update an existing calendar event. First use get_events (or create_event) to obtain the event's handle.",
+        description = "Update an existing calendar event. First use get_events (or create_event) to obtain the event's handle. " +
+            "For a recurring series, get_events returns one handle per occurrence (each carries a recurrenceId); use scope to say " +
+            "whether an edit changes just that occurrence or the whole series. If the handle is one occurrence of a series you must " +
+            "set scope, otherwise the edit is rejected rather than silently changing every occurrence.",
         title = "Update Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
@@ -703,6 +720,15 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     put("description", JsonPrimitive("Replace VALARM components (RFC 5545 §3.6.6). Pass null/omit to preserve existing alarms; pass empty array to clear all; pass a list of alarm objects to replace. Each entry has: trigger (required), action (DISPLAY|AUDIO|EMAIL, default DISPLAY), description, summary (EMAIL only), repeat_count, repeat_duration."))
                     put("items", alarmItemSchema())
                 })
+                put("scope", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("enum", buildJsonArray { EventScope.TOKENS.forEach { add(JsonPrimitive(it)) } })
+                    put("description", JsonPrimitive("For a recurring series: which occurrences the edit affects. " +
+                        "`this_occurrence` edits only the instance the handle points at (leaving siblings unchanged); " +
+                        "`this_and_future` edits that instance and every later one (earlier ones unchanged); " +
+                        "`all_events` edits the whole series. Required when the handle is one occurrence of a series; " +
+                        "omit for standalone events. rrule/rdates/exdates cannot be combined with an occurrence scope."))
+                })
             },
             required = listOf("event_id")
         ),
@@ -712,7 +738,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 put("uid", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("handle", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Refreshed opaque reference (carries the new etag) for a subsequent update_event/delete_event."))
+                    put("description", JsonPrimitive("Refreshed opaque reference (carries the new etag) for a subsequent update_event/delete_event. For a this_occurrence edit this is an occurrence handle for the edited instance."))
                 })
                 put("message", buildJsonObject { put("type", JsonPrimitive("string")) })
                 put("alarms", buildJsonObject {
@@ -752,6 +778,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
             val rrule = args["rrule"]?.jsonPrimitive?.content
             val rdates = args["rdates"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
             val exdates = args["exdates"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            val scope = args["scope"]?.jsonPrimitive?.content
             val alarmsDecoded = decodeAlarmsForValidation(args)
 
             // Validate event ID (required)
@@ -798,7 +825,11 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 InputValidator.validateTimezone(endTimezone, "end_timezone"),
                 InputValidator.validateRecurrenceDateList(rdates, "rdates"),
                 InputValidator.validateRecurrenceDateList(exdates, "exdates"),
-                InputValidator.validateAlarmList(alarmsDecoded, "alarms")
+                InputValidator.validateAlarmList(alarmsDecoded, "alarms"),
+                InputValidator.validateScope(scope, "scope"),
+                // Defense at the MCP layer, mirroring the service-layer check: an
+                // occurrence scope must not carry series-level fields.
+                InputValidator.validateOccurrenceScopeFields(scope, rrule, rdates, exdates, "scope")
             ))
 
             if (errors.isNotEmpty()) {
@@ -832,7 +863,8 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 endTimezone = endTimezone,
                 rdates = rdates,
                 exdates = exdates,
-                alarms = toAlarmSpecs(alarmsDecoded)
+                alarms = toAlarmSpecs(alarmsDecoded),
+                scope = EventScope.fromToken(scope)
             )
 
             when (result) {
@@ -876,13 +908,25 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "delete_event",
-        description = "Delete a calendar event. First use get_events (or create_event) to obtain the event's handle.",
+        description = "Delete a calendar event. First use get_events (or create_event) to obtain the event's handle. " +
+            "For a recurring series, use scope to say whether the delete removes just one occurrence or the whole series. " +
+            "If the handle is one occurrence of a series you must set scope, otherwise the delete is rejected rather than " +
+            "silently cancelling every occurrence.",
         title = "Delete Event",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
                 put("event_id", buildJsonObject {
                     put("type", JsonPrimitive("string"))
                     put("description", JsonPrimitive("Event reference to delete. Prefer the opaque `handle` from get_events/create_event (works even from a fresh process); a bare event UID is also accepted for recently-fetched events."))
+                })
+                put("scope", buildJsonObject {
+                    put("type", JsonPrimitive("string"))
+                    put("enum", buildJsonArray { EventScope.TOKENS.forEach { add(JsonPrimitive(it)) } })
+                    put("description", JsonPrimitive("For a recurring series: which occurrences the delete removes. " +
+                        "`this_occurrence` cancels only the instance the handle points at (an EXDATE; siblings remain); " +
+                        "`this_and_future` cancels that instance and every later one (earlier ones remain); " +
+                        "`all_events` deletes the whole series. Required when the handle is one occurrence of a series; " +
+                        "omit for standalone events."))
                 })
             },
             required = listOf("event_id")
@@ -910,11 +954,15 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
 
             val args = request.arguments ?: buildJsonObject { }
             val eventId = args["event_id"]?.jsonPrimitive?.content
+            val scope = args["scope"]?.jsonPrimitive?.content
 
-            // Validate event ID
-            val eventIdResult = InputValidator.validateCalendarId(eventId, "event_id")
-            if (eventIdResult is ValidationResult.Invalid) {
-                return@safeExecute SecureErrorHandler.validationError(listOf(eventIdResult.message))
+            // Validate event ID + scope
+            val deleteErrors = InputValidator.collectErrors(
+                InputValidator.validateCalendarId(eventId, "event_id"),
+                InputValidator.validateScope(scope, "scope")
+            )
+            if (deleteErrors.isNotEmpty()) {
+                return@safeExecute SecureErrorHandler.validationError(deleteErrors)
             }
 
             // Check service
@@ -924,7 +972,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 )
             }
 
-            when (val result = calendarService.deleteEvent(eventId!!)) {
+            when (val result = calendarService.deleteEvent(eventId!!, EventScope.fromToken(scope))) {
                 is ServiceResult.Success -> {
                     logger.info("Event deleted", mapOf(
                         "tool" to "delete_event",

@@ -717,7 +717,7 @@ class IcsPatcherTest {
         assertEquals("2025-12-25T10:00:00Z", event.startTime)
         assertEquals("2025-12-25T11:00:00Z", event.endTime)
         assertNotNull(event.rrule)
-        assertTrue(event.rrule!!.contains("FREQ=WEEKLY"))
+        assertTrue(event.rrule.contains("FREQ=WEEKLY"))
         assertEquals("CONFIRMED", event.status)
         assertEquals(3, event.priority)
         assertTrue(event.categories.contains("MEETING"))
@@ -1173,5 +1173,421 @@ class IcsPatcherTest {
             alarms = emptyList()
         )
         assertFalse(patched.contains("BEGIN:VALARM"), "Empty list clears all:\n$patched")
+    }
+
+    // ========== Single-occurrence: patchOccurrence / exdateOccurrence ==========
+
+    private fun veventCount(ics: String) = ics.split("BEGIN:VEVENT").size - 1
+
+    private val weeklyTimedSeries = """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//Test//Test//EN
+        BEGIN:VEVENT
+        UID:series@test
+        DTSTAMP:20260101T000000Z
+        DTSTART:20260105T090000Z
+        DTEND:20260105T100000Z
+        RRULE:FREQ=WEEKLY;BYDAY=MO
+        SUMMARY:Weekly sync
+        END:VEVENT
+        END:VCALENDAR
+    """.trimIndent()
+
+    @Test
+    fun `patchOccurrence adds an exception VEVENT with the RECURRENCE-ID and patched summary`() {
+        val patched = patcher.patchOccurrence(
+            existingIcs = weeklyTimedSeries,
+            recurrenceId = "20260202T090000Z",
+            summary = "Moved sync"
+        )
+        assertEquals(2, veventCount(patched), "master + exception:\n$patched")
+        assertTrue(patched.contains("RECURRENCE-ID:20260202T090000Z"), "exception carries the RECURRENCE-ID:\n$patched")
+        assertTrue(patched.contains("SUMMARY:Moved sync"))
+        // Master untouched: its DTSTART and RRULE survive, and RRULE appears once (only on the master).
+        assertTrue(patched.contains("DTSTART:20260105T090000Z"), "master DTSTART unchanged")
+        assertTrue(patched.contains("RRULE:FREQ=WEEKLY;BYDAY=MO"), "master RRULE unchanged")
+        assertEquals(1, patched.split("RRULE:").size - 1, "only the master carries an RRULE")
+    }
+
+    @Test
+    fun `patchOccurrence with only a summary keeps the exception DTSTART at the occurrence instant`() {
+        val patched = patcher.patchOccurrence(
+            existingIcs = weeklyTimedSeries,
+            recurrenceId = "20260202T090000Z",
+            summary = "Renamed"
+        )
+        // The exception's DTSTART is the occurrence's own start, NOT the master's 2026-01-05.
+        assertTrue(patched.contains("DTSTART:20260202T090000Z"), "exception DTSTART = occurrence instant:\n$patched")
+    }
+
+    @Test
+    fun `patchOccurrence moving the time updates the exception DTSTART but not its identity`() {
+        val patched = patcher.patchOccurrence(
+            existingIcs = weeklyTimedSeries,
+            recurrenceId = "20260202T090000Z",
+            startTime = "2026-02-02T15:00:00Z",
+            endTime = "2026-02-02T16:00:00Z"
+        )
+        assertTrue(patched.contains("RECURRENCE-ID:20260202T090000Z"), "identity stays the original instant")
+        assertTrue(patched.contains("DTSTART:20260202T150000Z"), "start moves to 15:00:\n$patched")
+    }
+
+    @Test
+    fun `patchOccurrence updates an existing exception in place without duplicating it`() {
+        val withException = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:series@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            RRULE:FREQ=WEEKLY;BYDAY=MO
+            SUMMARY:Weekly sync
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:series@test
+            DTSTAMP:20260101T000000Z
+            RECURRENCE-ID:20260202T090000Z
+            DTSTART:20260202T093000Z
+            DTEND:20260202T103000Z
+            SUMMARY:Old override
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val patched = patcher.patchOccurrence(
+            existingIcs = withException,
+            recurrenceId = "20260202T090000Z",
+            summary = "New override"
+        )
+        assertEquals(2, veventCount(patched), "still master + one exception (no duplicate):\n$patched")
+        assertTrue(patched.contains("SUMMARY:New override"))
+        assertFalse(patched.contains("SUMMARY:Old override"))
+    }
+
+    @Test
+    fun `exdateOccurrence adds an EXDATE on the master and leaves the series intact`() {
+        val patched = patcher.exdateOccurrence(
+            existingIcs = weeklyTimedSeries,
+            recurrenceId = "20260202T090000Z"
+        )
+        assertEquals(1, veventCount(patched), "only the master remains:\n$patched")
+        assertTrue(patched.contains("EXDATE:20260202T090000Z"), "EXDATE added for the cancelled instant:\n$patched")
+        assertTrue(patched.contains("DTSTART:20260105T090000Z"), "master DTSTART unchanged")
+        assertTrue(patched.contains("RRULE:FREQ=WEEKLY;BYDAY=MO"), "master RRULE unchanged")
+    }
+
+    @Test
+    fun `exdateOccurrence drops a matching exception VEVENT`() {
+        val withException = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:series@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            RRULE:FREQ=WEEKLY;BYDAY=MO
+            SUMMARY:Weekly sync
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:series@test
+            DTSTAMP:20260101T000000Z
+            RECURRENCE-ID:20260202T090000Z
+            DTSTART:20260202T093000Z
+            DTEND:20260202T103000Z
+            SUMMARY:Edited instance
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val patched = patcher.exdateOccurrence(withException, "20260202T090000Z")
+        assertEquals(1, veventCount(patched), "the exception is removed, master remains:\n$patched")
+        assertFalse(patched.contains("SUMMARY:Edited instance"), "the edited instance is gone")
+        assertTrue(patched.contains("EXDATE:20260202T090000Z"))
+    }
+
+    @Test
+    fun `patchOccurrence works for an all-day series with a DATE RECURRENCE-ID`() {
+        val yearlyAllDay = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:allday@test
+            DTSTAMP:20230101T000000Z
+            DTSTART;VALUE=DATE:20230517
+            DTEND;VALUE=DATE:20230518
+            RRULE:FREQ=YEARLY
+            SUMMARY:Anniversary
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val patched = patcher.patchOccurrence(yearlyAllDay, "20260517", summary = "Special anniversary")
+        assertEquals(2, veventCount(patched))
+        assertTrue(patched.contains("RECURRENCE-ID;VALUE=DATE:20260517"), "DATE-form RECURRENCE-ID:\n$patched")
+        assertTrue(patched.contains("DTSTART;VALUE=DATE:20260517"), "exception is the 2026 occurrence day")
+        assertTrue(patched.contains("SUMMARY:Special anniversary"))
+
+        val exdated = patcher.exdateOccurrence(yearlyAllDay, "20260517")
+        assertTrue(exdated.contains("EXDATE;VALUE=DATE:20260517"), "DATE-form EXDATE:\n$exdated")
+    }
+
+    @Test
+    fun `patchOccurrence rejects a non-recurring event`() {
+        val standalone = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:single@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            SUMMARY:One-off
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        assertFailsWith<IcsPatcher.NotARecurringSeriesException> {
+            patcher.patchOccurrence(standalone, "20260105T090000Z", summary = "nope")
+        }
+        assertFailsWith<IcsPatcher.NotARecurringSeriesException> {
+            patcher.exdateOccurrence(standalone, "20260105T090000Z")
+        }
+    }
+
+    // ========== this-and-future: truncateSeries / splitSeries ==========
+
+    private val dailyCountSeries = """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//Test//Test//EN
+        BEGIN:VEVENT
+        UID:series@test
+        DTSTAMP:20260101T000000Z
+        DTSTART:20260105T090000Z
+        DTEND:20260105T100000Z
+        RRULE:FREQ=DAILY;COUNT=5
+        SUMMARY:Daily standup
+        END:VEVENT
+        END:VCALENDAR
+    """.trimIndent()
+
+    @Test
+    fun `truncateSeries caps the master RRULE with UNTIL at the last kept occurrence`() {
+        // Weekly Mondays from 2026-01-05. Truncate at the 3rd (2026-01-19): keep 01-05 and 01-12.
+        val truncated = patcher.truncateSeries(weeklyTimedSeries, "20260119T090000Z")
+        assertEquals(1, veventCount(truncated), "only the master remains:\n$truncated")
+        assertTrue(truncated.contains("DTSTART:20260105T090000Z"), "master DTSTART unchanged")
+        assertTrue(truncated.contains("FREQ=WEEKLY"), "RRULE frequency preserved:\n$truncated")
+        assertTrue(truncated.contains("BYDAY=MO"), "RRULE byday preserved")
+        assertTrue(truncated.contains("UNTIL=20260112T090000Z"), "UNTIL = last kept occurrence (2nd Monday):\n$truncated")
+    }
+
+    @Test
+    fun `truncateSeries drops exception VEVENTs at or after the cut`() {
+        val withException = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:series@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            RRULE:FREQ=WEEKLY;BYDAY=MO
+            SUMMARY:Weekly sync
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:series@test
+            DTSTAMP:20260101T000000Z
+            RECURRENCE-ID:20260126T090000Z
+            DTSTART:20260126T093000Z
+            DTEND:20260126T103000Z
+            SUMMARY:Future override
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val truncated = patcher.truncateSeries(withException, "20260119T090000Z")
+        assertEquals(1, veventCount(truncated), "the future override is dropped with the cut tail:\n$truncated")
+        assertFalse(truncated.contains("SUMMARY:Future override"), "override past the cut is gone")
+    }
+
+    @Test
+    fun `truncateSeries emits a DATE-form UNTIL for an all-day series`() {
+        val yearlyAllDay = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:allday@test
+            DTSTAMP:20230101T000000Z
+            DTSTART;VALUE=DATE:20230517
+            DTEND;VALUE=DATE:20230518
+            RRULE:FREQ=YEARLY
+            SUMMARY:Anniversary
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val truncated = patcher.truncateSeries(yearlyAllDay, "20260517")
+        assertTrue(truncated.contains("UNTIL=20250517"), "DATE-form UNTIL at the last kept year:\n$truncated")
+        assertFalse(truncated.contains("UNTIL=20250517T"), "UNTIL is a bare DATE, not a DATE-TIME")
+    }
+
+    @Test
+    fun `truncateSeries at the first occurrence throws FirstOccurrenceException`() {
+        assertFailsWith<IcsPatcher.FirstOccurrenceException> {
+            patcher.truncateSeries(weeklyTimedSeries, "20260105T090000Z")
+        }
+    }
+
+    @Test
+    fun `truncateSeries rejects a non-recurring event`() {
+        val standalone = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:single@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            SUMMARY:One-off
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+        assertFailsWith<IcsPatcher.NotARecurringSeriesException> {
+            patcher.truncateSeries(standalone, "20260105T090000Z")
+        }
+    }
+
+    @Test
+    fun `splitSeries truncates the master and returns a fresh series from the occurrence`() {
+        val split = patcher.splitSeries(
+            existingIcs = weeklyTimedSeries,
+            recurrenceId = "20260119T090000Z",
+            summary = "Renamed from here"
+        )
+
+        // Master side: capped, original UID and summary intact.
+        assertEquals(1, veventCount(split.truncatedMaster), "master side is one VEVENT:\n${split.truncatedMaster}")
+        assertTrue(split.truncatedMaster.contains("UID:series@test"), "master keeps its UID")
+        assertTrue(split.truncatedMaster.contains("SUMMARY:Weekly sync"), "master summary untouched")
+        assertTrue(split.truncatedMaster.contains("UNTIL=20260112T090000Z"), "master is capped:\n${split.truncatedMaster}")
+
+        // New series side: fresh UID, patched summary, starts at the occurrence, no exception marker.
+        assertEquals(1, veventCount(split.newSeries), "new series is one VEVENT:\n${split.newSeries}")
+        assertFalse(split.newSeries.contains("UID:series@test"), "new series gets a fresh UID:\n${split.newSeries}")
+        assertTrue(split.newSeries.contains("UID:"), "new series has a UID")
+        assertTrue(split.newSeries.contains("SUMMARY:Renamed from here"), "patch applied to the new series")
+        assertTrue(split.newSeries.contains("DTSTART:20260119T090000Z"), "new series starts at the occurrence:\n${split.newSeries}")
+        assertTrue(split.newSeries.contains("FREQ=WEEKLY"), "new series carries the recurrence rule")
+        assertFalse(split.newSeries.contains("RECURRENCE-ID"), "new series is a master, not an exception")
+        assertFalse(split.newSeries.contains("UNTIL="), "an open-ended series stays open-ended:\n${split.newSeries}")
+    }
+
+    @Test
+    fun `splitSeries reduces COUNT on the new series and caps the master`() {
+        // Daily COUNT=5 from 2026-01-05; split at day 3 (2026-01-07): master keeps 2, new series gets 3.
+        val split = patcher.splitSeries(
+            existingIcs = dailyCountSeries,
+            recurrenceId = "20260107T090000Z",
+            summary = "Reworked standup"
+        )
+        assertTrue(split.truncatedMaster.contains("UNTIL=20260106T090000Z"), "master capped at day 2:\n${split.truncatedMaster}")
+        assertFalse(split.truncatedMaster.contains("COUNT="), "COUNT converted to UNTIL on the master")
+        assertTrue(split.newSeries.contains("COUNT=3"), "new series keeps the remaining 3 occurrences:\n${split.newSeries}")
+        assertTrue(split.newSeries.contains("DTSTART:20260107T090000Z"), "new series starts at the split point")
+    }
+
+    @Test
+    fun `splitSeries moves the occurrence time when the patch changes it`() {
+        val split = patcher.splitSeries(
+            existingIcs = weeklyTimedSeries,
+            recurrenceId = "20260119T090000Z",
+            startTime = "2026-01-19T14:00:00Z",
+            endTime = "2026-01-19T15:00:00Z"
+        )
+        assertTrue(split.newSeries.contains("DTSTART:20260119T140000Z"), "new series start moved to 14:00:\n${split.newSeries}")
+    }
+
+    @Test
+    fun `splitSeries at the first occurrence throws FirstOccurrenceException`() {
+        assertFailsWith<IcsPatcher.FirstOccurrenceException> {
+            patcher.splitSeries(weeklyTimedSeries, "20260105T090000Z", summary = "whole series really")
+        }
+    }
+
+    /** Weekly series with a modified instance (moved + relocated) at 2026-02-02, well after 01-19. */
+    private val weeklySeriesWithLaterException = """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//Test//Test//EN
+        BEGIN:VEVENT
+        UID:series@test
+        DTSTAMP:20260101T000000Z
+        DTSTART:20260105T090000Z
+        DTEND:20260105T100000Z
+        RRULE:FREQ=WEEKLY;BYDAY=MO
+        SUMMARY:Weekly sync
+        END:VEVENT
+        BEGIN:VEVENT
+        UID:series@test
+        DTSTAMP:20260101T000000Z
+        RECURRENCE-ID:20260202T090000Z
+        DTSTART:20260202T093000Z
+        DTEND:20260202T103000Z
+        SUMMARY:Weekly sync (moved)
+        LOCATION:Room 5
+        END:VEVENT
+        END:VCALENDAR
+    """.trimIndent()
+
+    @Test
+    fun `splitSeries carries a modified instance after the cut onto the new series`() {
+        // Cut at 01-19; the 02-02 exception falls after it, so it must move to the new series
+        // (re-based to the fresh UID, keeping its RECURRENCE-ID and customization), not vanish.
+        val split = patcher.splitSeries(
+            existingIcs = weeklySeriesWithLaterException,
+            recurrenceId = "20260119T090000Z",
+            summary = "Renamed from here"
+        )
+
+        // The exception is gone from the truncated master (it is past the cut).
+        assertEquals(1, veventCount(split.truncatedMaster), "master side drops the post-cut exception:\n${split.truncatedMaster}")
+
+        // The new series carries the master plus the re-based exception.
+        assertEquals(2, veventCount(split.newSeries), "new series = master + carried exception:\n${split.newSeries}")
+        assertTrue(split.newSeries.contains("RECURRENCE-ID:20260202T090000Z"), "carried exception keeps its RECURRENCE-ID:\n${split.newSeries}")
+        assertTrue(split.newSeries.contains("LOCATION:Room 5"), "carried exception keeps its customization:\n${split.newSeries}")
+        assertFalse(split.newSeries.contains("UID:series@test"), "carried exception re-based off the old UID:\n${split.newSeries}")
+        // Master and the carried exception share ONE fresh UID.
+        val uids = Regex("UID:([^\r\n]+)").findAll(split.newSeries).map { it.groupValues[1] }.toSet()
+        assertEquals(1, uids.size, "the new series and its exception share a single UID: $uids")
+    }
+
+    @Test
+    fun `splitSeries drops the exception exactly at the cut so the patch defines it`() {
+        // Cut AT the 02-02 exception: that instance becomes the new series' first occurrence,
+        // defined by the this-and-future patch, so the old override must not be carried.
+        val split = patcher.splitSeries(
+            existingIcs = weeklySeriesWithLaterException,
+            recurrenceId = "20260202T090000Z",
+            summary = "Renamed from the moved one",
+            location = "Room 9"
+        )
+
+        assertFalse(split.newSeries.contains("RECURRENCE-ID"), "no leftover exception at the cut:\n${split.newSeries}")
+        assertEquals(1, veventCount(split.newSeries), "new series is just the patched master:\n${split.newSeries}")
+        assertTrue(split.newSeries.contains("LOCATION:Room 9"), "the patch, not the old override, defines the instance:\n${split.newSeries}")
+        assertFalse(split.newSeries.contains("Room 5"), "old override location dropped:\n${split.newSeries}")
     }
 }

@@ -28,41 +28,78 @@ import java.util.Base64
  *    input validator rejects.
  *  - Prefix the literal marker [PREFIX] (`evt1_`) so a handle is distinguishable
  *    from a legacy bare UID and is version-tagged for future evolution.
+ *
+ * Occurrence references (`evt2_`): a handle may additionally carry a
+ * [recurrenceId] — the RFC 5545 RECURRENCE-ID (§3.8.4.4) of ONE instance of a
+ * recurring series, in its iCalendar wire form (`20260818T140000Z` for a timed
+ * occurrence, `20260818` for an all-day one). When present, the token uses the
+ * [PREFIX_V2] (`evt2_`) marker and a 3-field payload `href\netag\nrecurrenceId`;
+ * such a handle is an *occurrence* reference (see [isOccurrenceRef]). When absent
+ * the token is byte-identical to the original `evt1_` *master* reference, so
+ * existing callers and persisted handles are unaffected. The RECURRENCE-ID is in
+ * the master's stored value form, so the reference resolves to the same instant
+ * regardless of the host time zone that decodes it.
  */
 data class EventHandle(
     /** Regional-normalized href of the event resource. */
     val href: String,
     /** Last-known etag, or null when the minting fetch had none. */
-    val etag: String?
+    val etag: String?,
+    /**
+     * RECURRENCE-ID of a single occurrence (iCal wire form), or null for a
+     * master/whole-event reference. Non-null marks this an occurrence reference.
+     */
+    val recurrenceId: String? = null
 ) {
-    /** Encode this handle to its opaque `evt1_…` token form. */
+    /** True when this handle targets one occurrence of a series (carries a RECURRENCE-ID). */
+    fun isOccurrenceRef(): Boolean = recurrenceId != null
+
+    /** Encode this handle to its opaque token form (`evt1_…` master, `evt2_…` occurrence). */
     fun encode(): String {
-        val payload = "${ICloudUrlNormalizer.normalize(href)}\n${etag ?: ""}"
-        val b64 = Base64.getUrlEncoder().withoutPadding()
-            .encodeToString(payload.toByteArray(Charsets.UTF_8))
-        return "$PREFIX$b64"
+        val normHref = ICloudUrlNormalizer.normalize(href)
+        val encoder = Base64.getUrlEncoder().withoutPadding()
+        return if (recurrenceId == null) {
+            val payload = "$normHref\n${etag ?: ""}"
+            "$PREFIX${encoder.encodeToString(payload.toByteArray(Charsets.UTF_8))}"
+        } else {
+            val payload = "$normHref\n${etag ?: ""}\n$recurrenceId"
+            "$PREFIX_V2${encoder.encodeToString(payload.toByteArray(Charsets.UTF_8))}"
+        }
     }
 
     companion object {
-        /** Marker + version tag prefixed to every encoded handle. */
+        /** Marker + version tag prefixed to a master/whole-event handle. */
         const val PREFIX = "evt1_"
 
-        /** Encode an (href, etag) pair to an opaque handle token. */
+        /** Marker + version tag prefixed to an occurrence handle (carries a RECURRENCE-ID). */
+        const val PREFIX_V2 = "evt2_"
+
+        /** Encode an (href, etag) pair to a master handle token. */
         fun encode(href: String, etag: String?): String = EventHandle(href, etag).encode()
+
+        /**
+         * Encode an (href, etag, recurrenceId) triple. A null [recurrenceId] yields
+         * a master handle byte-identical to [encode] (href, etag); a non-null one
+         * yields an `evt2_` occurrence handle.
+         */
+        fun encode(href: String, etag: String?, recurrenceId: String?): String =
+            EventHandle(href, etag, recurrenceId).encode()
 
         /** True if [token] looks like an encoded handle (vs. a legacy bare UID). */
         fun looksLikeHandle(token: String?): Boolean =
-            token != null && token.startsWith(PREFIX)
+            token != null && (token.startsWith(PREFIX) || token.startsWith(PREFIX_V2))
 
         /**
-         * Decode an `evt1_…` token back to an [EventHandle], or null if [token] is
-         * not a well-formed handle (missing prefix, undecodable base64, or missing
-         * the href/etag separator). Callers treat a null as "not a handle" and fall
+         * Decode an `evt1_…`/`evt2_…` token back to an [EventHandle], or null if
+         * [token] is not a well-formed handle (missing prefix, undecodable base64,
+         * missing the href/etag separator, or — for `evt2_` — a missing/blank
+         * RECURRENCE-ID segment). Callers treat a null as "not a handle" and fall
          * back to legacy UID-based cache resolution.
          */
         fun decode(token: String?): EventHandle? {
             if (!looksLikeHandle(token)) return null
-            val b64 = token!!.substring(PREFIX.length)
+            val isV2 = token!!.startsWith(PREFIX_V2)
+            val b64 = token.substring((if (isV2) PREFIX_V2 else PREFIX).length)
             val decoded = try {
                 String(Base64.getUrlDecoder().decode(b64), Charsets.UTF_8)
             } catch (_: IllegalArgumentException) {
@@ -86,8 +123,18 @@ data class EventHandle(
             // client. Gating on the scheme makes this guard strictly stricter than
             // the client's own absolute-vs-relative split, closing that mismatch.
             if (hasScheme(href) && !hasICloudHost(href)) return null
-            val etag = decoded.substring(sep + 1).ifEmpty { null }
-            return EventHandle(href = href, etag = etag)
+            val rest = decoded.substring(sep + 1)
+            if (!isV2) {
+                return EventHandle(href = href, etag = rest.ifEmpty { null })
+            }
+            // evt2_: the remainder is `etag\nrecurrenceId`; neither an etag nor a
+            // RECURRENCE-ID contains a raw newline, so a single split is exact.
+            val sep2 = rest.indexOf('\n')
+            if (sep2 < 0) return null
+            val etag = rest.substring(0, sep2).ifEmpty { null }
+            val recurrenceId = rest.substring(sep2 + 1)
+            if (recurrenceId.isBlank()) return null
+            return EventHandle(href = href, etag = etag, recurrenceId = recurrenceId)
         }
 
         // A URI scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"` at the

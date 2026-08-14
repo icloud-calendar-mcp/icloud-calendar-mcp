@@ -7,6 +7,7 @@ import org.onekash.icaldav.model.ParseResult
 import org.onekash.icaldav.model.RRule
 import org.onekash.icaldav.parser.ICalGenerator
 import org.onekash.icaldav.parser.ICalParser
+import org.onekash.icaldav.recurrence.RRuleExpander
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
@@ -39,6 +40,7 @@ class IcsPatcher(
 
     private val parser = ICalParser()
     private val generator = ICalGenerator(prodId = PRODID, includeAppleExtensions = true)
+    private val expander = RRuleExpander()
 
     companion object {
         private const val PRODID = "-//OnekashMCP//AppleCalendarMCP 1.0//EN"
@@ -53,6 +55,30 @@ class IcsPatcher(
         message: String,
         cause: Throwable? = null
     ) : RuntimeException(message, cause)
+
+    /**
+     * Thrown by [patchOccurrence] / [exdateOccurrence] when the existing resource's
+     * master VEVENT is not a recurring series (no RRULE and no RDATE). A
+     * single-occurrence scope has no meaning without a recurrence set (RFC 5545
+     * §3.8.4.4); the caller should map this to a validation error.
+     */
+    class NotARecurringSeriesException(message: String) : RuntimeException(message)
+
+    /**
+     * Thrown by [truncateSeries] / [splitSeries] when the this-and-future target is the
+     * series' FIRST occurrence: there is no earlier occurrence to keep, so the operation
+     * is equivalent to acting on the whole series. The caller should delete the whole
+     * resource (delete) or patch the master in place (edit) instead of splitting.
+     */
+    class FirstOccurrenceException(message: String) : RuntimeException(message)
+
+    /**
+     * The two resource bodies a this-and-future edit produces. CalDAV stores one UID per
+     * resource, so the continuing series (fresh UID) cannot share the master's `.ics`:
+     * [truncatedMaster] is PUT back to the existing href, [newSeries] is created as a new
+     * resource.
+     */
+    data class SplitResult(val truncatedMaster: String, val newSeries: String)
 
     fun patch(
         existingIcs: String?,
@@ -122,6 +148,372 @@ class IcsPatcher(
         // method = null → no METHOD line (plain CalDAV storage PUT).
         // preserveDtstamp = false → DTSTAMP regenerated to now on every patch.
         return generator.generate(patched, method = null, preserveDtstamp = false, includeVTimezone = true)
+    }
+
+    /**
+     * Edit a single occurrence of a recurring series (scope = this occurrence).
+     *
+     * Stateless RECURRENCE-ID exception (RFC 5545 §3.8.4.4): parse [existingIcs],
+     * find (or create) the exception VEVENT for the occurrence identified by
+     * [recurrenceId] (in iCal wire form, as minted into the occurrence handle),
+     * apply the patch fields to that exception, and re-serialize the master plus
+     * every exception into one resource body. The master's DTSTART and RRULE are
+     * never touched; series-level fields (rrule/rdates/exdates) are deliberately not
+     * accepted here (rejected upstream) so an occurrence edit can never rewrite the
+     * series.
+     *
+     * A brand-new exception starts at the occurrence's own instant, so patching only
+     * the summary leaves its DTSTART at that instant (not the master's). Editing an
+     * occurrence that already has an exception updates it in place (no duplicate).
+     *
+     * @throws UnparseableExistingIcsException if [existingIcs] is blank/unparseable or has no master VEVENT.
+     * @throws NotARecurringSeriesException if the master carries no RRULE/RDATE.
+     */
+    fun patchOccurrence(
+        existingIcs: String?,
+        recurrenceId: String,
+        summary: String? = null,
+        startTime: String? = null,
+        endTime: String? = null,
+        startDate: String? = null,
+        endDate: String? = null,
+        isAllDay: Boolean? = null,
+        description: String? = null,
+        location: String? = null,
+        timezone: String? = null,
+        status: String? = null,
+        url: String? = null,
+        categories: List<String>? = null,
+        priority: Int? = null,
+        endTimezone: String? = null,
+        alarms: List<AlarmSpec>? = null
+    ): String {
+        val (master, overrides) = parseSeries(existingIcs)
+        val recid = normalizeRecurrenceId(recurrenceId, master)
+        val targetTs = recid.timestamp
+
+        val existing = overrides.firstOrNull { normalizedRecidTimestamp(it, master) == targetTs }
+        val base = existing ?: newExceptionBase(master, recid)
+
+        val patchedException = applyPatch(
+            base,
+            summary = summary?.let { sanitize(it) },
+            startTime = startTime,
+            endTime = endTime,
+            startDate = startDate,
+            endDate = endDate,
+            isAllDay = isAllDay,
+            description = description?.let { sanitize(it) },
+            location = location?.let { sanitize(it) },
+            timezone = timezone,
+            // Series-level fields never flow into a single-occurrence exception.
+            rrule = null,
+            status = status?.let { sanitize(it) },
+            url = url?.let { sanitize(it) },
+            categories = categories?.map { sanitize(it) },
+            priority = priority,
+            endTimezone = endTimezone,
+            rdates = null,
+            exdates = null,
+            alarms = alarms
+        )
+
+        val otherOverrides = overrides.filter { it !== existing }
+        val events = listOf(master) + otherOverrides + patchedException
+        return generator.generateBatch(events, includeMethod = false, includeVTimezone = true)
+    }
+
+    /**
+     * Cancel a single occurrence of a recurring series (scope = this occurrence):
+     * add [recurrenceId] to the master's EXDATE and drop any exception VEVENT for
+     * that instant. The master's DTSTART and RRULE are unchanged.
+     *
+     * @throws UnparseableExistingIcsException if [existingIcs] is blank/unparseable or has no master VEVENT.
+     * @throws NotARecurringSeriesException if the master carries no RRULE/RDATE.
+     */
+    fun exdateOccurrence(existingIcs: String?, recurrenceId: String): String {
+        val (master, overrides) = parseSeries(existingIcs)
+        val recid = normalizeRecurrenceId(recurrenceId, master)
+        val targetTs = recid.timestamp
+
+        val remaining = overrides.filterNot { normalizedRecidTimestamp(it, master) == targetTs }
+        val alreadyExcluded = master.exdates.any { it.timestamp == targetTs }
+        val exdates = if (alreadyExcluded) master.exdates else master.exdates + recid
+
+        val updatedMaster = master.copy(
+            exdates = exdates,
+            sequence = master.sequence + 1,
+            lastModified = ICalDateTime.now(),
+            created = master.created
+        )
+        val events = listOf(updatedMaster) + remaining
+        return generator.generateBatch(events, includeMethod = false, includeVTimezone = true)
+    }
+
+    /**
+     * Truncate a recurring series at [recurrenceId] (scope = this-and-future, delete):
+     * cap the master's RRULE with UNTIL at the last occurrence before [recurrenceId], so
+     * the occurrence and every later one drop out while everything earlier stays. The
+     * master's DTSTART is never touched. EXDATE/RDATE and exception VEVENTs at or after the
+     * cut are removed (they are orphaned once the series ends earlier).
+     *
+     * @throws UnparseableExistingIcsException if [existingIcs] is blank/unparseable or has no master VEVENT.
+     * @throws NotARecurringSeriesException if the master carries no RRULE/RDATE.
+     * @throws FirstOccurrenceException if [recurrenceId] is the series' first occurrence.
+     */
+    fun truncateSeries(existingIcs: String?, recurrenceId: String): String {
+        val (master, overrides) = parseSeries(existingIcs)
+        val recid = normalizeRecurrenceId(recurrenceId, master)
+        val (newMaster, keptOverrides) = truncateMaster(master, overrides, recid.timestamp)
+        return generator.generateBatch(listOf(newMaster) + keptOverrides, includeMethod = false, includeVTimezone = true)
+    }
+
+    /**
+     * Split a recurring series at [recurrenceId] (scope = this-and-future, edit): truncate
+     * the master as [truncateSeries] does, and produce a brand-new series (fresh UID) that
+     * starts at the occurrence, carries the master's recurrence rule (COUNT reduced by the
+     * occurrences the master keeps, UNTIL preserved), and has the patch fields applied. The
+     * two bodies are returned separately ([SplitResult]) because they must live in
+     * different CalDAV resources.
+     *
+     * Series-level fields (rrule/rdates/exdates) are deliberately not accepted; a
+     * this-and-future edit changes the occurrences' content, not the recurrence pattern.
+     *
+     * @throws UnparseableExistingIcsException if [existingIcs] is blank/unparseable or has no master VEVENT.
+     * @throws NotARecurringSeriesException if the master carries no RRULE/RDATE.
+     * @throws FirstOccurrenceException if [recurrenceId] is the series' first occurrence.
+     */
+    fun splitSeries(
+        existingIcs: String?,
+        recurrenceId: String,
+        summary: String? = null,
+        startTime: String? = null,
+        endTime: String? = null,
+        startDate: String? = null,
+        endDate: String? = null,
+        isAllDay: Boolean? = null,
+        description: String? = null,
+        location: String? = null,
+        timezone: String? = null,
+        endTimezone: String? = null,
+        alarms: List<AlarmSpec>? = null
+    ): SplitResult {
+        val (master, overrides) = parseSeries(existingIcs)
+        val recid = normalizeRecurrenceId(recurrenceId, master)
+
+        val (newMaster, keptOverrides) = truncateMaster(master, overrides, recid.timestamp)
+        val truncatedIcs = generator.generateBatch(
+            listOf(newMaster) + keptOverrides, includeMethod = false, includeVTimezone = true
+        )
+
+        val freshUid = "${java.util.UUID.randomUUID()}@onekash-mcp"
+        val newSeriesBase = newSeriesFromOccurrence(master, recid, freshUid)
+        val patched = applyPatch(
+            newSeriesBase,
+            summary = summary?.let { sanitize(it) },
+            startTime = startTime,
+            endTime = endTime,
+            startDate = startDate,
+            endDate = endDate,
+            isAllDay = isAllDay,
+            description = description?.let { sanitize(it) },
+            location = location?.let { sanitize(it) },
+            timezone = timezone,
+            // Series-level fields never flow through a scoped edit; keep the new series' rule.
+            rrule = null,
+            status = null,
+            url = null,
+            categories = null,
+            priority = null,
+            endTimezone = endTimezone,
+            rdates = null,
+            exdates = null,
+            alarms = alarms
+        ).copy(sequence = 0)  // a brand-new series starts at SEQUENCE 0
+
+        // Carry the modified instances that fall AFTER the cut onto the new series, mirroring how
+        // future EXDATE/RDATE are carried. Each keeps its RECURRENCE-ID and its own customization,
+        // but is re-based to the fresh UID so it belongs to the continuing series. The override AT
+        // the cut (== targetTs) is deliberately dropped: that instance is the new series' first
+        // occurrence, which the this-and-future patch itself defines.
+        val carriedOverrides = overrides
+            .filter { (normalizedRecidTimestamp(it, master) ?: Long.MIN_VALUE) > recid.timestamp }
+            .map { it.copy(uid = freshUid, importId = freshUid) }
+
+        val newSeriesIcs = generator.generateBatch(
+            listOf(patched) + carriedOverrides, includeMethod = false, includeVTimezone = true
+        )
+        return SplitResult(truncatedIcs, newSeriesIcs)
+    }
+
+    /**
+     * Build the capped master for a this-and-future cut at [targetTs] plus the exception
+     * VEVENTs that survive it (those strictly before the cut). Throws
+     * [FirstOccurrenceException] when no occurrence precedes the cut.
+     */
+    private fun truncateMaster(
+        master: ICalEvent,
+        overrides: List<ICalEvent>,
+        targetTs: Long
+    ): Pair<ICalEvent, List<ICalEvent>> {
+        val keptInstants = occurrenceInstantsBefore(master, targetTs, applyExdates = true)
+        if (keptInstants.isEmpty()) {
+            throw FirstOccurrenceException(
+                "this_and_future targets the first occurrence; act on the whole series instead"
+            )
+        }
+        val lastKept = keptInstants.max()
+        // UNTIL is inclusive (RFC 5545 §3.3.10): landing it on the last kept occurrence keeps
+        // that instance and drops the target and everything after. A timed series requires a
+        // UTC DATE-TIME UNTIL; an all-day series requires a DATE UNTIL.
+        val until = ICalDateTime.fromTimestamp(lastKept, timezone = null, isDate = master.dtStart.isDate)
+        val cappedRrule = master.rrule?.copy(until = until, count = null)
+
+        val newMaster = master.copy(
+            rrule = cappedRrule,
+            exdates = master.exdates.filter { it.timestamp < targetTs },
+            rdates = master.rdates.filter { it.timestamp < targetTs },
+            sequence = master.sequence + 1,
+            lastModified = ICalDateTime.now(),
+            created = master.created
+        )
+        val keptOverrides = overrides.filter {
+            (normalizedRecidTimestamp(it, master) ?: Long.MAX_VALUE) < targetTs
+        }
+        return newMaster to keptOverrides
+    }
+
+    /**
+     * The continuing series for a this-and-future edit: the master copied to a fresh UID,
+     * its DTSTART at the occurrence's own instant (DTEND shifted by the master's duration),
+     * its RRULE's COUNT reduced by the occurrences the truncated master keeps (UNTIL and
+     * open-ended rules pass through), and its future EXDATE/RDATE carried over. It takes the
+     * [freshUid] the split mints so the continuing series and its carried-over exceptions share
+     * one UID. [applyPatch] then applies the caller's edits.
+     */
+    private fun newSeriesFromOccurrence(master: ICalEvent, recid: ICalDateTime, freshUid: String): ICalEvent {
+        val targetTs = recid.timestamp
+        val dtEnd = master.dtEnd?.let { mEnd ->
+            ICalDateTime.fromTimestamp(
+                targetTs + (mEnd.timestamp - master.dtStart.timestamp),
+                timezone = mEnd.timezone,
+                isDate = mEnd.isDate
+            )
+        }
+        val newRrule = master.rrule?.let { r ->
+            val originalCount = r.count
+            if (originalCount != null) {
+                val consumed = occurrenceInstantsBefore(master, targetTs, applyExdates = false).size
+                r.copy(count = (originalCount - consumed).coerceAtLeast(1))
+            } else {
+                r
+            }
+        }
+        return master.copy(
+            uid = freshUid,
+            importId = freshUid,
+            recurrenceId = null,
+            dtStart = recid,
+            dtEnd = dtEnd,
+            duration = if (master.dtEnd == null) master.duration else null,
+            rrule = newRrule,
+            exdates = master.exdates.filter { it.timestamp >= targetTs },
+            rdates = master.rdates.filter { it.timestamp >= targetTs },
+            sequence = 0,
+            created = ICalDateTime.now(),
+            lastModified = ICalDateTime.now()
+        )
+    }
+
+    /**
+     * Instants of the master's occurrences strictly before [targetTs]. [applyExdates] =
+     * false counts pure RRULE/RDATE occurrences (for reducing COUNT, which per RFC 5545
+     * bounds RRULE generation independent of EXDATE); true removes EXDATE'd days (for the
+     * kept set, so a cancelled tail day is not treated as the last kept occurrence).
+     */
+    private fun occurrenceInstantsBefore(master: ICalEvent, targetTs: Long, applyExdates: Boolean): List<Long> {
+        val source = if (applyExdates) master else master.copy(exdates = emptyList(), rdates = emptyList())
+        val rangeStart = Instant.ofEpochMilli(minOf(master.dtStart.timestamp, targetTs))
+        val rangeEnd = Instant.ofEpochMilli(targetTs)
+        return expander.expand(source, rangeStart, rangeEnd)
+            .map { it.dtStart.timestamp }
+            .filter { it < targetTs }
+    }
+
+    /**
+     * Parse [existingIcs] into its master VEVENT and its exception (RECURRENCE-ID)
+     * VEVENTs, enforcing that the master is a recurring series.
+     */
+    private fun parseSeries(existingIcs: String?): Pair<ICalEvent, List<ICalEvent>> {
+        if (existingIcs.isNullOrBlank()) {
+            throw UnparseableExistingIcsException("Could not patch occurrence: existing ICS is required")
+        }
+        val events = when (val result = parser.parseAllEvents(existingIcs)) {
+            is ParseResult.Success -> result.value
+            is ParseResult.Error -> {
+                val ex = result.error.toException()
+                logFailure("<occurrence>", existingIcs, ex.toString())
+                throw UnparseableExistingIcsException(
+                    "Could not patch occurrence: existing ICS is unparseable (${ex.message ?: ex.javaClass.simpleName})",
+                    ex
+                )
+            }
+        }
+        val master = events.firstOrNull { it.recurrenceId == null }
+            ?: throw UnparseableExistingIcsException("Could not patch occurrence: no master VEVENT found")
+        if (master.rrule == null && master.rdates.isEmpty()) {
+            throw NotARecurringSeriesException(
+                "Single-occurrence scope requires a recurring series, but this event has no RRULE/RDATE"
+            )
+        }
+        val overrides = events.filter { it.recurrenceId != null }
+        return master to overrides
+    }
+
+    /**
+     * Parse a RECURRENCE-ID wire string to an [ICalDateTime] and reconcile its value
+     * type to the master's DTSTART. A local (floating) form is anchored to the
+     * master's timezone so the instant is stable regardless of the host zone; a
+     * DATE or Z-suffixed form is unambiguous on its own.
+     */
+    private fun normalizeRecurrenceId(recurrenceId: String, master: ICalEvent): ICalDateTime {
+        val raw = recurrenceId.trim()
+        val parsed = when {
+            raw.length == 8 && raw.all { it.isDigit() } -> ICalDateTime.parse(raw)          // DATE
+            raw.endsWith("Z") -> ICalDateTime.parse(raw)                                     // UTC instant
+            else -> ICalDateTime.parse(raw, master.dtStart.timezone?.id)                     // local → master zone
+        }
+        return RRuleExpander.normalizeToMasterValueType(parsed, master.dtStart)
+    }
+
+    /** The occurrence instant an override identifies, reconciled to the master's value type. */
+    private fun normalizedRecidTimestamp(override: ICalEvent, master: ICalEvent): Long? =
+        override.recurrenceId?.let { RRuleExpander.normalizeToMasterValueType(it, master.dtStart).timestamp }
+
+    /**
+     * Build the base exception VEVENT for a fresh single-occurrence edit: the master
+     * copied to this instance, its DTSTART at the occurrence's own instant and DTEND
+     * shifted by the master's duration, its RRULE/RDATE/EXDATE stripped (an instance
+     * is not itself a series), and its RECURRENCE-ID set. [applyPatch] then applies
+     * the caller's edits and bumps SEQUENCE.
+     */
+    private fun newExceptionBase(master: ICalEvent, recid: ICalDateTime): ICalEvent {
+        val dtEnd = master.dtEnd?.let { mEnd ->
+            ICalDateTime.fromTimestamp(
+                recid.timestamp + (mEnd.timestamp - master.dtStart.timestamp),
+                timezone = mEnd.timezone,
+                isDate = mEnd.isDate
+            )
+        }
+        return master.copy(
+            recurrenceId = recid,
+            dtStart = recid,
+            dtEnd = dtEnd,
+            duration = if (master.dtEnd == null) master.duration else null,
+            rrule = null,
+            rdates = emptyList(),
+            exdates = emptyList()
+        )
     }
 
     private fun logFailure(uid: String, existingIcs: String, detail: String) {

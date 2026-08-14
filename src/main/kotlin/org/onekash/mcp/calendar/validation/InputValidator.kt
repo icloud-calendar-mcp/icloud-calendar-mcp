@@ -6,6 +6,33 @@ import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
 
 /**
+ * The scope an `update_event`/`delete_event` acts on when the target is (or could
+ * be) one occurrence of a recurring series.
+ *
+ *  - [THIS_OCCURRENCE]: only the referenced occurrence (a RECURRENCE-ID exception,
+ *    or an EXDATE on delete).
+ *  - [THIS_AND_FUTURE]: the referenced occurrence and every later one.
+ *  - [ALL_EVENTS]: the whole series (today's behavior for a recurring reference).
+ *
+ * The [token] is the exact wire value accepted on the MCP `scope` argument. This
+ * is the single source of truth for the allowed values, reused by the validator,
+ * the service, and the tool schemas.
+ */
+enum class EventScope(val token: String) {
+    THIS_OCCURRENCE("this_occurrence"),
+    THIS_AND_FUTURE("this_and_future"),
+    ALL_EVENTS("all_events");
+
+    companion object {
+        /** The wire tokens in declaration order, for schemas and error messages. */
+        val TOKENS: List<String> = entries.map { it.token }
+
+        /** The [EventScope] for [token], or null if [token] is null/unrecognized. */
+        fun fromToken(token: String?): EventScope? = entries.firstOrNull { it.token == token }
+    }
+}
+
+/**
  * Input validation for MCP tool parameters.
  *
  * Security requirements (from MCP spec):
@@ -346,6 +373,55 @@ object InputValidator {
         } else {
             LocalDateTime.parse(datetime, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm"))
         }
+    }
+
+    /**
+     * Validate the optional `scope` argument on update/delete. Null/blank is Valid
+     * (omitted; the caller applies the fail-loud default elsewhere based on whether
+     * the reference is an occurrence). A non-null value must be one of
+     * [EventScope.TOKENS].
+     */
+    fun validateScope(scope: String?, fieldName: String = "scope"): ValidationResult {
+        if (scope.isNullOrBlank()) return ValidationResult.Valid
+        if (EventScope.fromToken(scope) == null) {
+            return ValidationResult.Invalid(
+                "$fieldName must be one of ${EventScope.TOKENS.joinToString(", ")}"
+            )
+        }
+        return ValidationResult.Valid
+    }
+
+    /**
+     * Reject series-level fields (rrule / rdates / exdates) supplied under a
+     * single-occurrence or this-and-future scope. Those fields describe the whole
+     * recurrence set (RFC 5545 §3.8.5), so pairing them with a scope that targets
+     * one occurrence is contradictory; the feature never silently widens an
+     * occurrence intent into a series rewrite. A no-op for [EventScope.ALL_EVENTS]
+     * and for an omitted/unrecognized scope (validated separately by [validateScope]).
+     */
+    fun validateOccurrenceScopeFields(
+        scope: String?,
+        rrule: String?,
+        rdates: List<String>?,
+        exdates: List<String>?,
+        fieldName: String = "scope"
+    ): ValidationResult {
+        val parsed = EventScope.fromToken(scope) ?: return ValidationResult.Valid
+        if (parsed != EventScope.THIS_OCCURRENCE && parsed != EventScope.THIS_AND_FUTURE) {
+            return ValidationResult.Valid
+        }
+        val offenders = buildList {
+            if (!rrule.isNullOrBlank()) add("rrule")
+            if (!rdates.isNullOrEmpty()) add("rdates")
+            if (!exdates.isNullOrEmpty()) add("exdates")
+        }
+        if (offenders.isNotEmpty()) {
+            return ValidationResult.Invalid(
+                "${offenders.joinToString(", ")} cannot be set with $fieldName=$scope; " +
+                    "series-level fields belong to the whole series (use scope=all_events)"
+            )
+        }
+        return ValidationResult.Valid
     }
 
     /**
