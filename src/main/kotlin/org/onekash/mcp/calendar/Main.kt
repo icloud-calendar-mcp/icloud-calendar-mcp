@@ -283,7 +283,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
     // ═══════════════════════════════════════════════════════════════════
     server.addTool(
         name = "get_events",
-        description = "Get events from a calendar within a date range. Reflects iCloud's server state at query time. The range is capped at 366 days, and end_date must not precede start_date; a range past the cap or an inverted one is rejected up front. The response is also capped: a query that would return more than 1000 events, or a single recurring series that expands to too many occurrences in the range, is rejected rather than returned. Query a week or a month at a time to stay under the caps. Note on read-after-write: iCloud has no immediate-visibility guarantee, so an event created moments ago may not appear in the very next get_events (CDN indexing lag) — this is NOT a deletion. If a create_event/update_event returned success, that write landed; do not treat a briefly-missing just-created event as failed or deleted, and do not recreate it (that duplicates the event). Use the returned uid/handle to reference it directly.",
+        description = "Get events from a calendar within a date range. Reflects iCloud's server state at query time. The range is capped at 366 days, and end_date must not precede start_date; a range past the cap or an inverted one is rejected up front. The response is also capped: a query that would return more than 1000 events, or a single recurring series that expands to too many occurrences in the range, is rejected rather than returned. Query a week or a month at a time to stay under the caps. Day boundaries are UTC: start_date and end_date select whole UTC calendar days (start_date 00:00Z through the end of end_date, UTC), and timed events are returned with UTC startTime/endTime instants (all-day events as plain YYYY-MM-DD). To resolve a user's day in another timezone, request one extra calendar day on each side and keep only the events whose startTime, converted to that zone, lands on the wanted local day; all-day events are floating dates and need no conversion. Note on read-after-write: iCloud has no immediate-visibility guarantee, so an event created moments ago may not appear in the very next get_events (CDN indexing lag) — this is NOT a deletion. If a create_event/update_event returned success, that write landed; do not treat a briefly-missing just-created event as failed or deleted, and do not recreate it (that duplicates the event). Use the returned uid/handle to reference it directly.",
         title = "Get Events",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
@@ -293,11 +293,11 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 })
                 put("start_date", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Start date (YYYY-MM-DD)"))
+                    put("description", JsonPrimitive("Start date (YYYY-MM-DD), interpreted as a UTC calendar day (00:00Z)."))
                 })
                 put("end_date", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("End date (YYYY-MM-DD), inclusive. Must be on or after start_date, and within 366 days of it."))
+                    put("description", JsonPrimitive("End date (YYYY-MM-DD), inclusive, interpreted as a UTC calendar day (through the end of the day, UTC). Must be on or after start_date, and within 366 days of it."))
                 })
             },
             required = listOf("calendar_id", "start_date", "end_date")
