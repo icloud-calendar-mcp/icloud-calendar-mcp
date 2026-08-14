@@ -1,6 +1,6 @@
 {
   "name": "@icloud-calendar-mcp/server",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "mcpName": "org.onekash/icloud-calendar-mcp",
   "description": "MCP server for iCloud Calendar access via CalDAV",
   "keywords": [

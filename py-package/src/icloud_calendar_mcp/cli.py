@@ -3,7 +3,7 @@
 iCloud Calendar MCP Server - Python wrapper
 
 This script wraps the Java JAR for easy uvx/pip usage.
-Requires Java 17+ to be installed.
+Requires Java 21+ to be installed.
 """
 
 import os
@@ -13,8 +13,8 @@ from pathlib import Path
 
 from icloud_calendar_mcp.downloader import ensure_jar
 
-JAR_NAME = "icloud-calendar-mcp-3.1.0-all.jar"
-MIN_JAVA_VERSION = 17
+JAR_NAME = "icloud-calendar-mcp-3.2.0-all.jar"
+MIN_JAVA_VERSION = 21
 
 
 def get_jar_path() -> Path:
@@ -26,7 +26,7 @@ def get_jar_path() -> Path:
 
 
 def check_java() -> tuple[bool, str]:
-    """Check if Java 17+ is available."""
+    """Check if Java 21+ is available."""
     try:
         result = subprocess.run(
             ["java", "-version"],
@@ -45,7 +45,7 @@ def check_java() -> tuple[bool, str]:
             return False, f"Java {MIN_JAVA_VERSION}+ required, found Java {version}"
         return False, "Could not parse Java version"
     except FileNotFoundError:
-        return False, "Java not found. Please install Java 17 or higher."
+        return False, "Java not found. Please install Java 21 or higher."
 
 
 def check_credentials() -> tuple[bool, str]:

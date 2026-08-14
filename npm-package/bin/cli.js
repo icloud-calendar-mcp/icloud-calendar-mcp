@@ -4,7 +4,7 @@
  * iCloud Calendar MCP Server - npm wrapper
  *
  * This script wraps the Java JAR for easy npm/npx usage.
- * Requires Java 17+ to be installed.
+ * Requires Java 21+ to be installed.
  */
 
 const { spawn, execSync } = require('child_process');
@@ -14,7 +14,7 @@ const fs = require('fs');
 const pkg = require('../package.json');
 const JAR_NAME = `icloud-calendar-mcp-${pkg.version}-all.jar`;
 const JAR_PATH = path.join(__dirname, '..', 'lib', JAR_NAME);
-const MIN_JAVA_VERSION = 17;
+const MIN_JAVA_VERSION = 21;
 
 // ANSI colors
 const RED = '\x1b[31m';
@@ -39,7 +39,7 @@ function checkJava() {
     }
     return { ok: false, error: 'Could not parse Java version' };
   } catch (e) {
-    return { ok: false, error: 'Java not found. Please install Java 17 or higher.' };
+    return { ok: false, error: 'Java not found. Please install Java 21 or higher.' };
   }
 }
 

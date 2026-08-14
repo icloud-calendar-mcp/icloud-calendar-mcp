@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-08-14
+
+### Added
+- Durable event handles. `get_events`, `create_event`, and `update_event` return
+  an opaque handle for each event (base64url of the event's normalized href plus
+  its last-seen ETag). Pass it to `update_event` / `delete_event` to act on an
+  event from a cold process, with no prior `get_events` to warm the cache. The
+  decode carries an SSRF guard: a handle's href must be a relative path or an
+  iCloud host.
+- Per-occurrence editing of recurring events. `get_events` expands a recurring
+  series into per-occurrence entries, each carrying its own `RECURRENCE-ID`, an
+  occurrence handle, and the series `RRULE`. `update_event` / `delete_event` take
+  an `event_scope` (`this_occurrence`, `this_and_future`, `all_events`), enforced
+  before any network write, so a single occurrence can be changed or cancelled
+  without rewriting the whole series.
+- Three user-initiated prompt templates: `schedule_meeting`, `reschedule`,
+  `find_conflicts`.
+- `create_event` accepts `summary` as an alias for `title` when `title` is omitted.
+
+### Fixed
+- `get_events` reports each recurring occurrence at its own date, not the master's
+  `DTSTART`. (#9)
+- `get_events` returns occurrences that overlap the queried window even when they
+  began before it (RFC 4791 §9.9: `DTSTART < end AND DTEND > start`). A daily
+  overnight shift (22:00-06:00) queried for the morning it runs into now appears;
+  an occurrence entirely before the window does not.
+- `get_events` drops events iCloud returns outside the requested range, including
+  the all-day case where an exclusive `DTEND` only touches the query start. (#11)
+- `create_event` / `update_event` accept `Z` and `+HH:MM` / `-HH:MM` offset ISO
+  8601 datetimes, not only naive local wall-clock. An explicit offset denotes an
+  absolute instant and takes precedence over the `timezone` parameter, which now
+  applies only to naive datetimes. The schema had advertised a `Z` form the
+  validator rejected. (#14, #16)
+- UTC-origin datetimes resolve in UTC regardless of the host time zone. A value
+  stored as UTC no longer shifts by the host offset on an off-UTC machine, which
+  had moved both the wall-clock time and the calendar date. The recurrence-expansion
+  seed is aligned the same way. (#15)
+- Stale-ETag recovery on writes. A write that hits `412 Precondition Failed`
+  refetches the current ETag and retries once. The first PUT sends the handle's
+  ETag as `If-Match`, so a concurrent out-of-band edit reliably trips `412` and
+  reconciles.
+- `RECURRENCE-ID` overrides survive a parse/generate round-trip: `RANGE=THISANDFUTURE`
+  is preserved, and value-type / time-zone normalization makes an override match
+  the correct occurrence regardless of the host zone.
+- kotlin-logging's startup banner no longer reaches the STDIO JSON-RPC stream,
+  where it could corrupt the first client exchange. (#13)
+- The npm and PyPI installers now require Java 21, matching the JAR's compile
+  target. They previously accepted Java 17, which passed the preflight check and
+  then failed at runtime with an unsupported-class-version error.
+
+### Changed
+- Java 21 is now the baseline (was 17): toolchain, source/target level, and CI.
+- `get_events` response-size caps, three fixed bounds with no pagination: reject a
+  requested range wider than 366 days before the fetch; abort expansion of a
+  single series past 10,000 occurrences; return a structured `PAYLOAD_TOO_LARGE`
+  error when the assembled result exceeds 1,000 events, telling the caller to
+  narrow the range. Prevents a silently truncated, invalid-JSON response.
+- `get_events` day boundaries are UTC, now stated in the tool description:
+  `start_date` and `end_date` select whole UTC calendar days, and timed events
+  are returned as UTC instants. The description gives the recipe for resolving a
+  user's local day (request one extra day on each side, filter by the converted
+  `startTime`). No `timezone` parameter is added.
+- Regional iCloud partition hosts (`pNN-*`, `:443`) are normalized consistently.
+- MCP Kotlin SDK 0.14.0 → 0.15.0; ical4j 4.2.2 → 4.3.0 (in `icaldav-core`).
+
 ## [3.1.0] - 2026-07-22
 
 ### Added

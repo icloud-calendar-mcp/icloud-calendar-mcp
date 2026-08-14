@@ -1561,13 +1561,27 @@ class CalendarServiceTest {
             Pair(client.lastUpdatedIcs!!, (result as ServiceResult.Success).data.handle!!)
         }
 
+        // ical4j keeps process-global time-zone state (its TimeZoneRegistry and the
+        // net.fortuna.ical4j.model.TimeZone cache) that is lazily populated under
+        // whatever the JVM default zone is when a cold path first runs. A real server
+        // fixes the host zone once at startup, so that state is always consistent;
+        // only this test toggles TimeZone.setDefault inside one JVM. If the measured
+        // Seoul run were the first in the suite to warm the Asia/Seoul entry, it could
+        // pick up a transient and diverge from the UTC run (a rare, suite-class-order
+        // dependent flake). Warm the identical edit path under both zones first, so
+        // neither measured run touches a cold cache.
+        editUnderZone("UTC")
+        editUnderZone("Asia/Seoul")
+
         val (icsUtc, handleUtc) = editUnderZone("UTC")
         val (icsSeoul, handleSeoul) = editUnderZone("Asia/Seoul")
 
         assertEquals(icsUtc, icsSeoul, "the patched body must be byte-identical regardless of host zone")
         assertEquals(handleUtc, handleSeoul, "the returned occurrence handle must be byte-identical")
-        // Sanity: the exception really targets the 2025-01-16 instant, moved to 15:00Z.
+        // Sanity: both runs target the 2025-01-16 instant, moved to 15:00Z, in UTC wire form.
         assertTrue(icsUtc.contains("RECURRENCE-ID:20250116T090000Z"), "identity is the 01-16 instant:\n$icsUtc")
         assertTrue(icsUtc.contains("DTSTART:20250116T150000Z"), "moved to 15:00Z:\n$icsUtc")
+        assertTrue(icsSeoul.contains("RECURRENCE-ID:20250116T090000Z"), "Seoul-run identity is the 01-16 instant:\n$icsSeoul")
+        assertTrue(icsSeoul.contains("DTSTART:20250116T150000Z"), "Seoul-run moved to 15:00Z:\n$icsSeoul")
     }
 }
