@@ -7,6 +7,7 @@ import org.onekash.icaldav.model.ICalEvent
 import org.onekash.icaldav.parser.ICalParser
 import org.onekash.icaldav.recurrence.RRuleExpander
 import org.onekash.icaldav.util.DurationUtils
+import java.time.Duration
 import java.time.Instant
 import java.time.format.DateTimeFormatter
 
@@ -75,6 +76,29 @@ class IcsParser {
     private val expander = RRuleExpander()
     private val dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
+    private companion object {
+        /**
+         * Upper bound on how far the recurrence expansion is widened backward to catch
+         * a boundary-spanning occurrence. It mirrors the get_events span cap
+         * (InputValidator's 366-day MAX_RANGE_DAYS): an occurrence longer than a year
+         * that also starts more than a year before the window is effectively permanent,
+         * and capping the pad keeps a pathological long-duration series from widening
+         * expansion without bound (CWE-400), the same absurdity the span cap rejects
+         * up front.
+         */
+        private val MAX_EXPANSION_PAD: Duration = Duration.ofDays(366)
+
+        /**
+         * End-time an event carrying neither DTEND nor DURATION is treated as lasting.
+         * Shared by [mapTimed] (the reported end) and [effectiveDuration] (the widening
+         * and [reachesWindow] end) so the two cannot drift: were they to disagree, a
+         * durationless boundary-spanning occurrence would be dropped again. All-day
+         * events default to a whole day instead, handled inline where that value type
+         * is derived ([mapAllDay] / [effectiveDuration]).
+         */
+        private val DEFAULT_TIMED_DURATION: Duration = Duration.ofHours(1)
+    }
+
     /**
      * A recurring series in the requested range expands to more instances than the
      * expander's per-series work-bound allows (CWE-400 guard). This is the bridge-level
@@ -130,25 +154,83 @@ class IcsParser {
                     // Non-recurring: pass through verbatim (no series identity).
                     listOf(master to null)
                 } else {
-                    // Recurring: each expanded occurrence is tagged with its series
-                    // master so mapEvent can stamp the occurrence identity and retain
-                    // the series rrule (the expander strips both from a plain occurrence).
-                    // Re-throw the expander's work-bound abort as the bridge-level
-                    // exception, so callers never touch the ical4j-confined core type.
+                    // Recurring: an occurrence that STARTS before the requested range can
+                    // still be in progress during it (RFC 4791 §9.9 overlap: DTSTART < end
+                    // AND DTEND > start). The expander matches by start, so it never emits
+                    // those leading, boundary-spanning occurrences. Widen the expansion
+                    // start backward by the master's own occurrence duration so they are
+                    // generated, then drop the ones that do not actually reach the window
+                    // ([reachesWindow]). CalendarService.overlapsRequestedRange stays the
+                    // outer trim (and owns the upper bound + all-day exclusive-DTEND).
+                    //
+                    // Two accepted limits of the master-duration heuristic:
+                    //  - The pad is the MASTER's duration, so a RECURRENCE-ID override (or
+                    //    RDATE) stretched longer than the master, whose original instant sits
+                    //    more than a master-duration before the window, is not regenerated.
+                    //    This narrows, not widens, the pre-existing gap (the old code padded
+                    //    by nothing) and needs a pathological edit to hit.
+                    //  - A sub-daily series (MINUTELY/SECONDLY) whose occurrences each last
+                    //    close to a year can, once widened, exceed the expander's
+                    //    MAX_ITERATIONS and return a 413. Such a series has far more than
+                    //    MAX_RETURNED_EVENTS occurrences overlapping any window, so a 413 is
+                    //    the correct answer regardless; the outcome is a clean structured
+                    //    error, never a crash or a truncated payload.
+                    val pad = effectiveDuration(master).coerceIn(Duration.ZERO, MAX_EXPANSION_PAD)
+                    val widenedStart = rangeStart.minus(pad)
+
+                    // Each expanded occurrence is tagged with its series master so mapEvent
+                    // can stamp the occurrence identity and retain the series rrule (the
+                    // expander strips both from a plain occurrence). Re-throw the expander's
+                    // work-bound abort as the bridge-level exception, so callers never touch
+                    // the ical4j-confined core type.
                     val expanded = try {
                         expander.expand(
                             master,
-                            rangeStart,
+                            widenedStart,
                             rangeEnd,
                             RRuleExpander.buildOverrideMap(overridesByUid[master.uid].orEmpty())
                         )
                     } catch (e: RRuleExpander.ExpansionLimitException) {
                         throw ExpansionLimitException(e.uid, e.limit)
                     }
-                    expanded.map { it to master }
+                    expanded
+                        .filter { reachesWindow(it, rangeStart) }
+                        .map { it to master }
                 }
             }
             .mapNotNull { (occurrence, seriesMaster) -> mapEvent(occurrence, seriesMaster) }
+    }
+
+    /**
+     * A master's per-occurrence duration, matching the end-time semantics [mapEvent]
+     * reports: an explicit DURATION, else DTEND − DTSTART, else the default [mapAllDay]
+     * and [mapTimed] apply to an event carrying neither (a whole day for all-day, one
+     * hour for timed). Used to widen the expansion window (so a boundary-spanning
+     * occurrence is generated) and to reconstruct a leading occurrence's end in
+     * [reachesWindow]. Deriving it here rather than reusing the expander's private
+     * duration keeps the value aligned with what the reader ultimately reports and
+     * keeps ical4j confined to :icaldav-core.
+     */
+    private fun effectiveDuration(event: ICalEvent): Duration {
+        event.duration?.let { return it }
+        event.dtEnd?.let { return Duration.ofMillis(it.timestamp - event.dtStart.timestamp) }
+        return if (event.isAllDay) Duration.ofDays(1) else DEFAULT_TIMED_DURATION
+    }
+
+    /**
+     * Lower-bound guard for the widened expansion. An occurrence whose start is inside
+     * the requested range passes through unchanged (zero change to the pre-widening
+     * behavior); a leading (pad) occurrence that starts before [rangeStart] is kept
+     * only if it is still in progress at [rangeStart], i.e. its end is strictly after
+     * it. This decides only which newly generated leading occurrences may reach the
+     * outer trim; the upper bound and the all-day exclusive-DTEND handling stay with
+     * CalendarService.overlapsRequestedRange.
+     */
+    private fun reachesWindow(occurrence: ICalEvent, rangeStart: Instant): Boolean {
+        val occStart = occurrence.dtStart.toInstant()
+        if (!occStart.isBefore(rangeStart)) return true
+        val occEnd = occurrence.dtEnd?.toInstant() ?: occStart.plus(effectiveDuration(occurrence))
+        return occEnd.isAfter(rangeStart)
     }
 
     /**
@@ -235,7 +317,7 @@ class IcsParser {
         val endInstant = when {
             event.dtEnd != null -> event.dtEnd!!.toInstant()
             event.duration != null -> startInstant.plusMillis(event.duration!!.toMillis())
-            else -> startInstant.plusSeconds(3600)
+            else -> startInstant.plus(DEFAULT_TIMED_DURATION)
         }
 
         val startTzid = event.dtStart.timezone?.id

@@ -151,6 +151,81 @@ class GetEventsRangeFilterTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // OVERLAP, NOT START-IN-WINDOW — a recurring occurrence that started before
+    // the queried day but is still running during it must reach the output.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `daily overnight recurring occurrence spanning into the queried day reaches the output`() {
+        // 22:00–06:00 daily. Querying 2026-06-10 must surface both the occurrence that
+        // began 22:00 the prior evening (running to 06:00) and that evening's occurrence,
+        // through the full service path (expansion widening + overlapsRequestedRange).
+        serveIcs(
+            """
+            BEGIN:VEVENT
+            UID:overnight@example.com
+            DTSTART:20260601T220000Z
+            DTEND:20260602T060000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Overnight shift
+            END:VEVENT
+            """.trimIndent()
+        )
+
+        val starts = getEvents("2026-06-10").mapNotNull { it.startTime }.sorted()
+        assertEquals(2, starts.size, "prior-evening + query-evening occurrences: $starts")
+        assertTrue(starts.any { it.startsWith("2026-06-09T22:00") }, "the prior-evening occurrence must reach the output: $starts")
+        assertTrue(starts.any { it.startsWith("2026-06-10T22:00") }, "the query-day evening occurrence too: $starts")
+    }
+
+    @Test
+    fun `widened expansion of a full-year daily series does not spuriously 413`() {
+        // A DAILY series with 1-hour occurrences over a wide (but within-span-cap) range.
+        // Widening adds at most one leading occurrence; it must not trip MAX_ITERATIONS or
+        // the MAX_RETURNED_EVENTS count cap — the request succeeds with one event per day.
+        serveIcs(
+            """
+            BEGIN:VEVENT
+            UID:year-daily@example.com
+            DTSTART:20260101T090000Z
+            DTEND:20260101T100000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Daily standup
+            END:VEVENT
+            """.trimIndent()
+        )
+
+        val result = service.getEvents(calendarId, "2026-01-01", "2026-06-30")
+        assertTrue(result is ServiceResult.Success, "wide daily range must succeed, not 413: $result")
+        val events = (result as ServiceResult.Success).data
+        // Jan 1 through Jun 30 2026 inclusive = 181 days, one occurrence each.
+        assertEquals(181, events.size, "one occurrence per day, no leading double-count")
+    }
+
+    @Test
+    fun `pathological sub-daily series with a near-year duration returns a clean 413, not a crash`() {
+        // A MINUTELY series whose occurrences each last most of a year is degenerate:
+        // hundreds of thousands of occurrences overlap any window, far past
+        // MAX_RETURNED_EVENTS, so a 413 is the correct answer. Widening cannot turn this
+        // into a wrong result or an uncaught exception — it must be a structured 413.
+        serveIcs(
+            """
+            BEGIN:VEVENT
+            UID:pathological@example.com
+            DTSTART:20260101T000000Z
+            DTEND:20261215T000000Z
+            RRULE:FREQ=MINUTELY
+            SUMMARY:Degenerate overlapping series
+            END:VEVENT
+            """.trimIndent()
+        )
+
+        val result = service.getEvents(calendarId, "2026-06-01", "2026-06-01")
+        assertTrue(result is ServiceResult.Error, "expected a structured error, got $result")
+        assertEquals(413, (result as ServiceResult.Error).code, "must be a clean 413, not a crash")
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // ORDINARY CASES MUST NOT REGRESS
     // ═══════════════════════════════════════════════════════════════════════
 

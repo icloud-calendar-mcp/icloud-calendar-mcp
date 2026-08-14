@@ -396,6 +396,218 @@ class IcsParserOccurrenceTest {
         assertTrue(moved.startTime!!.startsWith("2026-01-08T15:00"), "moved instance lands on 01-08 15:00: ${moved.startTime}")
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // OVERLAP, NOT START-IN-WINDOW (RFC 4791 §9.9): a boundary-spanning
+    // occurrence that STARTS before the range but is still in progress during
+    // it must be returned. The expander matches by start, so parseOccurrences
+    // widens the expansion backward by the master's duration and drops the
+    // leading occurrences that do not actually reach the window.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun `daily overnight occurrence spanning into the queried day appears`() {
+        // 22:00–06:00 every day. Querying the calendar day 2026-06-10 must return
+        // the occurrence that began at 22:00 on 06-09 (running until 06:00 on 06-10)
+        // as well as the one that begins at 22:00 on 06-10.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:overnight@example.com
+            DTSTART:20260601T220000Z
+            DTEND:20260602T060000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Overnight shift
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-06-10")
+        val starts = parser.parseOccurrences(ics, start, end).mapNotNull { it.startTime }.sorted()
+
+        assertTrue(
+            starts.any { it.startsWith("2026-06-09T22:00") },
+            "the prior-evening occurrence spanning into the morning must appear: $starts"
+        )
+        assertTrue(
+            starts.any { it.startsWith("2026-06-10T22:00") },
+            "the query-day evening occurrence must also appear: $starts"
+        )
+        assertEquals(2, starts.size, "exactly the two occupying occurrences: $starts")
+    }
+
+    @Test
+    fun `monthly two-day all-day occurrence queried on its second day appears`() {
+        // A 2-day workshop (DTEND exclusive = start + 2 days) repeating monthly.
+        // Querying the second calendar day must return it, though it started the day before.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:workshop@example.com
+            DTSTART;VALUE=DATE:20260115
+            DTEND;VALUE=DATE:20260117
+            RRULE:FREQ=MONTHLY
+            SUMMARY:Two-day workshop
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-03-16") // second day of the March occurrence (03-15..03-16)
+        val events = parser.parseOccurrences(ics, start, end)
+
+        assertEquals(1, events.size, "the workshop occupies its second day")
+        assertEquals("2026-03-15", events[0].startDate, "it started the previous day")
+        assertEquals("2026-03-16", events[0].endDate, "inclusive end is the queried day")
+    }
+
+    @Test
+    fun `occurrence entirely before the queried window is absent`() {
+        // The overnight occurrence that began 22:00 on 06-08 ends 06:00 on 06-09,
+        // wholly before a 2026-06-10 query — it must not be dragged in by the widening.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:overnight@example.com
+            DTSTART:20260601T220000Z
+            DTEND:20260602T060000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Overnight shift
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-06-10")
+        val starts = parser.parseOccurrences(ics, start, end).mapNotNull { it.startTime }
+        assertTrue(starts.none { it.startsWith("2026-06-08") }, "occurrences ending before the window stay out: $starts")
+    }
+
+    @Test
+    fun `all-day occurrence whose exclusive DTEND merely touches the query start is excluded`() {
+        // Single-day all-day occurrences (DTEND exclusive = start + 1). Querying the day
+        // AFTER an occurrence must not surface it: its exclusive DTEND only touches the
+        // query start, so per RFC 4791 it does not overlap.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:daily-allday@example.com
+            DTSTART;VALUE=DATE:20260201
+            DTEND;VALUE=DATE:20260202
+            RRULE:FREQ=DAILY
+            SUMMARY:Daily all-day
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        // Query 2026-02-10: only the 02-10 occurrence overlaps, not the 02-09 one whose
+        // exclusive DTEND (02-10) merely touches the window open.
+        val (start, end) = day("2026-02-10")
+        val dates = parser.parseOccurrences(ics, start, end).mapNotNull { it.startDate }
+        assertEquals(listOf("2026-02-10"), dates, "only the queried day's occurrence: $dates")
+    }
+
+    @Test
+    fun `EXDATE on the leading boundary-spanning occurrence keeps it out`() {
+        // The overnight occurrence that would span 06-09 22:00 -> 06-10 06:00 is EXDATE'd.
+        // It must not surface for the 2026-06-10 query even though it would otherwise be
+        // the leading boundary-spanning one.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:overnight-ex@example.com
+            DTSTART:20260601T220000Z
+            DTEND:20260602T060000Z
+            RRULE:FREQ=DAILY
+            EXDATE:20260609T220000Z
+            SUMMARY:Overnight shift with a gap
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-06-10")
+        val starts = parser.parseOccurrences(ics, start, end).mapNotNull { it.startTime }
+        assertTrue(starts.none { it.startsWith("2026-06-09") }, "EXDATE'd leading occurrence stays out: $starts")
+        assertTrue(starts.any { it.startsWith("2026-06-10T22:00") }, "the query-day occurrence still appears: $starts")
+    }
+
+    @Test
+    fun `RECURRENCE-ID override on a boundary-spanning occurrence surfaces as the override`() {
+        // The 06-09 22:00 instance (which spans into 06-10) is edited. Querying 06-10 must
+        // surface the OVERRIDE for that leading instance, not the default projection.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:overnight-ovr@example.com
+            DTSTART:20260601T220000Z
+            DTEND:20260602T060000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Overnight shift
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:overnight-ovr@example.com
+            RECURRENCE-ID:20260609T220000Z
+            DTSTART:20260609T220000Z
+            DTEND:20260610T063000Z
+            SUMMARY:Overnight shift (extended)
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-06-10")
+        val leading = parser.parseOccurrences(ics, start, end)
+            .single { it.startTime?.startsWith("2026-06-09") == true }
+        assertEquals("Overnight shift (extended)", leading.summary, "the override, not the default projection")
+        assertEquals("20260609T220000Z", leading.recurrenceId, "identity is the original instant")
+    }
+
+    @Test
+    fun `durationless timed recurring occurrence spanning into the window appears`() {
+        // No DTEND/DURATION: mapTimed defaults such an event to +1h, so a 23:30 occurrence
+        // runs to 00:30 the next day. Querying that next day must surface the prior-evening
+        // occurrence — the widening uses the same 1h effective duration mapEvent reports.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:durationless@example.com
+            DTSTART:20260601T233000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Late check-in
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-06-10")
+        val starts = parser.parseOccurrences(ics, start, end).mapNotNull { it.startTime }.sorted()
+        assertTrue(
+            starts.any { it.startsWith("2026-06-09T23:30") },
+            "the prior-evening durationless occurrence running to 00:30 must appear: $starts"
+        )
+    }
+
+    @Test
+    fun `RDATE-only boundary-spanning occurrence appears`() {
+        // An RDATE (no RRULE) that started the evening before and spans into the queried day.
+        // Widening feeds the expander's RDATE range filter too, so the leading RDATE surfaces.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:rdate-only@example.com
+            DTSTART:20260609T220000Z
+            DTEND:20260610T060000Z
+            RDATE:20260609T220000Z
+            RDATE:20260612T220000Z
+            SUMMARY:RDATE overnight
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-06-10")
+        val starts = parser.parseOccurrences(ics, start, end).mapNotNull { it.startTime }
+        assertTrue(
+            starts.any { it.startsWith("2026-06-09T22:00") },
+            "the leading RDATE occurrence spanning into 06-10 must appear: $starts"
+        )
+        assertTrue(starts.none { it.startsWith("2026-06-12") }, "the far RDATE stays out of a 06-10 query: $starts")
+    }
+
     @Test
     fun `orphaned override without its master is still mapped`() {
         // A response holding only a modified instance has no series to expand,
