@@ -1503,4 +1503,71 @@ class CalendarServiceTest {
         val masterIcs = mockClient.lastUpdatedIcs!!
         assertTrue(masterIcs.contains("UNTIL=20250116T090000Z"), "truncation re-applied on retry:\n$masterIcs")
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HOST TIME-ZONE STABILITY (US6-AC3)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /** Run [block] with the JVM default zone set to [zoneId], restoring the original afterwards. */
+    private fun <T> withDefaultZone(zoneId: String, block: () -> T): T {
+        val original = java.util.TimeZone.getDefault()
+        java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone(zoneId))
+        try {
+            return block()
+        } finally {
+            java.util.TimeZone.setDefault(original)
+        }
+    }
+
+    @Test
+    fun `a this_occurrence edit selects the same instance and is byte-stable across host time zones`() {
+        // The occurrence reference pins its instant in UTC wire form, the occurrence
+        // window is UTC-anchored, and the patch is emitted in UTC. So resolving and
+        // rewriting the SAME occurrence under a non-UTC default zone must produce a
+        // byte-identical body and a byte-identical returned handle: no off-by-one-day
+        // instance selection, no zone-dependent serialization.
+        fun editUnderZone(zoneId: String): Pair<String, String> = withDefaultZone(zoneId) {
+            val client = MockCalDavClient()
+            val svc = CalendarService(client)
+            val master = CalDavEvent(
+                uid = "daily-series",
+                href = "/cal/daily.ics",
+                url = "https://test.com/cal/daily.ics",
+                etag = "\"e-series\"",
+                icalData = """
+                    BEGIN:VCALENDAR
+                    VERSION:2.0
+                    PRODID:-//Test//Test//EN
+                    BEGIN:VEVENT
+                    UID:daily-series
+                    SUMMARY:Daily standup
+                    DTSTART:20250115T090000Z
+                    DTEND:20250115T091500Z
+                    RRULE:FREQ=DAILY
+                    END:VEVENT
+                    END:VCALENDAR
+                """.trimIndent()
+            )
+            client.registeredEvents[master.uid] = master
+            val handle = EventHandle.encode(master.href, master.etag, "20250116T090000Z")
+
+            val result = svc.updateEvent(
+                handle,
+                startTime = "2025-01-16T15:00:00Z",
+                endTime = "2025-01-16T16:00:00Z",
+                scope = EventScope.THIS_OCCURRENCE
+            )
+            assertTrue(result is ServiceResult.Success, "edit must succeed under $zoneId")
+            Pair(client.lastUpdatedIcs!!, (result as ServiceResult.Success).data.handle!!)
+        }
+
+        val (icsUtc, handleUtc) = editUnderZone("UTC")
+        val (icsSeoul, handleSeoul) = editUnderZone("Asia/Seoul")
+
+        assertEquals(icsUtc, icsSeoul, "the patched body must be byte-identical regardless of host zone")
+        assertEquals(handleUtc, handleSeoul, "the returned occurrence handle must be byte-identical")
+        // Sanity: the exception really targets the 2025-01-16 instant, moved to 15:00Z.
+        assertTrue(icsUtc.contains("RECURRENCE-ID:20250116T090000Z"), "identity is the 01-16 instant:\n$icsUtc")
+        assertTrue(icsUtc.contains("DTSTART:20250116T150000Z"), "moved to 15:00Z:\n$icsUtc")
+    }
 }

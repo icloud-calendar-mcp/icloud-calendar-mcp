@@ -357,6 +357,46 @@ class IcsParserOccurrenceTest {
     }
 
     @Test
+    fun `an occurrence moved to a different day appears once on the new day and leaves no phantom on the original`() {
+        // The 2026-01-07 09:00 instance is moved to 2026-01-08 15:00. Its RECURRENCE-ID
+        // stays the original 09:00 instant (RFC 5545 §3.8.4.4), so the override merges
+        // over the master's 01-07 slot: the original day is vacated (no phantom) and the
+        // instance surfaces on 01-08, alongside that day's own natural 09:00 occurrence.
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:series@example.com
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            RRULE:FREQ=DAILY
+            SUMMARY:Daily
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:series@example.com
+            RECURRENCE-ID:20260107T090000Z
+            DTSTART:20260108T150000Z
+            DTEND:20260108T160000Z
+            SUMMARY:Moved to the next day
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val start = LocalDate.parse("2026-01-06").atStartOfDay(ZoneOffset.UTC).toInstant()
+        val end = LocalDate.parse("2026-01-09").atTime(LocalTime.of(23, 59, 59)).toInstant(ZoneOffset.UTC)
+        val events = parser.parseOccurrences(ics, start, end)
+
+        val starts = events.mapNotNull { it.startTime }
+        // Jan 6 (natural), Jan 8 natural 09:00, Jan 8 moved-in 15:00, Jan 9 (natural).
+        assertEquals(4, events.size, "01-07 is vacated; 01-08 carries two: $starts")
+        assertTrue(starts.none { it.startsWith("2026-01-07") }, "no phantom on the original day: $starts")
+        assertEquals(2, starts.count { it.startsWith("2026-01-08") }, "01-08 has its natural and the moved-in instance: $starts")
+
+        val moved = events.single { it.recurrenceId == "20260107T090000Z" }
+        assertEquals("Moved to the next day", moved.summary)
+        assertTrue(moved.startTime!!.startsWith("2026-01-08T15:00"), "moved instance lands on 01-08 15:00: ${moved.startTime}")
+    }
+
+    @Test
     fun `orphaned override without its master is still mapped`() {
         // A response holding only a modified instance has no series to expand,
         // so it should surface rather than vanish.
