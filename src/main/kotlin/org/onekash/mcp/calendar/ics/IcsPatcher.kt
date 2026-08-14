@@ -11,6 +11,7 @@ import org.onekash.icaldav.recurrence.RRuleExpander
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.time.OffsetDateTime
 
 /**
  * Patches existing ICS content, preserving properties not being updated.
@@ -704,12 +705,16 @@ class IcsPatcher(
 
     /**
      * ISO 8601 timed value → [ICalDateTime].
-     * - Z-suffixed → UTC.
-     * - TZID present → local wall-clock anchored to that zone.
-     * - Neither → treated as UTC (matches the previous patcher's floating fallback).
+     * - Explicit zone ('Z' or a numeric offset) → absolute instant, and it wins over
+     *   [timezone] (matches IcsBuilder's create-path precedence).
+     * - Naive value + TZID → local wall-clock anchored to that zone.
+     * - Naive value, no TZID → treated as UTC (the previous patcher's floating fallback).
      */
     private fun timedICalDateTime(iso: String, timezone: String?): ICalDateTime {
-        if (iso.endsWith("Z")) return utcICalDateTime(iso)
+        if (iso.endsWith("Z") || IcsBuilder.OFFSET_SUFFIX.containsMatchIn(iso)) {
+            val instant = OffsetDateTime.parse(iso).toInstant()
+            return ICalDateTime.fromTimestamp(instant.toEpochMilli(), timezone = null, isDate = false)
+        }
         if (timezone != null) {
             val basic = iso.replace("-", "").replace(":", "") // yyyyMMddTHHmmss
             return ICalDateTime.parse(basic, timezone)

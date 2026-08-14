@@ -104,21 +104,52 @@ class InputValidatorTest {
     }
 
     @Test
+    fun `validateDateTime should accept a UTC Z-suffixed datetime`() {
+        // Issue #14: the schema advertises this form (e.g. 2025-01-15T09:00:00Z).
+        assertTrue(InputValidator.validateDateTime("2025-01-15T09:30:00Z") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateDateTime("2025-01-15T09:30Z") is ValidationResult.Valid)
+    }
+
+    @Test
+    fun `validateDateTime should accept an offset datetime`() {
+        // Issue #14: +HH:MM / -HH:MM offsets denote an absolute instant.
+        assertTrue(InputValidator.validateDateTime("2026-08-06T18:30:00+09:00") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateDateTime("2026-08-06T04:30:00-05:00") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateDateTime("2026-08-06T18:30+09:00") is ValidationResult.Valid)
+    }
+
+    @Test
     fun `validateDateTime should reject wrong formats`() {
         val invalid = listOf(
-            "2025-01-15",           // Date only
-            "2025-01-15 09:30:00",  // Space instead of T
-            "2025-01-15T9:30:00",   // Missing leading zero
-            "2025-01-15T09:30:00Z", // With timezone
-            "09:30:00",             // Time only
-            "2025-01-15T25:00:00",  // Invalid hour
-            "2025-01-15T09:60:00"   // Invalid minute
+            "2025-01-15",              // Date only
+            "2025-01-15 09:30:00",     // Space instead of T
+            "2025-01-15T9:30:00",      // Missing leading zero
+            "09:30:00",                // Time only
+            "2025-01-15T25:00:00",     // Invalid hour
+            "2025-01-15T09:60:00",     // Invalid minute
+            "2026-13-40T99:99",        // Nonsense date/time
+            "2026-08-06T09:30:00+9",   // Truncated offset
+            "2026-08-06T09:30:00+09:0",// Incomplete offset minutes
+            "2026-08-06T09:30:00+0900",// Missing offset colon
+            "2026-08-06T09:30:00ZZ",   // Double zone marker
+            "2026-08-06T09:30:00Z+09:00", // Z and offset both
+            "2026-08-06T09:30:00Zjunk"    // Trailing junk
         )
 
         invalid.forEach { datetime ->
             val result = InputValidator.validateDateTime(datetime, "start_time")
             assertTrue(result is ValidationResult.Invalid, "Should reject: $datetime")
         }
+    }
+
+    @Test
+    fun `validateDateTime error message lists the accepted forms`() {
+        val result = InputValidator.validateDateTime("nonsense", "start_time")
+        assertTrue(result is ValidationResult.Invalid)
+        val msg = (result as ValidationResult.Invalid).message
+        // Names naive, UTC (Z), and offset so a client is not left to guess.
+        assertTrue(msg.contains("Z"), "message should mention the Z form: $msg")
+        assertTrue(msg.contains("+HH:MM") || msg.contains("offset"), "message should mention offsets: $msg")
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -292,6 +323,67 @@ class InputValidatorTest {
         )
         assertTrue(result is ValidationResult.Invalid)
         assertTrue((result as ValidationResult.Invalid).message.contains("different"))
+    }
+
+    @Test
+    fun `validateTimeRange should accept a Z-suffixed range`() {
+        val result = InputValidator.validateTimeRange(
+            "2025-01-15T09:00:00Z",
+            "2025-01-15T10:00:00Z"
+        )
+        assertTrue(result is ValidationResult.Valid)
+    }
+
+    @Test
+    fun `validateTimeRange should order offset datetimes by their absolute instant`() {
+        // 18:30+09:00 == 09:30Z, before 10:00Z: a valid range whose ordering only
+        // holds if offsets are compared as absolute instants.
+        val valid = InputValidator.validateTimeRange(
+            "2026-08-06T18:30:00+09:00",
+            "2026-08-06T10:00:00Z"
+        )
+        assertTrue(valid is ValidationResult.Valid, "18:30+09:00 (=09:30Z) precedes 10:00Z")
+
+        // 18:30+09:00 == 09:30Z, which is after 09:00Z: end precedes start as instants.
+        val inverted = InputValidator.validateTimeRange(
+            "2026-08-06T18:30:00+09:00",
+            "2026-08-06T09:00:00Z"
+        )
+        assertTrue(inverted is ValidationResult.Invalid, "09:00Z end precedes the 09:30Z start")
+    }
+
+    @Test
+    fun `validateTimeRange orders a naive start against an offset end as UTC`() {
+        // Naive start is treated as UTC (the no-timezone contract). 09:00 (naive=UTC)
+        // precedes 18:30+09:00 (=09:30Z), so this is a valid range.
+        val result = InputValidator.validateTimeRange(
+            "2026-08-06T09:00:00",
+            "2026-08-06T18:30:00+09:00"
+        )
+        assertTrue(result is ValidationResult.Valid)
+    }
+
+    @Test
+    fun `validateTimeRange anchors a naive endpoint to the timezone param, matching the write path`() {
+        // A mixed naive/zoned range must be ordered at the instant the writer will store.
+        // Naive start 09:00 in America/Los_Angeles (PDT, -07:00) = 16:00Z; that is AFTER
+        // the 15:30Z end, so this range is inverted and must be rejected. Without
+        // anchoring to the timezone, the naive start would be read as 09:00Z and slip
+        // through as "valid" while the stored event is inverted.
+        val inverted = InputValidator.validateTimeRange(
+            "2026-08-06T09:00:00",
+            "2026-08-06T15:30:00Z",
+            "America/Los_Angeles"
+        )
+        assertTrue(inverted is ValidationResult.Invalid, "16:00Z start must not precede a 15:30Z end")
+
+        // Same naive start against a 17:00Z end (after 16:00Z) is a genuinely valid range.
+        val valid = InputValidator.validateTimeRange(
+            "2026-08-06T09:00:00",
+            "2026-08-06T17:00:00Z",
+            "America/Los_Angeles"
+        )
+        assertTrue(valid is ValidationResult.Valid)
     }
 
     // ═══════════════════════════════════════════════════════════════════

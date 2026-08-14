@@ -1,7 +1,10 @@
 package org.onekash.mcp.calendar.validation
 
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
 
@@ -58,8 +61,21 @@ object InputValidator {
 
     // Regex patterns
     private val DATE_PATTERN = Regex("""^\d{4}-\d{2}-\d{2}$""")
-    private val DATETIME_PATTERN = Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$""")
+    // A datetime is naive (no zone) or carries an explicit zone: a UTC 'Z' or a
+    // numeric offset (+HH:MM / -HH:MM). Anchored and linear (no nested quantifiers),
+    // so it stays ReDoS-safe.
+    private val DATETIME_PATTERN = Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})?$""")
     private val CALENDAR_ID_PATTERN = Regex("""^[a-zA-Z0-9\-_:/\.@]+$""")
+
+    // Single source of truth for the trailing numeric offset (+HH:MM / -HH:MM) lives
+    // in IcsBuilder.OFFSET_SUFFIX; re-exposed here so the boundary validator and the
+    // ICS writer agree on what counts as an explicit zone. Anchored/fixed-length, so
+    // containsMatchIn stays linear. Mirrors ALARM_ABSOLUTE_PATTERN below.
+    private val OFFSET_SUFFIX get() = org.onekash.mcp.calendar.ics.IcsBuilder.OFFSET_SUFFIX
+
+    /** True when [datetime] carries an explicit zone: a UTC 'Z' or a numeric offset. */
+    private fun hasExplicitZone(datetime: String): Boolean =
+        datetime.endsWith("Z") || OFFSET_SUFFIX.containsMatchIn(datetime)
 
     /**
      * Validation result sealed class.
@@ -136,15 +152,21 @@ object InputValidator {
         }
 
         if (!DATETIME_PATTERN.matches(datetime)) {
-            return ValidationResult.Invalid("$fieldName must be in ISO 8601 format (YYYY-MM-DDTHH:MM:SS)")
+            return ValidationResult.Invalid(
+                "$fieldName must be in ISO 8601 format: naive local (YYYY-MM-DDTHH:MM:SS), " +
+                    "UTC (…Z), or with an offset (…+HH:MM)"
+            )
         }
 
         return try {
-            // Try parsing with seconds
-            if (datetime.count { it == ':' } == 2) {
+            // The pattern permits three shapes; parse the one that matches so genuinely
+            // malformed values (e.g. 2026-13-40T99:99) are still rejected here, before
+            // any CalDAV call.
+            if (hasExplicitZone(datetime)) {
+                OffsetDateTime.parse(datetime) // Z or numeric offset (ISO_OFFSET_DATE_TIME)
+            } else if (datetime.count { it == ':' } == 2) {
                 LocalDateTime.parse(datetime)
             } else {
-                // Parse without seconds
                 LocalDateTime.parse(datetime, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm"))
             }
             ValidationResult.Valid
@@ -247,7 +269,17 @@ object InputValidator {
             // Each value is either a YYYY-MM-DD or a datetime string
             val asDate = validateDate(v, "$fieldName[$i]")
             if (asDate is ValidationResult.Valid) continue
-            val asDateTime = validateDateTime(v.removeSuffix("Z"), "$fieldName[$i]")
+            // RDATE/EXDATE values are date or UTC-instant only. A numeric offset would
+            // pass validateDateTime but the downstream writer (IcsBuilder/IcsPatcher
+            // toRecurrenceDateTime) appends 'Z' and Instant.parse would then throw, so
+            // reject offsets here.
+            val withoutZ = v.removeSuffix("Z")
+            if (hasExplicitZone(withoutZ)) {
+                return ValidationResult.Invalid(
+                    "$fieldName[$i] must be a date (YYYY-MM-DD) or a UTC datetime (…Z), not an offset datetime"
+                )
+            }
+            val asDateTime = validateDateTime(withoutZ, "$fieldName[$i]")
             if (asDateTime is ValidationResult.Invalid) {
                 return asDateTime
             }
@@ -373,11 +405,24 @@ object InputValidator {
 
     /**
      * Validate that end time is after start time.
+     *
+     * Endpoints are compared as absolute instants resolved the same way the write
+     * path resolves them (IcsBuilder/IcsPatcher): an explicit Z/offset is that
+     * instant; a naive value is anchored to [timezone] (or [endTimezone] for the end,
+     * falling back to [timezone]), or treated as UTC when no zone is given. Resolving
+     * identically is what keeps this guard honest for a mixed naive/zoned range: a
+     * naive endpoint anchored to a non-UTC zone must be ordered against the other
+     * endpoint at the same instant the stored event will use.
      */
-    fun validateTimeRange(startTime: String, endTime: String): ValidationResult {
+    fun validateTimeRange(
+        startTime: String,
+        endTime: String,
+        timezone: String? = null,
+        endTimezone: String? = null
+    ): ValidationResult {
         return try {
-            val start = parseDateTime(startTime)
-            val end = parseDateTime(endTime)
+            val start = parseDateTime(startTime, timezone)
+            val end = parseDateTime(endTime, endTimezone ?: timezone)
 
             if (end.isBefore(start)) {
                 ValidationResult.Invalid("End time must be after start time")
@@ -411,13 +456,24 @@ object InputValidator {
     }
 
     /**
-     * Parse datetime string to LocalDateTime.
+     * Parse a datetime string to the absolute [Instant] it denotes, resolving it the
+     * same way the write path does so ordering matches the stored event. A Z/offset
+     * value carries its own zone (and [timezone] is ignored); a naive value is
+     * anchored to [timezone], or treated as UTC when [timezone] is null.
      */
-    private fun parseDateTime(datetime: String): LocalDateTime {
-        return if (datetime.count { it == ':' } == 2) {
+    private fun parseDateTime(datetime: String, timezone: String? = null): Instant {
+        if (hasExplicitZone(datetime)) {
+            return OffsetDateTime.parse(datetime).toInstant()
+        }
+        val local = if (datetime.count { it == ':' } == 2) {
             LocalDateTime.parse(datetime)
         } else {
             LocalDateTime.parse(datetime, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm"))
+        }
+        return if (timezone != null) {
+            local.atZone(java.time.ZoneId.of(timezone)).toInstant()
+        } else {
+            local.toInstant(ZoneOffset.UTC)
         }
     }
 

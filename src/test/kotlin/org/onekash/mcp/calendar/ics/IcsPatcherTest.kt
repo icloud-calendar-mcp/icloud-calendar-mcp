@@ -220,6 +220,122 @@ class IcsPatcherTest {
     }
 
     @Test
+    fun `patch updates times with a Z-suffixed datetime`() {
+        val originalIcs = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:z-update@test
+            DTSTAMP:20251220T100000Z
+            DTSTART:20251225T100000Z
+            DTEND:20251225T110000Z
+            SUMMARY:Z Update
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val patched = patcher.patch(
+            existingIcs = originalIcs,
+            uid = "z-update@test",
+            startTime = "2026-08-06T09:30:00Z",
+            endTime = "2026-08-06T10:30:00Z"
+        )
+
+        assertTrue(patched.contains("DTSTART:20260806T093000Z"), patched)
+        assertTrue(patched.contains("DTEND:20260806T103000Z"), patched)
+        assertFalse(patched.contains("TZID="))
+    }
+
+    @Test
+    fun `patch updates times with an offset datetime storing the correct UTC instant`() {
+        // Issue #14: update_event goes through IcsPatcher, not IcsBuilder.
+        // 18:30+09:00 = 09:30 UTC.
+        val originalIcs = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:offset-update@test
+            DTSTAMP:20251220T100000Z
+            DTSTART:20251225T100000Z
+            DTEND:20251225T110000Z
+            SUMMARY:Offset Update
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val patched = patcher.patch(
+            existingIcs = originalIcs,
+            uid = "offset-update@test",
+            startTime = "2026-08-06T18:30:00+09:00",
+            endTime = "2026-08-06T19:30:00+09:00"
+        )
+
+        assertTrue(patched.contains("DTSTART:20260806T093000Z"), patched)
+        assertTrue(patched.contains("DTEND:20260806T103000Z"), patched)
+        assertFalse(patched.contains("TZID="))
+    }
+
+    @Test
+    fun `patch offset datetime ignores the timezone parameter (offset wins)`() {
+        val originalIcs = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:offset-wins-update@test
+            DTSTAMP:20251220T100000Z
+            DTSTART:20251225T100000Z
+            DTEND:20251225T110000Z
+            SUMMARY:Offset Wins Update
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val patched = patcher.patch(
+            existingIcs = originalIcs,
+            uid = "offset-wins-update@test",
+            startTime = "2026-08-06T18:30:00+09:00",  // = 09:30 UTC
+            endTime = "2026-08-06T19:30:00+09:00",    // = 10:30 UTC
+            timezone = "America/New_York"             // must be ignored
+        )
+
+        assertTrue(patched.contains("DTSTART:20260806T093000Z"), patched)
+        assertTrue(patched.contains("DTEND:20260806T103000Z"), patched)
+        assertFalse(patched.contains("TZID="))
+    }
+
+    @Test
+    fun `patchOccurrence applies an offset start time as an absolute instant`() {
+        // The offset precedence must also hold through the RECURRENCE-ID exception path.
+        val originalIcs = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:series-offset@test
+            DTSTAMP:20251220T100000Z
+            DTSTART:20251225T100000Z
+            DTEND:20251225T110000Z
+            SUMMARY:Weekly
+            RRULE:FREQ=WEEKLY
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val patched = patcher.patchOccurrence(
+            existingIcs = originalIcs,
+            recurrenceId = "20251225T100000Z",
+            startTime = "2026-08-06T18:30:00+09:00",  // = 09:30 UTC
+            endTime = "2026-08-06T19:30:00+09:00"     // = 10:30 UTC
+        )
+
+        assertTrue(patched.contains("DTSTART:20260806T093000Z"), patched)
+        assertTrue(patched.contains("DTEND:20260806T103000Z"), patched)
+    }
+
+    @Test
     fun `patch updates all-day dates`() {
         val originalIcs = """
             BEGIN:VCALENDAR
