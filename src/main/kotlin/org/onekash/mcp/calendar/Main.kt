@@ -431,11 +431,11 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 })
                 put("start_time", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("Start time (ISO 8601 local, no zone suffix, e.g., 2025-01-15T09:00:00). Interpreted as UTC unless 'timezone' is set."))
+                    put("description", JsonPrimitive("Start time (ISO 8601). Naive local (2025-01-15T09:00:00): interpreted as UTC unless 'timezone' is set. UTC (2025-01-15T09:00:00Z) or offset (2025-01-15T18:00:00+09:00): an absolute instant that wins over 'timezone'."))
                 })
                 put("end_time", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("End time (ISO 8601 local, no zone suffix, e.g., 2025-01-15T10:00:00). Interpreted as UTC unless 'timezone' is set."))
+                    put("description", JsonPrimitive("End time (ISO 8601). Naive local (2025-01-15T10:00:00): interpreted as UTC unless 'timezone' is set. UTC (2025-01-15T10:00:00Z) or offset (2025-01-15T19:00:00+09:00): an absolute instant that wins over 'timezone'."))
                 })
                 put("location", buildJsonObject {
                     put("type", JsonPrimitive("string"))
@@ -558,9 +558,10 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     InputValidator.validateDateTime(startTime, "start_time"),
                     InputValidator.validateDateTime(endTime, "end_time")
                 ))
-                // Validate time range
+                // Validate time range (resolve naive endpoints in the same zone the
+                // write path uses, so a mixed naive/zoned range is ordered honestly).
                 if (startTime != null && endTime != null) {
-                    val timeRangeResult = InputValidator.validateTimeRange(startTime, endTime)
+                    val timeRangeResult = InputValidator.validateTimeRange(startTime, endTime, timezone, endTimezone)
                     if (timeRangeResult is ValidationResult.Invalid) {
                         errors.add(timeRangeResult.message)
                     }
@@ -671,11 +672,11 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 })
                 put("start_time", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("New start time (optional)"))
+                    put("description", JsonPrimitive("New start time (optional, ISO 8601). Naive local (2025-01-15T09:00:00): interpreted as UTC unless 'timezone' is set. UTC (…Z) or offset (…+09:00): an absolute instant that wins over 'timezone'."))
                 })
                 put("end_time", buildJsonObject {
                     put("type", JsonPrimitive("string"))
-                    put("description", JsonPrimitive("New end time (optional)"))
+                    put("description", JsonPrimitive("New end time (optional, ISO 8601). Naive local (2025-01-15T10:00:00): interpreted as UTC unless 'timezone' is set. UTC (…Z) or offset (…+09:00): an absolute instant that wins over 'timezone'."))
                 })
                 put("location", buildJsonObject {
                     put("type", JsonPrimitive("string"))
@@ -814,9 +815,10 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 }
             }
 
-            // Validate time range if both provided
+            // Validate time range if both provided (resolve naive endpoints in the
+            // same zone the write path uses, so a mixed naive/zoned range is honest).
             if (startTime != null && endTime != null) {
-                val timeRangeResult = InputValidator.validateTimeRange(startTime, endTime)
+                val timeRangeResult = InputValidator.validateTimeRange(startTime, endTime, timezone, endTimezone)
                 if (timeRangeResult is ValidationResult.Invalid) {
                     errors.add(timeRangeResult.message)
                 }

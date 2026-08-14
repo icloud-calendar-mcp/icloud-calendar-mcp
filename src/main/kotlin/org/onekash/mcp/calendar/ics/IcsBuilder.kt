@@ -12,6 +12,7 @@ import org.onekash.icaldav.util.DurationUtils
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.time.OffsetDateTime
 import java.time.temporal.ChronoUnit
 import java.util.UUID
 
@@ -64,6 +65,13 @@ class IcsBuilder {
          * Anchored, no backtracking risk.
          */
         internal val ICAL_ABSOLUTE_TRIGGER_REGEX = Regex("""^\d{8}T\d{6}Z$""")
+
+        /**
+         * A trailing numeric offset (+HH:MM / -HH:MM) on an ISO 8601 datetime.
+         * Anchored to the end and fixed length, so matching is linear. Shared by
+         * [IcsBuilder] and [IcsPatcher] to detect an explicit zone on a timed value.
+         */
+        internal val OFFSET_SUFFIX = Regex("""[+-]\d{2}:\d{2}$""")
 
         /**
          * Map an [AlarmSpec] (MCP wire shape) to an icaldav [ICalAlarm]. Shared with
@@ -233,29 +241,16 @@ class IcsBuilder {
         }
 
         if (startTime != null && endTime != null) {
-            val utc = startTime.endsWith("Z") && endTime.endsWith("Z")
-            return when {
-                utc || timezone == null -> {
-                    // UTC times, or floating times treated as UTC (matches prior behavior).
-                    val startDt = utcICalDateTime(startTime)
-                    val endInstant = Instant.parse(asUtc(endTime))
-                    if (recurring) {
-                        ResolvedTimes(startDt, null, Duration.between(startDt.toInstant(), endInstant))
-                    } else {
-                        ResolvedTimes(startDt, utcICalDateTime(endTime), null)
-                    }
-                }
-                else -> {
-                    // Local wall-clock times anchored to a TZID.
-                    val startDt = localICalDateTime(startTime, timezone)
-                    val effectiveEndTz = endTimezone ?: timezone
-                    val endDt = localICalDateTime(endTime, effectiveEndTz)
-                    if (recurring) {
-                        ResolvedTimes(startDt, null, Duration.between(startDt.toInstant(), endDt.toInstant()))
-                    } else {
-                        ResolvedTimes(startDt, endDt, null)
-                    }
-                }
+            // Resolve each endpoint independently: an explicit Z/offset denotes an
+            // absolute instant and wins over the timezone param; a naive value is
+            // anchored to the timezone as local wall-clock, or treated as UTC when no
+            // timezone is set (matches prior floating-time behavior).
+            val startDt = resolveTimedEndpoint(startTime, timezone)
+            val endDt = resolveTimedEndpoint(endTime, endTimezone ?: timezone)
+            return if (recurring) {
+                ResolvedTimes(startDt, null, Duration.between(startDt.toInstant(), endDt.toInstant()))
+            } else {
+                ResolvedTimes(startDt, endDt, null)
             }
         }
 
@@ -283,6 +278,28 @@ class IcsBuilder {
         } catch (_: Exception) {
             null
         }
+
+    /**
+     * Resolve one timed endpoint. An explicit UTC 'Z' or numeric offset denotes an
+     * absolute instant and wins over [timezone]; a naive value is anchored to
+     * [timezone] as local wall-clock, or treated as UTC when [timezone] is null.
+     */
+    private fun resolveTimedEndpoint(iso: String, timezone: String?): ICalDateTime =
+        when {
+            hasExplicitZone(iso) -> absoluteICalDateTime(iso)
+            timezone == null -> utcICalDateTime(iso)
+            else -> localICalDateTime(iso, timezone)
+        }
+
+    /** True when [iso] carries an explicit zone: a UTC 'Z' or a numeric offset. */
+    private fun hasExplicitZone(iso: String): Boolean =
+        iso.endsWith("Z") || OFFSET_SUFFIX.containsMatchIn(iso)
+
+    /** ISO 8601 with an explicit zone ('Z' or offset) → UTC [ICalDateTime] at that instant. */
+    private fun absoluteICalDateTime(iso: String): ICalDateTime {
+        val instant = OffsetDateTime.parse(iso).toInstant()
+        return ICalDateTime.fromTimestamp(instant.toEpochMilli(), timezone = null, isDate = false)
+    }
 
     /** ISO 8601 UTC (or Z-suffixed) → UTC [ICalDateTime]. */
     private fun utcICalDateTime(iso: String): ICalDateTime {

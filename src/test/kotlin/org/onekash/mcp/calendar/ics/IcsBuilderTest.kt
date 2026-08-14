@@ -160,6 +160,54 @@ class IcsBuilderTest {
         assertFalse(ics.contains("TZID="))
     }
 
+    @Test
+    fun `build offset event stores the correct UTC instant`() {
+        // Issue #14: +09:00 offset denotes an absolute instant. 18:30+09:00 = 09:30 UTC.
+        val ics = builder.build(
+            uid = "offset-event@example.com",
+            summary = "Offset Meeting",
+            startTime = "2026-08-06T18:30:00+09:00",
+            endTime = "2026-08-06T19:30:00+09:00"
+        )
+
+        assertTrue(ics.contains("DTSTART:20260806T093000Z"), ics)
+        assertTrue(ics.contains("DTEND:20260806T103000Z"), ics)
+        assertFalse(ics.contains("TZID="))
+    }
+
+    @Test
+    fun `build anchors a naive end to end_timezone even when timezone is omitted`() {
+        // Per-endpoint resolution honors end_timezone for a naive end regardless of the
+        // (absent) start timezone, matching the update path (IcsPatcher uses
+        // endTimezone ?: timezone). Start stays floating→UTC; end anchors to Tokyo.
+        val ics = builder.build(
+            uid = "end-tz@example.com",
+            summary = "Split Zone",
+            startTime = "2025-01-15T00:00:00",       // naive, no timezone → UTC
+            endTime = "2025-01-15T18:00:00",         // naive → anchored to end_timezone
+            endTimezone = "Asia/Tokyo"
+        )
+
+        assertTrue(ics.contains("DTSTART:20250115T000000Z"), ics)
+        assertTrue(ics.contains("DTEND;TZID=Asia/Tokyo:20250115T180000"), ics)
+    }
+
+    @Test
+    fun `build offset event ignores the timezone parameter (offset wins)`() {
+        // The explicit offset denotes an absolute instant, so the timezone param is ignored.
+        val ics = builder.build(
+            uid = "offset-wins@example.com",
+            summary = "Offset Wins",
+            startTime = "2026-08-06T18:30:00+09:00",  // = 09:30 UTC
+            endTime = "2026-08-06T19:30:00+09:00",    // = 10:30 UTC
+            timezone = "America/New_York"             // must be ignored
+        )
+
+        assertTrue(ics.contains("DTSTART:20260806T093000Z"), ics)
+        assertTrue(ics.contains("DTEND:20260806T103000Z"), ics)
+        assertFalse(ics.contains("TZID="))
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // TEXT ESCAPING
     // ═══════════════════════════════════════════════════════════════════════
