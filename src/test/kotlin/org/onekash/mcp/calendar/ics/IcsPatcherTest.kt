@@ -1526,6 +1526,29 @@ class IcsPatcherTest {
         }
     }
 
+    @Test
+    fun `splitSeries rejects a non-recurring event`() {
+        // Parallels the patchOccurrence/exdateOccurrence/truncateSeries rejections: the
+        // this-and-future EDIT path also refuses a master with no RRULE/RDATE, so a
+        // stale occurrence handle onto a de-recurred resource fails loud, not silently.
+        val standalone = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            BEGIN:VEVENT
+            UID:single@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260105T090000Z
+            DTEND:20260105T100000Z
+            SUMMARY:One-off
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+        assertFailsWith<IcsPatcher.NotARecurringSeriesException> {
+            patcher.splitSeries(standalone, "20260105T090000Z", summary = "nope")
+        }
+    }
+
     /** Weekly series with a modified instance (moved + relocated) at 2026-02-02, well after 01-19. */
     private val weeklySeriesWithLaterException = """
         BEGIN:VCALENDAR
