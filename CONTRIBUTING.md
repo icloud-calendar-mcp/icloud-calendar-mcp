@@ -202,7 +202,7 @@ See [SECURITY.md](SECURITY.md) for responsible disclosure process.
 
 ```bash
 ./gradlew fatJar
-# Output: build/libs/icloud-calendar-mcp-3.2.0-all.jar
+# Output: build/libs/icloud-calendar-mcp-<version>-all.jar
 ```
 
 ### Testing with MCP Inspector
@@ -210,7 +210,7 @@ See [SECURITY.md](SECURITY.md) for responsible disclosure process.
 ```bash
 ICLOUD_USERNAME="test@icloud.com" \
 ICLOUD_PASSWORD="test-password" \
-npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-3.2.0-all.jar
+npx @mcp-use/inspector java -jar build/libs/icloud-calendar-mcp-*-all.jar
 ```
 
 ### Adding Security Tests

@@ -47,6 +47,15 @@ private val rateLimiter = RateLimiter(readLimit = 60, writeLimit = 20, windowMs 
 // iCloud CalDAV base URL
 private const val ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 
+/**
+ * The MCP serverInfo version, read from the JAR manifest's Implementation-Version
+ * (set from build.gradle.kts by the fatJar task). Returns "dev" when running
+ * outside a packaged JAR, e.g. `./gradlew run` or under test, where no manifest
+ * version is present. Keeps the version in one place instead of a source literal.
+ */
+private fun serverVersion(): String =
+    object {}.javaClass.`package`?.implementationVersion ?: "dev"
+
 fun main(args: Array<String>) {
     // kotlin-logging's startup banner goes to System.out, which stdio reserves for JSON-RPC.
     // Must run before the first MCP SDK class loads. See StdioPurityTest.
@@ -72,7 +81,7 @@ fun main(args: Array<String>) {
     val server = Server(
         serverInfo = Implementation(
             name = "icloud-calendar-mcp",
-            version = "3.2.0"
+            version = serverVersion()
         ),
         options = ServerOptions(
             capabilities = ServerCapabilities(

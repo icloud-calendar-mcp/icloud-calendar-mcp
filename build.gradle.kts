@@ -106,6 +106,7 @@ tasks.test {
 tasks.jar {
     manifest {
         attributes["Main-Class"] = "org.onekash.mcp.calendar.MainKt"
+        attributes["Implementation-Version"] = project.version.toString()
     }
 }
 
@@ -116,6 +117,9 @@ tasks.register<Jar>("fatJar") {
 
     manifest {
         attributes["Main-Class"] = "org.onekash.mcp.calendar.MainKt"
+        // Read back at runtime as the MCP serverInfo version, so the version lives
+        // in exactly one place (build.gradle.kts) instead of a hardcoded literal.
+        attributes["Implementation-Version"] = project.version.toString()
     }
 
     from(sourceSets.main.get().output)

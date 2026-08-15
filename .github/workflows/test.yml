@@ -26,6 +26,9 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Check version consistency
+        run: bash scripts/check-version.sh
+
       - name: Run tests
         run: ./gradlew test
 

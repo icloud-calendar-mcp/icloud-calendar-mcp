@@ -29,23 +29,41 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Verify tag matches project version
+        # Fail fast if build.gradle.kts was not bumped to the tag. The JAR is built
+        # from the gradle version, but npm/PyPI download a tag-versioned filename, so
+        # a mismatch would 404 downstream. scripts/bump-version.sh keeps them aligned.
+        run: |
+          GRADLE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' build.gradle.kts)"
+          if [ "$GRADLE_VERSION" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Tag v${{ steps.version.outputs.version }} does not match build.gradle.kts version $GRADLE_VERSION. Run scripts/bump-version.sh ${{ steps.version.outputs.version }}, commit, then re-tag."
+            exit 1
+          fi
+
       - name: Run tests
         run: ./gradlew test
 
       - name: Build fat JAR
         run: ./gradlew fatJar
 
-      - name: Get version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
       - name: Verify JAR exists
         run: ls -la build/libs/icloud-calendar-mcp-*-all.jar
+
+      - name: Create version-agnostic JAR copy
+        # A constant asset name gives the README a releases/latest/download link that
+        # never 404s across releases; the versioned asset is kept alongside it.
+        run: cp "build/libs/icloud-calendar-mcp-${{ steps.version.outputs.version }}-all.jar" build/libs/icloud-calendar-mcp-all.jar
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: build/libs/icloud-calendar-mcp-*-all.jar
+          files: |
+            build/libs/icloud-calendar-mcp-${{ steps.version.outputs.version }}-all.jar
+            build/libs/icloud-calendar-mcp-all.jar
           generate_release_notes: true
           draft: false
           prerelease: false
