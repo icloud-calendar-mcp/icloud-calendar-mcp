@@ -279,7 +279,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     )
                 }
                 is ServiceResult.Error -> {
-                    SecureErrorHandler.serviceError(result.code, result.message)
+                    SecureErrorHandler.serviceError(result.code, result.message, result.retryAt)
                 }
             }
         }.getOrElse { exception ->
@@ -409,7 +409,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                     )
                 }
                 is ServiceResult.Error -> {
-                    SecureErrorHandler.serviceError(result.code, result.message)
+                    SecureErrorHandler.serviceError(result.code, result.message, result.retryAt)
                 }
             }
         }.getOrElse { exception ->
@@ -651,7 +651,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                         "calendar" to calendarId,
                         "code" to result.code
                     ))
-                    SecureErrorHandler.serviceError(result.code, result.message)
+                    SecureErrorHandler.serviceError(result.code, result.message, result.retryAt)
                 }
             }
         }.getOrElse { exception ->
@@ -910,7 +910,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                         "eventId" to eventId,
                         "code" to result.code
                     ))
-                    SecureErrorHandler.serviceError(result.code, result.message)
+                    SecureErrorHandler.serviceError(result.code, result.message, result.retryAt)
                 }
             }
         }.getOrElse { exception ->
@@ -1008,7 +1008,7 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                         "eventId" to eventId,
                         "code" to result.code
                     ))
-                    SecureErrorHandler.serviceError(result.code, result.message)
+                    SecureErrorHandler.serviceError(result.code, result.message, result.retryAt)
                 }
             }
         }.getOrElse { exception ->

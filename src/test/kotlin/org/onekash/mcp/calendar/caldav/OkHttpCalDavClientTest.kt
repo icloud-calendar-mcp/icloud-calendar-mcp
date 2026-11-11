@@ -515,6 +515,7 @@ class OkHttpCalDavClientTest {
     fun `updateEvent with null etag falls through to PUT without If-Match when PROPFIND fails`() {
         // Probe fails (server quirk or network error).
         mockServer.enqueue(MockResponse().setResponseCode(500))
+        mockServer.enqueue(MockResponse().setResponseCode(500))
         // PUT proceeds without If-Match (preserves prior best-effort behavior; no regression).
         mockServer.enqueue(MockResponse().setResponseCode(204).addHeader("ETag", "\"new-etag\""))
 
@@ -523,6 +524,7 @@ class OkHttpCalDavClientTest {
         assertIs<CalDavResult.Success<CalDavEvent>>(result)
 
         mockServer.takeRequest()  // skip probe
+        mockServer.takeRequest()  // skip probe retry
         val put = mockServer.takeRequest()
         assertEquals("PUT", put.method)
         assertEquals(null, put.getHeader("If-Match"))
@@ -688,7 +690,7 @@ class OkHttpCalDavClientTest {
 
     @Test
     fun `retries 429 with Retry-After header`() {
-        // 429 with Retry-After: 1 (will be capped to 2s max)
+        // A short Retry-After window is waited out within the read call.
         mockServer.enqueue(MockResponse().setResponseCode(429).addHeader("Retry-After", "1"))
         // Then success (principal discovery)
         enqueuePrincipalResponse()
@@ -878,7 +880,8 @@ class OkHttpCalDavClientTest {
         // PUT response with NO ETag header
         mockServer.enqueue(MockResponse().setResponseCode(201))
 
-        // PROPFIND fails
+        // Both PROPFIND attempts fail.
+        mockServer.enqueue(MockResponse().setResponseCode(500))
         mockServer.enqueue(MockResponse().setResponseCode(500))
 
         val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:fail@test\nSUMMARY:Fail\nEND:VEVENT\nEND:VCALENDAR"

@@ -21,8 +21,17 @@ import java.util.concurrent.ConcurrentHashMap
  */
 sealed class ServiceResult<out T> {
     data class Success<T>(val data: T) : ServiceResult<T>()
-    data class Error(val code: Int, val message: String) : ServiceResult<Nothing>()
+    data class Error(
+        val code: Int,
+        val message: String,
+        val retryAt: Instant? = null
+    ) : ServiceResult<Nothing>()
 }
+
+private fun CalDavResult.Error.toServiceError() = ServiceResult.Error(code, message, retryAt)
+
+private fun refetchError(error: CalDavResult.Error, conflict: ServiceResult.Error): ServiceResult.Error =
+    if (error.retryAt != null) error.toServiceError() else conflict
 
 /**
  * Calendar info for MCP responses.
@@ -144,7 +153,7 @@ class CalendarService(
                 connectionValidated = true
                 ServiceResult.Success(Unit)
             }
-            is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+            is CalDavResult.Error -> result.toServiceError()
         }
     }
 
@@ -236,7 +245,7 @@ class CalendarService(
                 ServiceResult.Success(calendars)
             }
             is CalDavResult.Error -> {
-                ServiceResult.Error(result.code, result.message)
+                result.toServiceError()
             }
         }
     }
@@ -291,7 +300,7 @@ class CalendarService(
                 ServiceResult.Success(events)
             }
             is CalDavResult.Error -> {
-                ServiceResult.Error(result.code, result.message)
+                result.toServiceError()
             }
         }
     }
@@ -390,7 +399,7 @@ class CalendarService(
         // Check if calendar exists and is writable
         val calendarsResult = client.listCalendars()
         if (calendarsResult is CalDavResult.Error) {
-            return ServiceResult.Error(calendarsResult.code, calendarsResult.message)
+            return calendarsResult.toServiceError()
         }
 
         val calendars = (calendarsResult as CalDavResult.Success).data
@@ -443,7 +452,7 @@ class CalendarService(
                 }
             }
             is CalDavResult.Error -> {
-                ServiceResult.Error(result.code, result.message)
+                result.toServiceError()
             }
         }
     }
@@ -574,7 +583,7 @@ class CalendarService(
                         }
                     }
                 }
-                is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+                is CalDavResult.Error -> result.toServiceError()
             }
         }
     }
@@ -597,7 +606,7 @@ class CalendarService(
                 // freshly fetched one (best-effort, matches the create path).
                 is CalDavResult.Success ->
                     ServiceResult.Success(r.data.copy(etag = handle.etag ?: r.data.etag))
-                is CalDavResult.Error -> ServiceResult.Error(r.code, r.message)
+                is CalDavResult.Error -> r.toServiceError()
             }
         }
         val cached = getFromCache(eventId)
@@ -612,8 +621,8 @@ class CalendarService(
      * then surface that second attempt's result. [writeOnce] recomputes its payload
      * purely from the [CalDavEvent] it is handed, so the retry rebuilds against the
      * fresh body (a concurrent EXDATE/exception is not clobbered) and PUTs with the
-     * current etag. A non-412 result, and a failed refetch, surface the first
-     * attempt's result unchanged. No more than one retry.
+     * current etag. A failed refetch carries a backoff deadline when present,
+     * otherwise the original conflict. No more than one retry.
      */
     private fun <T> withStaleEtagRetry(
         target: CalDavEvent,
@@ -623,7 +632,7 @@ class CalendarService(
         if (first !is ServiceResult.Error || first.code != 412) return first
         return when (val fresh = client.getEvent(target.href)) {
             is CalDavResult.Success -> writeOnce(fresh.data)
-            is CalDavResult.Error -> first
+            is CalDavResult.Error -> refetchError(fresh, first)
         }
     }
 
@@ -721,10 +730,10 @@ class CalendarService(
                         // Stale etag: refetch current etag and retry the DELETE once.
                         when (val fresh = client.getEvent(href)) {
                             is CalDavResult.Success -> attempt(fresh.data.etag, allowRetry = false)
-                            is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+                            is CalDavResult.Error -> refetchError(fresh, result.toServiceError())
                         }
                     } else {
-                        ServiceResult.Error(result.code, result.message)
+                        result.toServiceError()
                     }
                 }
             }
@@ -860,7 +869,7 @@ class CalendarService(
         //    original full series untouched.
         val created = when (val c = client.createEvent(calendarIdForHref(base.href), split.newSeries)) {
             is CalDavResult.Success -> c.data
-            is CalDavResult.Error -> return ServiceResult.Error(c.code, c.message)
+            is CalDavResult.Error -> return c.toServiceError()
         }
         addToCache(created.uid, created)
 
@@ -878,21 +887,21 @@ class CalendarService(
                                 val recomputed = try {
                                     patcher.truncateSeries(fresh.data.icalData, recurrenceId)
                                 } catch (e: RuntimeException) {
-                                    return ServiceResult.Error(put.code, put.message)
+                                    return put.toServiceError()
                                 }
                                 putTruncated(fresh.data, recomputed, allowRetry = false)
                             }
-                            is CalDavResult.Error -> ServiceResult.Error(put.code, put.message)
+                            is CalDavResult.Error -> refetchError(fresh, put.toServiceError())
                         }
                     } else {
-                        ServiceResult.Error(put.code, put.message)
+                        put.toServiceError()
                     }
                 }
             }
         }
 
         val truncate = putTruncated(base, split.truncatedMaster, allowRetry = true)
-        if (truncate is ServiceResult.Error) return splitTruncatePartialFailure(truncate.code, truncate.message)
+        if (truncate is ServiceResult.Error) return splitTruncatePartialFailure(truncate)
 
         // The edited occurrence is the continuing series' first instance; report that series.
         val parsed = parser.parse(created.icalData)
@@ -946,10 +955,10 @@ class CalendarService(
                     if (put.code == 412 && allowRetry) {
                         when (val fresh = client.getEvent(target.href)) {
                             is CalDavResult.Success -> attempt(fresh.data, allowRetry = false)
-                            is CalDavResult.Error -> ServiceResult.Error(put.code, put.message)
+                            is CalDavResult.Error -> refetchError(fresh, put.toServiceError())
                         }
                     } else {
-                        ServiceResult.Error(put.code, put.message)
+                        put.toServiceError()
                     }
             }
         }
@@ -957,11 +966,12 @@ class CalendarService(
         return attempt(base, allowRetry = true)
     }
 
-    private fun splitTruncatePartialFailure(code: Int, message: String): ServiceResult.Error = ServiceResult.Error(
-        code,
+    private fun splitTruncatePartialFailure(error: ServiceResult.Error): ServiceResult.Error = ServiceResult.Error(
+        error.code,
         "The continuing series for this and later occurrences was created, but truncating the original " +
-            "series failed: $message. Those occurrences now exist in both series (a duplicate). Re-list " +
-            "with get_events and delete the duplicate future occurrences from the original series."
+            "series failed: ${error.message}. Those occurrences now exist in both series (a duplicate). Re-list " +
+            "with get_events and delete the duplicate future occurrences from the original series.",
+        error.retryAt
     )
 
     /**
@@ -1030,7 +1040,7 @@ class CalendarService(
                     addToCache(updated.uid, updated)
                     ServiceResult.Success(occurrenceEventInfo(updated, ics, recurrenceId))
                 }
-                is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+                is CalDavResult.Error -> result.toServiceError()
             }
         }
     }
@@ -1062,7 +1072,7 @@ class CalendarService(
                     addToCache(result.data.uid, result.data)
                     ServiceResult.Success(Unit)
                 }
-                is CalDavResult.Error -> ServiceResult.Error(result.code, result.message)
+                is CalDavResult.Error -> result.toServiceError()
             }
         }
     }

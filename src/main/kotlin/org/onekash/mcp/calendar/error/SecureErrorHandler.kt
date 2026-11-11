@@ -3,6 +3,9 @@ package org.onekash.mcp.calendar.error
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import org.onekash.mcp.calendar.security.CredentialManager
+import java.time.Clock
+import java.time.Duration
+import java.time.Instant
 
 /**
  * Secure error handling for MCP tool responses.
@@ -122,7 +125,9 @@ object SecureErrorHandler {
     fun createErrorResult(
         code: ErrorCode,
         message: String,
-        details: String? = null
+        details: String? = null,
+        retryAt: Instant? = null,
+        clock: Clock = Clock.systemUTC()
     ): CallToolResult {
         val safeMessage = sanitizeErrorMessage(message)
         val safeDetails = details?.let { sanitizeErrorMessage(it) }
@@ -133,6 +138,11 @@ object SecureErrorHandler {
             append(""""message": "$safeMessage"""")
             if (safeDetails != null) {
                 append(""", "details": "$safeDetails"""")
+            }
+            if (retryAt != null) {
+                val remaining = Duration.between(clock.instant(), retryAt)
+                val seconds = (remaining.seconds + if (remaining.nano > 0) 1 else 0).coerceAtLeast(1)
+                append(""", "retryAt": "$retryAt", "retryAfterSeconds": $seconds""")
             }
             append("}}")
         }
@@ -176,7 +186,12 @@ object SecureErrorHandler {
      * Create error result for service layer errors.
      * Maps HTTP-like status codes to error types.
      */
-    fun serviceError(code: Int, message: String): CallToolResult {
+    fun serviceError(
+        code: Int,
+        message: String,
+        retryAt: Instant? = null,
+        clock: Clock = Clock.systemUTC()
+    ): CallToolResult {
         val errorCode = when (code) {
             400 -> ErrorCode.VALIDATION_ERROR
             401 -> ErrorCode.AUTHENTICATION_ERROR
@@ -188,7 +203,7 @@ object SecureErrorHandler {
             in 500..599 -> ErrorCode.CALDAV_ERROR
             else -> ErrorCode.INTERNAL_ERROR
         }
-        return createErrorResult(errorCode, message)
+        return createErrorResult(errorCode, message, retryAt = retryAt, clock = clock)
     }
 
     /**

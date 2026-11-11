@@ -6,12 +6,12 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import java.io.IOException
 import java.net.SocketTimeoutException
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
+import java.time.Clock
+import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SSLException
 import kotlin.random.Random
 
@@ -30,8 +30,17 @@ import kotlin.random.Random
 class OkHttpCalDavClient(
     private val baseUrl: String,
     private val credentials: CalDavCredentials,
-    private val httpClient: OkHttpClient = createDefaultClient()
+    httpClient: OkHttpClient = createDefaultClient(),
+    private val clock: Clock = Clock.systemUTC(),
+    private val sleep: (Long) -> Unit = Thread::sleep
 ) : CalDavClient, java.io.Closeable {
+
+    private val backoff = CalDavBackoff(clock, sleep)
+    private val httpClient = httpClient.newBuilder().apply {
+        interceptors().add(0, backoff)
+        networkInterceptors().add(0, backoff.networkInterceptor)
+        retryOnConnectionFailure(false)
+    }.build()
 
     private val xmlParser = ICloudXmlParser()
     private val logger = org.slf4j.LoggerFactory.getLogger(OkHttpCalDavClient::class.java)
@@ -44,9 +53,6 @@ class OkHttpCalDavClient(
     private var calendarsCache: List<CalDavCalendar>? = null
     @Volatile
     private var cacheTimestamp: Long = 0L
-
-    // Circuit breaker: consecutive request-level failures
-    private val consecutiveFailures = AtomicInteger(0)
 
     // Well-known discovery cache
     // @Volatile: double-fetch under contention is acceptable (idempotent)
@@ -73,7 +79,7 @@ class OkHttpCalDavClient(
         internal const val MAX_RETRIES = 1
         internal const val BASE_DELAY_MS = 100L
         internal const val MAX_JITTER_MS = 50L
-        /** Cap Retry-After to 2s max — MCP tools must respond quickly */
+        /** Longest backoff window to wait out within one call. */
         internal const val MAX_RETRY_AFTER_MS = 2000L
 
         /** Circuit breaker: consecutive failures before failing fast */
@@ -206,9 +212,14 @@ class OkHttpCalDavClient(
     // ═══════════════════════════════════════════════════════════════════
 
     override fun listCalendars(): CalDavResult<List<CalDavCalendar>> {
+        try {
+            backoff.awaitAdmission()
+        } catch (e: IOException) {
+            return requestFailure(e)
+        }
         // Use cache if available and within TTL
         val cached = calendarsCache
-        if (cached != null && (System.currentTimeMillis() - cacheTimestamp) < CACHE_TTL_MS) {
+        if (cached != null && (clock.millis() - cacheTimestamp) < CACHE_TTL_MS) {
             return CalDavResult.Success(cached)
         }
 
@@ -249,7 +260,7 @@ class OkHttpCalDavClient(
         }
 
         calendarsCache = allCalendars
-        cacheTimestamp = System.currentTimeMillis()
+        cacheTimestamp = clock.millis()
         return CalDavResult.Success(allCalendars)
     }
 
@@ -419,28 +430,17 @@ class OkHttpCalDavClient(
                     .build()
 
                 httpClient.newCall(request).execute().use { response ->
-                    when {
-                        response.code == 401 || response.code == 403 ->
-                            if (response.code == 401) CalDavResult.Error.authError() else CalDavResult.Error.forbiddenError()
-                        response.code !in 200..299 ->
-                            CalDavResult.Error.serverError(response.code)
-                        else -> {
-                            val davHeader = response.header("DAV") ?: ""
-                            if (davHeader.contains("calendar-access")) {
-                                CalDavResult.Success(true)
-                            } else {
-                                CalDavResult.Error.badRequestError(
-                                    "Server does not support CalDAV (missing 'calendar-access' in DAV header)")
-                            }
-                        }
+                    responseError(response)?.let { return@executeWithRetry it }
+                    val davHeader = response.header("DAV") ?: ""
+                    if (davHeader.contains("calendar-access")) {
+                        CalDavResult.Success(true)
+                    } else {
+                        CalDavResult.Error.badRequestError(
+                            "Server does not support CalDAV (missing 'calendar-access' in DAV header)")
                     }
                 }
-            } catch (e: SSLException) {
-                CalDavResult.Error.sslError("SSL error: ${e.message}")
-            } catch (e: SocketTimeoutException) {
-                CalDavResult.Error.timeoutError("Connection timed out")
             } catch (e: Exception) {
-                CalDavResult.Error.networkError("Unable to connect: ${e.message}")
+                requestFailure(e)
             }
         }
     }
@@ -602,26 +602,13 @@ class OkHttpCalDavClient(
      * Returns null if PROPFIND fails or ETag not present.
      */
     private fun fetchEtag(eventUrl: String): String? {
-        return try {
-            val request = Request.Builder()
-                .url(eventUrl)
-                .method("PROPFIND", PROPFIND_ETAG.toRequestBody(XML_MEDIA_TYPE))
-                .addHeader("Authorization", basicAuth())
-                .addHeader("Depth", "0")
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                if (response.code in 200..299 || response.code == 207) {
-                    val body = readBodyWithLimit(response) ?: return null
-                    xmlParser.parseEtag(body)
-                } else {
-                    null
-                }
-            }
-        } catch (e: Exception) {
-            logger.debug("fetchEtag PROPFIND failed for {}: {}", eventUrl, e.toString())
-            null
-        }
+        val request = Request.Builder()
+            .url(eventUrl)
+            .method("PROPFIND", PROPFIND_ETAG.toRequestBody(XML_MEDIA_TYPE))
+            .addHeader("Authorization", basicAuth())
+            .addHeader("Depth", "0")
+            .build()
+        return executeRequest(request) { body -> CalDavResult.Success(xmlParser.parseEtag(body)) }.getOrNull()
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -657,199 +644,95 @@ class OkHttpCalDavClient(
         expectBody: Boolean = true,
         allow404: Boolean = false,
         onSuccess: (String) -> CalDavResult<T>
-    ): CalDavResult<T> {
-        return executeWithRetry {
-            executeSingleRequest(request, expectBody, allow404, onSuccess)
-        }
+    ): CalDavResult<T> = executeWithRetry {
+        executeSingleRequest(request, expectBody, allow404, onSuccess)
     }
 
     private fun <T> executeSingleRequest(
         request: Request,
-        expectBody: Boolean = true,
-        allow404: Boolean = false,
+        expectBody: Boolean,
+        allow404: Boolean,
         onSuccess: (String) -> CalDavResult<T>
-    ): CalDavResult<T> {
-        return try {
-            httpClient.newCall(request).execute().use { response ->
-                val code = response.code
-                val body = readBodyWithLimit(response)
-                    ?: return CalDavResult.Error.payloadTooLargeError("Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
-
-                when {
-                    code in 200..299 || code == 207 -> {
-                        onSuccess(body)
-                    }
-                    code == 404 && allow404 -> {
-                        @Suppress("UNCHECKED_CAST")
-                        CalDavResult.Success(Unit) as CalDavResult<T>
-                    }
-                    code == 401 || code == 403 -> {
-                        if (code == 401) CalDavResult.Error.authError() else CalDavResult.Error.forbiddenError()
-                    }
-                    code == 404 -> {
-                        CalDavResult.Error.notFoundError()
-                    }
-                    code == 412 -> {
-                        CalDavResult.Error.conflictError()
-                    }
-                    code == 429 -> {
-                        val retryAfter = parseRetryAfter(response)
-                        CalDavResult.Error.rateLimitError().also {
-                            retryAfterHint.set(retryAfter)
-                        }
-                    }
-                    code in 500..599 -> {
-                        CalDavResult.Error.serverError(code)
-                    }
-                    else -> {
-                        CalDavResult.Error(code, "Unexpected response: $code", isRetryable = false)
-                    }
-                }
-            }
-        } catch (e: SSLException) {
-            CalDavResult.Error.sslError("SSL error: ${e.message}")
-        } catch (e: SocketTimeoutException) {
-            CalDavResult.Error.timeoutError("Request timed out: ${e.message}")
-        } catch (e: Exception) {
-            CalDavResult.Error.networkError("Network error: ${e.message}")
-        }
+    ): CalDavResult<T> = executeSingleRequestWithHeaders(request, expectBody, allow404) { body, _ ->
+        onSuccess(body)
     }
 
-    /**
-     * Helper for response handling that needs etag from headers.
-     */
     private fun <T> executeRequestWithHeaders(
         request: Request,
         onSuccess: (String, Map<String, String>) -> CalDavResult<T>
-    ): CalDavResult<T> {
-        return executeWithRetry {
-            executeSingleRequestWithHeaders(request, onSuccess)
-        }
+    ): CalDavResult<T> = executeWithRetry {
+        executeSingleRequestWithHeaders(request, onSuccess = onSuccess)
     }
 
     private fun <T> executeSingleRequestWithHeaders(
         request: Request,
+        expectBody: Boolean = true,
+        allow404: Boolean = false,
         onSuccess: (String, Map<String, String>) -> CalDavResult<T>
     ): CalDavResult<T> {
         return try {
             httpClient.newCall(request).execute().use { response ->
-                val code = response.code
-                val body = readBodyWithLimit(response)
-                    ?: return CalDavResult.Error.payloadTooLargeError("Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
-                val headers = response.headers.toMap()
+                if (response.code == 404 && allow404) {
+                    @Suppress("UNCHECKED_CAST")
+                    return CalDavResult.Success(Unit) as CalDavResult<T>
+                }
+                responseError(response)?.let { return it }
+                val body = if (expectBody) readBodyWithLimit(response)
+                    ?: return CalDavResult.Error.payloadTooLargeError(
+                        "Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
+                    else ""
+                onSuccess(body, response.headers.toMap())
+            }
+        } catch (e: Exception) {
+            requestFailure(e)
+        }
+    }
 
-                when {
-                    code in 200..299 || code == 207 -> {
-                        onSuccess(body, headers)
-                    }
-                    code == 401 || code == 403 -> {
-                        if (code == 401) CalDavResult.Error.authError() else CalDavResult.Error.forbiddenError()
-                    }
-                    code == 404 -> {
-                        CalDavResult.Error.notFoundError()
-                    }
-                    code == 412 -> {
-                        CalDavResult.Error.conflictError()
-                    }
-                    code == 429 -> {
-                        val retryAfter = parseRetryAfter(response)
-                        CalDavResult.Error.rateLimitError().also {
-                            retryAfterHint.set(retryAfter)
-                        }
-                    }
-                    code in 500..599 -> {
-                        CalDavResult.Error.serverError(code)
-                    }
-                    else -> {
-                        CalDavResult.Error(code, "Unexpected response: $code", isRetryable = false)
-                    }
+    private fun responseError(response: Response): CalDavResult.Error? {
+        val code = response.code
+        if (code in 200..299) return null
+        val window = response.request.tag(CalDavBackoff.Window::class.java)
+        return when {
+            (code == 429 || code == 503) && window != null -> window.error()
+            code == 401 -> CalDavResult.Error.authError()
+            code == 403 -> CalDavResult.Error.forbiddenError()
+            code == 404 -> CalDavResult.Error.notFoundError()
+            code == 412 -> CalDavResult.Error.conflictError()
+            code == 429 -> CalDavResult.Error.rateLimitError()
+            code in 500..599 -> CalDavResult.Error.serverError(code)
+            else -> CalDavResult.Error(code, "Unexpected response: $code")
+        }
+    }
+
+    private fun requestFailure(exception: Exception): CalDavResult.Error {
+        if (exception is CalDavBackoff.Blocked) return exception.window.error()
+        val cause = if (exception is CalDavBackoff.TransportFailure) exception.failure else exception
+        return when (cause) {
+            is SSLException -> CalDavResult.Error.sslError("SSL error: ${cause.message}")
+            is SocketTimeoutException -> CalDavResult.Error.timeoutError("Request timed out: ${cause.message}")
+            else -> CalDavResult.Error.networkError("Network error: ${cause.message}")
+        }
+    }
+
+    private fun <T> executeWithRetry(block: () -> CalDavResult<T>): CalDavResult<T> {
+        for (attempt in 0..MAX_RETRIES) {
+            val result = block()
+            if (result !is CalDavResult.Error || !result.isRetryable) return result
+            val window = backoff.window()
+            if (window != null && Duration.between(clock.instant(), window.retryAt).toMillis() > MAX_RETRY_AFTER_MS) {
+                return window.error()
+            }
+            if (attempt == MAX_RETRIES) return result
+            if (window == null) {
+                try {
+                    sleep(BASE_DELAY_MS * (1L shl attempt) + Random.nextLong(0, MAX_JITTER_MS))
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return result
                 }
             }
-        } catch (e: SSLException) {
-            CalDavResult.Error.sslError("SSL error: ${e.message}")
-        } catch (e: SocketTimeoutException) {
-            CalDavResult.Error.timeoutError("Request timed out: ${e.message}")
-        } catch (e: Exception) {
-            CalDavResult.Error.networkError("Network error: ${e.message}")
         }
-    }
-
-    // Thread-local Retry-After hint for retry loop
-    private val retryAfterHint = ThreadLocal<Long>()
-
-    /**
-     * Execute with retry: exponential backoff + jitter.
-     * Max 2 retries. Only retries when result.isRetryable.
-     * Respects Retry-After header (capped at 10s).
-     * Circuit breaker: fails fast after CIRCUIT_BREAKER_THRESHOLD consecutive failures.
-     */
-    private fun <T> executeWithRetry(block: () -> CalDavResult<T>): CalDavResult<T> {
-        // Circuit breaker check
-        if (consecutiveFailures.get() >= CIRCUIT_BREAKER_THRESHOLD) {
-            return CalDavResult.Error(503, "Circuit breaker open: too many consecutive failures", isRetryable = false)
-        }
-
-        var lastResult: CalDavResult<T>? = null
-
-        for (attempt in 0..MAX_RETRIES) {
-            retryAfterHint.remove()
-            val result = block()
-
-            if (result is CalDavResult.Success) {
-                consecutiveFailures.set(0) // Reset on success
-                return result
-            }
-
-            lastResult = result
-            val error = result as CalDavResult.Error
-
-            // Don't retry non-retryable errors
-            if (!error.isRetryable) {
-                consecutiveFailures.incrementAndGet()
-                return result
-            }
-
-            // Don't retry after last attempt
-            if (attempt == MAX_RETRIES) break
-
-            // Calculate delay
-            val retryAfterMs = (retryAfterHint.get() ?: 0L)
-            val backoffMs = BASE_DELAY_MS * (1L shl attempt) // exponential: 500, 1000
-            val jitterMs = Random.nextLong(0, MAX_JITTER_MS)
-            val delayMs = maxOf(backoffMs + jitterMs, retryAfterMs)
-
-            try {
-                Thread.sleep(delayMs)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                break
-            }
-        }
-
-        consecutiveFailures.incrementAndGet()
-        return lastResult ?: CalDavResult.Error.networkError("Request failed after retries")
-    }
-
-    /**
-     * Parse Retry-After header: supports seconds (integer) and HTTP-date (RFC 7231).
-     * Returns delay in milliseconds, capped at MAX_RETRY_AFTER_MS for MCP responsiveness.
-     */
-    internal fun parseRetryAfter(response: Response): Long {
-        val header = response.header("Retry-After") ?: return 0L
-
-        // Try as integer (seconds)
-        header.toLongOrNull()?.let { seconds ->
-            return minOf(seconds * 1000, MAX_RETRY_AFTER_MS)
-        }
-
-        // Try as HTTP-date (RFC 7231)
-        return try {
-            val date = ZonedDateTime.parse(header, DateTimeFormatter.RFC_1123_DATE_TIME)
-            val delayMs = date.toInstant().toEpochMilli() - System.currentTimeMillis()
-            minOf(maxOf(delayMs, 0), MAX_RETRY_AFTER_MS)
-        } catch (_: Exception) {
-            0L
-        }
+        error("Retry loop must return a result")
     }
 
     private fun okhttp3.Headers.toMap(): Map<String, String> {
