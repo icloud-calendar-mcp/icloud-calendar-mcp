@@ -304,6 +304,55 @@ class CalDavRecoveryTest {
     }
 
     @Test
+    fun `mutations send once and distinguish unknown outcome from not applied`() {
+        for (method in listOf("PUT", "DELETE")) for (response in listOf("500", "timeout", "throttled", "zero")) {
+            MockWebServer().use { server ->
+                val clock = CalDavTestClock()
+                client(server, clock).use { client ->
+                    server.enqueue(when (response) {
+                        "timeout" -> MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)
+                        "throttled" -> MockResponse().setResponseCode(503).addHeader("Retry-After", "1595")
+                        "zero" -> MockResponse().setResponseCode(503).addHeader("Retry-After", "0")
+                        else -> MockResponse().setResponseCode(500)
+                    })
+                    val result = assertIs<CalDavResult.Error>(if (method == "PUT")
+                        client.updateEvent("/event.ics", ics, "etag") else client.deleteEvent("/event.ics", "etag"))
+                    assertEquals(1, server.requestCount, "$method $response")
+                    if (response == "throttled" || response == "zero") {
+                        assertEquals(429, result.code)
+                        assertEquals(clock.instant().plusSeconds(if (response == "zero") 0 else 1595), result.retryAt)
+                        assertTrue(result.message.contains("not applied"))
+                    } else {
+                        assertFalse(result.isRetryable)
+                        assertTrue(result.message.contains("may have been applied"))
+                        assertTrue(result.message.contains("read back", ignoreCase = true))
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `mutation TLS failures report an unknown outcome without retrying`() {
+        for (method in listOf("PUT", "DELETE")) MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            val attempts = AtomicInteger()
+            val http = OkHttpClient.Builder().addInterceptor {
+                attempts.incrementAndGet()
+                throw SSLException("TLS transport failed")
+            }.build()
+            client(server, clock, http).use { client ->
+                val result = assertIs<CalDavResult.Error>(if (method == "PUT")
+                    client.updateEvent("/event.ics", ics, "etag") else client.deleteEvent("/event.ics", "etag"))
+                assertEquals(1, attempts.get())
+                assertFalse(result.isRetryable)
+                assertTrue(result.message.contains("may have been applied"))
+                assertTrue(result.message.contains("Read back"))
+            }
+        }
+    }
+
+    @Test
     fun `body timeouts count before successful headers reset the breaker`() {
         MockWebServer().use { server ->
             val clock = CalDavTestClock()

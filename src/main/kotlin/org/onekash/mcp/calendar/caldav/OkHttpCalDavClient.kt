@@ -4,8 +4,10 @@ import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okio.BufferedSink
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Clock
@@ -41,6 +43,7 @@ class OkHttpCalDavClient(
         networkInterceptors().add(0, backoff.networkInterceptor)
         retryOnConnectionFailure(false)
     }.build()
+    private val mutationClient = this.httpClient.newBuilder().followRedirects(false).build()
 
     private val xmlParser = ICloudXmlParser()
     private val logger = org.slf4j.LoggerFactory.getLogger(OkHttpCalDavClient::class.java)
@@ -326,7 +329,7 @@ class OkHttpCalDavClient(
     override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
         // Ensure we have calendar info
         val calendarsResult = listCalendars()
-        if (calendarsResult is CalDavResult.Error) return calendarsResult
+        if (calendarsResult is CalDavResult.Error) return notApplied(calendarsResult)
 
         val calendars = (calendarsResult as CalDavResult.Success).data
         val calendar = calendars.find { it.id == calendarId }
@@ -639,12 +642,14 @@ class OkHttpCalDavClient(
         return body.string()
     }
 
+    private fun Request.isMutation() = method == "PUT" || method == "DELETE"
+
     private fun <T> executeRequest(
         request: Request,
         expectBody: Boolean = true,
         allow404: Boolean = false,
         onSuccess: (String) -> CalDavResult<T>
-    ): CalDavResult<T> = executeWithRetry {
+    ): CalDavResult<T> = executeWithRetry(readOnly = !request.isMutation()) {
         executeSingleRequest(request, expectBody, allow404, onSuccess)
     }
 
@@ -660,7 +665,7 @@ class OkHttpCalDavClient(
     private fun <T> executeRequestWithHeaders(
         request: Request,
         onSuccess: (String, Map<String, String>) -> CalDavResult<T>
-    ): CalDavResult<T> = executeWithRetry {
+    ): CalDavResult<T> = executeWithRetry(readOnly = !request.isMutation()) {
         executeSingleRequestWithHeaders(request, onSuccess = onSuccess)
     }
 
@@ -671,12 +676,23 @@ class OkHttpCalDavClient(
         onSuccess: (String, Map<String, String>) -> CalDavResult<T>
     ): CalDavResult<T> {
         return try {
-            httpClient.newCall(request).execute().use { response ->
+            val call = if (request.isMutation()) {
+                // Disable automatic replays for PUT and DELETE.
+                val body = request.body ?: ByteArray(0).toRequestBody()
+                val oneShot = object : RequestBody() {
+                    override fun contentType() = body.contentType()
+                    override fun contentLength() = body.contentLength()
+                    override fun writeTo(sink: BufferedSink) = body.writeTo(sink)
+                    override fun isOneShot() = true
+                }
+                mutationClient.newCall(request.newBuilder().method(request.method, oneShot).build())
+            } else httpClient.newCall(request)
+            call.execute().use { response ->
                 if (response.code == 404 && allow404) {
                     @Suppress("UNCHECKED_CAST")
                     return CalDavResult.Success(Unit) as CalDavResult<T>
                 }
-                responseError(response)?.let { return it }
+                responseError(response, request.isMutation())?.let { return it }
                 val body = if (expectBody) readBodyWithLimit(response)
                     ?: return CalDavResult.Error.payloadTooLargeError(
                         "Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
@@ -684,15 +700,18 @@ class OkHttpCalDavClient(
                 onSuccess(body, response.headers.toMap())
             }
         } catch (e: Exception) {
-            requestFailure(e)
+            requestFailure(e, request.isMutation())
         }
     }
 
-    private fun responseError(response: Response): CalDavResult.Error? {
+    private fun responseError(
+        response: Response,
+        mutation: Boolean = false
+    ): CalDavResult.Error? {
         val code = response.code
         if (code in 200..299) return null
         val window = response.request.tag(CalDavBackoff.Window::class.java)
-        return when {
+        val error = when {
             (code == 429 || code == 503) && window != null -> window.error()
             code == 401 -> CalDavResult.Error.authError()
             code == 403 -> CalDavResult.Error.forbiddenError()
@@ -702,22 +721,43 @@ class OkHttpCalDavClient(
             code in 500..599 -> CalDavResult.Error.serverError(code)
             else -> CalDavResult.Error(code, "Unexpected response: $code")
         }
+        return when {
+            mutation && code in 500..599 && backoff.retryAfter(response) == null -> unknownOutcome(error)
+            mutation && error.retryAt != null -> notApplied(error)
+            else -> error
+        }
     }
 
-    private fun requestFailure(exception: Exception): CalDavResult.Error {
-        if (exception is CalDavBackoff.Blocked) return exception.window.error()
+    private fun requestFailure(exception: Exception, mutation: Boolean = false): CalDavResult.Error {
+        if (exception is CalDavBackoff.Blocked) {
+            val error = exception.window.error()
+            return if (mutation) notApplied(error) else error
+        }
         val cause = if (exception is CalDavBackoff.TransportFailure) exception.failure else exception
-        return when (cause) {
+        val error = when (cause) {
             is SSLException -> CalDavResult.Error.sslError("SSL error: ${cause.message}")
             is SocketTimeoutException -> CalDavResult.Error.timeoutError("Request timed out: ${cause.message}")
             else -> CalDavResult.Error.networkError("Network error: ${cause.message}")
         }
+        return if (mutation && cause is IOException) unknownOutcome(error) else error
     }
 
-    private fun <T> executeWithRetry(block: () -> CalDavResult<T>): CalDavResult<T> {
-        for (attempt in 0..MAX_RETRIES) {
+    private fun notApplied(error: CalDavResult.Error) = error.copy(
+        message = "Mutation not applied. ${error.message}"
+    )
+
+    private fun unknownOutcome(error: CalDavResult.Error) = error.copy(
+        message = "Mutation may have been applied. Read back the event before retrying. ${error.message}",
+        isRetryable = false
+    )
+
+    private fun <T> executeWithRetry(
+        readOnly: Boolean = true,
+        block: () -> CalDavResult<T>
+    ): CalDavResult<T> {
+        for (attempt in 0..if (readOnly) MAX_RETRIES else 0) {
             val result = block()
-            if (result !is CalDavResult.Error || !result.isRetryable) return result
+            if (result !is CalDavResult.Error || !result.isRetryable || !readOnly) return result
             val window = backoff.window()
             if (window != null && Duration.between(clock.instant(), window.retryAt).toMillis() > MAX_RETRY_AFTER_MS) {
                 return window.error()
