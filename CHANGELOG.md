@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retryAfterSeconds; breaker cooldowns return CALDAV_ERROR with the deadline.
 - Send PUT and DELETE once per call. Report whether a blocked write was not
   applied or an uncertain write needs to be read back before retrying.
+- Report refused discovery credentials as AUTH_ERROR and return failed calendar
+  listings without caching an empty result.
 
 ## [3.2.0] - 2026-08-14
 

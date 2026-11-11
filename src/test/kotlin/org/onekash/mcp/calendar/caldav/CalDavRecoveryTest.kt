@@ -353,6 +353,97 @@ class CalDavRecoveryTest {
     }
 
     @Test
+    fun `authentication failures do not open breaker and event 403 stays forbidden`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                repeat(5) {
+                    server.enqueue(MockResponse().setResponseCode(401))
+                    error(client.listCalendars(), 401)
+                }
+                server.enqueue(MockResponse().setResponseCode(403))
+                error(client.listCalendars(), 401)
+                server.enqueue(MockResponse().setResponseCode(403))
+                error(client.checkConnection(), 401)
+                server.enqueue(MockResponse().setResponseCode(403))
+                error(client.getEvent("/event.ics"), 403)
+                assertEquals(8, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `calendar list throttle is returned uncached`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                server.enqueue(MockResponse().setResponseCode(207).setBody("""
+                    <D:multistatus xmlns:D="DAV:"><D:response><D:propstat><D:prop>
+                    <D:current-user-principal><D:href>/p/</D:href></D:current-user-principal>
+                    </D:prop></D:propstat></D:response></D:multistatus>
+                """.trimIndent()))
+                server.enqueue(MockResponse().setResponseCode(207).setBody("""
+                    <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+                    <D:response><D:propstat><D:prop><C:calendar-home-set><D:href>/cal/</D:href>
+                    </C:calendar-home-set></D:prop></D:propstat></D:response></D:multistatus>
+                """.trimIndent()))
+                server.enqueue(MockResponse().setResponseCode(503).addHeader("Retry-After", "1595"))
+                error(client.listCalendars(), 429, clock.instant().plusSeconds(1595))
+                clock.advance(1595)
+                discover(server, client)
+                assertEquals(6, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `well-known transient failure is not cached`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            OkHttpCalDavClient(server.url("/").toString().trimEnd('/'),
+                CalDavCredentials("test", "password"), clock = clock, sleep = clock::sleep).use { client ->
+                server.enqueue(MockResponse().setResponseCode(503).addHeader("Retry-After", "1595"))
+                error(client.listCalendars(), 429, clock.instant().plusSeconds(1595))
+                assertEquals(1, server.requestCount)
+                clock.advance(1595)
+                server.enqueue(MockResponse().setResponseCode(404))
+                discover(server, client)
+                assertEquals("/.well-known/caldav", server.takeRequest().path)
+                assertEquals("/.well-known/caldav", server.takeRequest().path)
+            }
+        }
+    }
+
+    @Test
+    fun `well-known GET waits out short windows and ETag PROPFIND retries once`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            OkHttpCalDavClient(server.url("/").toString().trimEnd('/'), CalDavCredentials("test", "password"),
+                clock = clock, sleep = clock::sleep).use { client ->
+                server.enqueue(MockResponse().setResponseCode(503).addHeader("Retry-After", "1"))
+                server.enqueue(MockResponse().setResponseCode(404))
+                discover(server, client)
+                assertEquals(listOf(1000L), clock.sleeps)
+                assertEquals(5, server.requestCount)
+            }
+        }
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                server.enqueue(MockResponse().setResponseCode(500))
+                server.enqueue(MockResponse().setResponseCode(207).setBody("""
+                    <D:multistatus xmlns:D="DAV:"><D:response><D:propstat><D:prop>
+                    <D:getetag>recovered</D:getetag></D:prop></D:propstat></D:response></D:multistatus>
+                """.trimIndent()))
+                server.enqueue(MockResponse().setResponseCode(204).addHeader("ETag", "updated"))
+                assertIs<CalDavResult.Success<CalDavEvent>>(client.updateEvent("/event.ics", ics, null))
+                assertEquals(listOf("PROPFIND", "PROPFIND", "PUT"), (1..3).map { server.takeRequest().method })
+                assertEquals(3, server.requestCount)
+            }
+        }
+    }
+
+    @Test
     fun `body timeouts count before successful headers reset the breaker`() {
         MockWebServer().use { server ->
             val clock = CalDavTestClock()

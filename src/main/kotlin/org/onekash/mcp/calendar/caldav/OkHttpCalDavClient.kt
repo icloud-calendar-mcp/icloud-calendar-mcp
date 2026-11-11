@@ -227,7 +227,9 @@ class OkHttpCalDavClient(
         }
 
         // Try well-known discovery for CalDAV endpoint (RFC 6764)
-        val effectiveBaseUrl = discoverWellKnown() ?: baseUrl
+        val discovery = discoverWellKnown()
+        if (discovery is CalDavResult.Error) return discovery
+        val effectiveBaseUrl = (discovery as CalDavResult.Success).data ?: baseUrl
 
         // Step 1: Get current user principal
         val principalResult = discoverPrincipal(effectiveBaseUrl)
@@ -253,6 +255,10 @@ class OkHttpCalDavClient(
 
         for (homeSet in homeSets) {
             val calendarsResult = fetchCalendars(homeSet)
+            if (calendarsResult is CalDavResult.Error &&
+                (calendarsResult.isRetryable || calendarsResult.isAuthError || calendarsResult.code == 0)) {
+                return calendarsResult
+            }
             if (calendarsResult is CalDavResult.Success) {
                 for (cal in calendarsResult.data) {
                     if (seenHrefs.add(cal.href)) {
@@ -433,7 +439,7 @@ class OkHttpCalDavClient(
                     .build()
 
                 httpClient.newCall(request).execute().use { response ->
-                    responseError(response)?.let { return@executeWithRetry it }
+                    responseError(response, authentication = true)?.let { return@executeWithRetry it }
                     val davHeader = response.header("DAV") ?: ""
                     if (davHeader.contains("calendar-access")) {
                         CalDavResult.Success(true)
@@ -493,7 +499,7 @@ class OkHttpCalDavClient(
             .addHeader("Depth", "0")
             .build()
 
-        return executeRequest(request) { responseBody ->
+        return executeRequest(request, authentication = true) { responseBody ->
             val principal = xmlParser.parseCurrentUserPrincipal(responseBody)
             CalDavResult.Success(principal)
         }
@@ -509,7 +515,7 @@ class OkHttpCalDavClient(
             .addHeader("Depth", "0")
             .build()
 
-        return executeRequest(request) { responseBody ->
+        return executeRequest(request, authentication = true) { responseBody ->
             val homeSets = xmlParser.parseCalendarHomeSets(responseBody)
             CalDavResult.Success(homeSets)
         }
@@ -525,7 +531,7 @@ class OkHttpCalDavClient(
             .addHeader("Depth", "1")
             .build()
 
-        return executeRequest(request) { responseBody ->
+        return executeRequest(request, authentication = true) { responseBody ->
             val calendars = xmlParser.parseCalendars(responseBody, baseUrl)
             CalDavResult.Success(calendars)
         }
@@ -537,11 +543,12 @@ class OkHttpCalDavClient(
      * to discover the CalDAV endpoint URL.
      *
      * Returns the discovered URL, or null if well-known is not supported.
-     * Result is cached (only attempted once per client lifetime).
+     * Cache successful discovery and permanent absence, leaving transient failures retryable.
      */
-    private fun discoverWellKnown(): String? {
-        if (wellKnownAttempted) return discoveredBaseUrl
-        wellKnownAttempted = true // Double-fetch OK (idempotent)
+    private fun discoverWellKnown(): CalDavResult<String?> = executeWithRetry { discoverWellKnownOnce() }
+
+    private fun discoverWellKnownOnce(): CalDavResult<String?> {
+        if (wellKnownAttempted) return CalDavResult.Success(discoveredBaseUrl)
 
         try {
             val url = "${baseUrl.trimEnd('/')}/.well-known/caldav"
@@ -554,7 +561,8 @@ class OkHttpCalDavClient(
 
             for (hop in 0 until MAX_WELL_KNOWN_HOPS) {
                 if (!visited.add(currentUrl)) {
-                    return null // Loop detected
+                    wellKnownAttempted = true
+                    return CalDavResult.Success(null)
                 }
 
                 val request = Request.Builder()
@@ -564,11 +572,14 @@ class OkHttpCalDavClient(
                     .build()
 
                 noRedirectClient.newCall(request).execute().use { response ->
+                    val error = responseError(response, authentication = true)
+                    if (error != null && (error.isRetryable || error.isAuthError)) return error
                     when (response.code) {
                         301, 302, 307, 308 -> {
-                            val location = response.header("Location") ?: return null
+                            val location = response.header("Location")
+                                ?: return CalDavResult.Success(null).also { wellKnownAttempted = true }
                             val resolved = response.request.url.resolve(location)?.toString()
-                                ?: return null
+                                ?: return CalDavResult.Success(null).also { wellKnownAttempted = true }
 
                             // Preserve HTTPS: reject downgrade to HTTP
                             currentUrl = if (baseUrl.startsWith("https://") && resolved.startsWith("http://")) {
@@ -579,17 +590,19 @@ class OkHttpCalDavClient(
                         }
                         in 200..299, 207 -> {
                             discoveredBaseUrl = currentUrl
-                            return currentUrl
+                            wellKnownAttempted = true
+                            return CalDavResult.Success(currentUrl)
                         }
-                        else -> return null // 404 or other error
+                        else -> return CalDavResult.Success(null).also { wellKnownAttempted = true }
                     }
                 }
             }
 
-            return null // Max hops exceeded
+            wellKnownAttempted = true
+            return CalDavResult.Success(null)
         } catch (e: Exception) {
             logger.debug("well-known discovery failed for {}/.well-known/caldav: {}", baseUrl.trimEnd('/'), e.toString())
-            return null // Well-known discovery is best-effort
+            return requestFailure(e)
         }
     }
 
@@ -648,17 +661,19 @@ class OkHttpCalDavClient(
         request: Request,
         expectBody: Boolean = true,
         allow404: Boolean = false,
+        authentication: Boolean = false,
         onSuccess: (String) -> CalDavResult<T>
     ): CalDavResult<T> = executeWithRetry(readOnly = !request.isMutation()) {
-        executeSingleRequest(request, expectBody, allow404, onSuccess)
+        executeSingleRequest(request, expectBody, allow404, authentication, onSuccess)
     }
 
     private fun <T> executeSingleRequest(
         request: Request,
         expectBody: Boolean,
         allow404: Boolean,
+        authentication: Boolean,
         onSuccess: (String) -> CalDavResult<T>
-    ): CalDavResult<T> = executeSingleRequestWithHeaders(request, expectBody, allow404) { body, _ ->
+    ): CalDavResult<T> = executeSingleRequestWithHeaders(request, expectBody, allow404, authentication) { body, _ ->
         onSuccess(body)
     }
 
@@ -673,6 +688,7 @@ class OkHttpCalDavClient(
         request: Request,
         expectBody: Boolean = true,
         allow404: Boolean = false,
+        authentication: Boolean = false,
         onSuccess: (String, Map<String, String>) -> CalDavResult<T>
     ): CalDavResult<T> {
         return try {
@@ -692,7 +708,7 @@ class OkHttpCalDavClient(
                     @Suppress("UNCHECKED_CAST")
                     return CalDavResult.Success(Unit) as CalDavResult<T>
                 }
-                responseError(response, request.isMutation())?.let { return it }
+                responseError(response, authentication, request.isMutation())?.let { return it }
                 val body = if (expectBody) readBodyWithLimit(response)
                     ?: return CalDavResult.Error.payloadTooLargeError(
                         "Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
@@ -706,6 +722,7 @@ class OkHttpCalDavClient(
 
     private fun responseError(
         response: Response,
+        authentication: Boolean = false,
         mutation: Boolean = false
     ): CalDavResult.Error? {
         val code = response.code
@@ -713,7 +730,7 @@ class OkHttpCalDavClient(
         val window = response.request.tag(CalDavBackoff.Window::class.java)
         val error = when {
             (code == 429 || code == 503) && window != null -> window.error()
-            code == 401 -> CalDavResult.Error.authError()
+            code == 401 || (code == 403 && authentication) -> CalDavResult.Error.authError()
             code == 403 -> CalDavResult.Error.forbiddenError()
             code == 404 -> CalDavResult.Error.notFoundError()
             code == 412 -> CalDavResult.Error.conflictError()

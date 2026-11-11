@@ -563,12 +563,13 @@ class OkHttpCalDavClientTest {
     }
 
     @Test
-    fun `handles 403 forbidden`() {
+    fun `handles discovery 403 as authentication refusal`() {
         mockServer.enqueue(MockResponse().setResponseCode(403))
 
         val result = client.listCalendars()
 
         assertIs<CalDavResult.Error>(result)
+        assertEquals(401, result.code)
         assertTrue(result.isAuthError)
         assertFalse(result.isRetryable)
     }
@@ -663,15 +664,13 @@ class OkHttpCalDavClientTest {
     }
 
     @Test
-    fun `does not retry SSL errors`() {
-        // We can't easily simulate SSL errors with MockWebServer,
-        // but we test the error classification in executeSingleRequest
-        // by checking that 401/403 are not retried (proxy for non-retryable)
+    fun `does not retry discovery 403`() {
         mockServer.enqueue(MockResponse().setResponseCode(403))
 
         val result = client.listCalendars()
 
         assertIs<CalDavResult.Error>(result)
+        assertEquals(401, result.code)
         assertEquals(1, mockServer.requestCount)
     }
 
