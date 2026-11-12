@@ -73,7 +73,15 @@ data class ICalJournal(
     val classification: String? = null,
 
     /** Preserve unknown properties for round-trip fidelity */
-    val rawProperties: Map<String, String> = emptyMap()
+    val rawProperties: Map<String, String> = emptyMap(),
+
+    /**
+     * Unknown properties as the original, unfolded content lines, in document order. Filled by
+     * the parser; written back unchanged by the generator (RFC 5545 3.2.20). When this is
+     * non-empty the generator writes these lines and ignores [rawProperties], so add to the map
+     * only on components without lines.
+     */
+    val unknownPropertyLines: List<String> = emptyList()
 ) {
     /**
      * Generate importId for a journal.

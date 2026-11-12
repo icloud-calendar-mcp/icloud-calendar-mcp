@@ -50,3 +50,9 @@ __pycache__/
 
 # MCP registry publisher tokens (secrets)
 .mcpregistry_*
+
+# Local copies of the RFC texts cited by property tests and code comments
+rfcs/
+
+# Kotlin 2.x daemon session files
+.kotlin/

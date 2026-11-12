@@ -47,6 +47,13 @@ private val rateLimiter = RateLimiter(readLimit = 60, writeLimit = 20, windowMs 
 // iCloud CalDAV base URL
 private const val ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
 
+/** The accepted rdates/exdates value forms, shared by the create_event and update_event schemas. */
+private const val RECURRENCE_DATE_FORMS =
+    "Each value is one of: a UTC instant ending in Z (e.g. 2026-08-05T13:00:00Z, which is 09:00 America/New_York " +
+        "in summer); a local date-time read in the event's zone (2026-08-05T09:00:00); or a date (2026-08-05), " +
+        "which on a timed series means that day's occurrence. A date is not accepted on a series with several " +
+        "occurrences per day: give that occurrence's exact start."
+
 /**
  * The MCP serverInfo version, read from the JAR manifest's Implementation-Version
  * (set from build.gradle.kts by the fatJar task). Returns "dev" when running
@@ -480,12 +487,12 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 })
                 put("rdates", buildJsonObject {
                     put("type", JsonPrimitive("array"))
-                    put("description", JsonPrimitive("Optional additional occurrence dates (RFC 5545 RDATE). ISO 8601 instants for timed events; YYYY-MM-DD for all-day. One value per array element."))
+                    put("description", JsonPrimitive("Optional additional occurrence dates (RFC 5545 RDATE). $RECURRENCE_DATE_FORMS One value per array element."))
                     put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
                 })
                 put("exdates", buildJsonObject {
                     put("type", JsonPrimitive("array"))
-                    put("description", JsonPrimitive("Optional excluded occurrence dates (RFC 5545 EXDATE). Same format as rdates."))
+                    put("description", JsonPrimitive("Optional excluded occurrence dates (RFC 5545 EXDATE). Same forms as rdates. On a series with several occurrences per day, an exdate removes only the occurrence at its exact start."))
                     put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
                 })
                 put("alarms", buildJsonObject {
@@ -721,12 +728,12 @@ internal fun registerTools(server: Server, calendarService: CalendarService?, lo
                 })
                 put("rdates", buildJsonObject {
                     put("type", JsonPrimitive("array"))
-                    put("description", JsonPrimitive("Replace additional occurrence dates (RFC 5545 RDATE). ISO 8601 instants for timed; YYYY-MM-DD for all-day. Pass null/omit to leave existing untouched; pass empty array to clear."))
+                    put("description", JsonPrimitive("Replace additional occurrence dates (RFC 5545 RDATE). $RECURRENCE_DATE_FORMS Pass null/omit to leave existing untouched; pass empty array to clear."))
                     put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
                 })
                 put("exdates", buildJsonObject {
                     put("type", JsonPrimitive("array"))
-                    put("description", JsonPrimitive("Replace excluded occurrence dates (RFC 5545 EXDATE). Same semantics as rdates."))
+                    put("description", JsonPrimitive("Replace excluded occurrence dates (RFC 5545 EXDATE). Same forms and semantics as rdates. On a series with several occurrences per day, an exdate removes only the occurrence at its exact start, and moving that series' time does not move its exdates: resend them."))
                     put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
                 })
                 put("alarms", buildJsonObject {

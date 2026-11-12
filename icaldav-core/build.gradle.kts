@@ -2,6 +2,8 @@ import java.util.TimeZone
 
 plugins {
     kotlin("jvm") version libs.versions.kotlin
+    // Shares the property-test harness (testutil.PropertyRuns) with the root module's tests.
+    `java-test-fixtures`
 }
 
 repositories {
@@ -10,9 +12,9 @@ repositories {
 
 dependencies {
     // iCalendar parsing - handles RFC 5545 compliance.
-    // ical4j 4.3.0 is deliberately confined to THIS subproject; the MCP's own
+    // ical4j 4.4.0 is deliberately confined to THIS subproject; the MCP's own
     // source depends on :icaldav-core, never on ical4j directly.
-    implementation("org.mnode.ical4j:ical4j:4.3.0")
+    implementation("org.mnode.ical4j:ical4j:4.4.0")
 
     // Kotlin coroutines (aligned with the root version catalog)
     implementation(libs.kotlinx.coroutines.core)
@@ -22,6 +24,20 @@ dependencies {
     testImplementation(kotlin("test"))
     testImplementation(libs.mockk)
     testImplementation(libs.kotlinx.coroutines.test)
+
+    // Property tests (checkAll, generators, shrinking) through testutil.PropertyRuns, run from
+    // JUnit 5 tests. The excluded modules aren't needed by checkAll: a bytecode agent with native
+    // access (kotlinx-coroutines-debug pulls byte-buddy and jna), classpath scanning (classgraph),
+    // an XML serialization stack (xmlutil), regex-driven generators (rgxgen, for
+    // Arb.stringPattern) and assertion diffs (java-diff-utils, for Kotest's matchers).
+    testFixturesApi(libs.kotest.property) {
+        exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-debug")
+        exclude(group = "io.github.pdvrieze.xmlutil")
+        exclude(group = "io.github.classgraph")
+        exclude(group = "com.github.curious-odd-man")
+        exclude(group = "community.flock.kotlinx.rgxgen")
+        exclude(group = "io.github.java-diff-utils")
+    }
 }
 
 java {
@@ -50,4 +66,13 @@ tasks.withType<Test> {
         System.getProperty("user.timezone")?.takeIf { it.isNotBlank() }
             ?: TimeZone.getDefault().id
     )
+    // Property tests (testutil.PropertyRuns): -PpropertySeed=<seed>|random replays a printed seed
+    // or draws a new one, -PpropertyIterations=<n> multiplies the iterations. Never up to date
+    // while set, so a repeated random run draws again.
+    listOf("propertySeed", "propertyIterations").forEach { key ->
+        if (project.hasProperty(key)) {
+            systemProperty(key, project.property(key).toString())
+            outputs.upToDateWhen { false }
+        }
+    }
 }

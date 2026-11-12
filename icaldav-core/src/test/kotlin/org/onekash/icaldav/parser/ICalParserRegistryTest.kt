@@ -214,14 +214,13 @@ class ICalParserRegistryTest {
         fun `parser accepts mock registry for testing`() {
             // Create a mock registry for testing
             val mockRegistry = object : TimeZoneRegistry {
-                override fun getTimeZone(id: String?): TimeZone? = null
-                override fun register(timezone: TimeZone?) {}
-                override fun register(timezone: TimeZone?, update: Boolean) {}
+                override fun getTimeZone(id: String): TimeZone? = null
+                override fun register(timezone: TimeZone) {}
+                override fun register(timezone: TimeZone, update: Boolean) {}
                 override fun clear() {}
                 override fun getZoneRules(): Map<String, ZoneRules> = emptyMap()
-                override fun getZoneId(tzId: String?): ZoneId? =
-                    if (tzId != null) ZoneId.of(tzId) else null
-                override fun getTzId(zoneId: String?): String? = zoneId
+                override fun getZoneId(tzId: String): ZoneId = ZoneId.of(tzId)
+                override fun getTzId(zoneId: String): String = zoneId
             }
 
             // Verify parser can be created with custom registry and parsing works

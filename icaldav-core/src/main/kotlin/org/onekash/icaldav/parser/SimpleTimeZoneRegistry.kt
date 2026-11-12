@@ -3,6 +3,7 @@ package org.onekash.icaldav.parser
 import net.fortuna.ical4j.model.TimeZone
 import net.fortuna.ical4j.model.TimeZoneRegistry
 import org.onekash.icaldav.model.ICalDateTime
+import java.time.DateTimeException
 import java.time.ZoneId
 import java.time.zone.ZoneRules
 
@@ -24,19 +25,19 @@ class SimpleTimeZoneRegistry : TimeZoneRegistry {
      * Returns null - ical4j will handle dates using embedded VTIMEZONE definitions
      * in the iCalendar data or fall back to system timezone handling.
      */
-    override fun getTimeZone(id: String?): TimeZone? = null
+    override fun getTimeZone(id: String): TimeZone? = null
 
     /**
      * No-op - we don't maintain a registry of custom timezones.
      */
-    override fun register(timezone: TimeZone?) {
+    override fun register(timezone: TimeZone) {
         // No-op: We don't store custom timezone definitions
     }
 
     /**
      * No-op - we don't maintain a registry of custom timezones.
      */
-    override fun register(timezone: TimeZone?, update: Boolean) {
+    override fun register(timezone: TimeZone, update: Boolean) {
         // No-op: We don't store custom timezone definitions
     }
 
@@ -57,10 +58,14 @@ class SimpleTimeZoneRegistry : TimeZoneRegistry {
      * Converts timezone ID string to ZoneId using Java's built-in support.
      * ZoneId.of() is supported on Android via desugaring.
      *
-     * Returns null if the timezone ID is invalid or not recognized.
+     * Throws [DateTimeException] for a blank or unrecognized ID, as ical4j's own registry does
+     * (ical4j 4.4.0's TimeZoneRegistry is null-marked, so null is not a valid answer).
      */
-    override fun getZoneId(tzId: String?): ZoneId? {
-        if (tzId.isNullOrBlank()) return null
+    override fun getZoneId(tzId: String): ZoneId =
+        resolve(tzId) ?: throw DateTimeException("Unknown timezone identifier [$tzId]")
+
+    private fun resolve(tzId: String): ZoneId? {
+        if (tzId.isBlank()) return null
         return try {
             ZoneId.of(tzId)
         } catch (_: Exception) {
@@ -78,7 +83,7 @@ class SimpleTimeZoneRegistry : TimeZoneRegistry {
     /**
      * Returns the timezone ID string as-is.
      */
-    override fun getTzId(zoneId: String?): String? = zoneId
+    override fun getTzId(zoneId: String): String = zoneId
 
     /**
      * Hardcoded aliases for common US Windows timezone names.

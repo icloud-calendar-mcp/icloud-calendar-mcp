@@ -1,18 +1,22 @@
 package org.onekash.icaldav.parser
 
+import io.mockk.mockk
+import net.fortuna.ical4j.model.TimeZone
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
+import java.time.DateTimeException
 import java.time.ZoneId
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Unit tests for SimpleTimeZoneRegistry.
- *
- * Verifies the registry provides safe defaults that work on Android
- * without requiring ZoneRulesProvider.
+ * Tests [SimpleTimeZoneRegistry], which resolves zones without ZoneRulesProvider: getTimeZone
+ * returns null, register and clear are no-ops, getZoneRules is empty, getTzId passes its input
+ * through, and getZoneId resolves IANA IDs and Windows names (hardcoded aliases and the
+ * properties-file fallback, in any case) and throws DateTimeException for blank or unknown IDs.
  */
 @DisplayName("SimpleTimeZoneRegistry")
 class SimpleTimeZoneRegistryTest {
@@ -25,23 +29,23 @@ class SimpleTimeZoneRegistryTest {
         assertNull(registry.getTimeZone("America/New_York"))
         assertNull(registry.getTimeZone("Europe/London"))
         assertNull(registry.getTimeZone("UTC"))
-        assertNull(registry.getTimeZone(null))
         assertNull(registry.getTimeZone(""))
     }
 
     @Test
     @DisplayName("register does not throw")
     fun `register is no-op`() {
-        // Should not throw
-        registry.register(null)
-        registry.register(null, false)
-        registry.register(null, true)
+        // Passes if it doesn't throw.
+        val timezone = mockk<TimeZone>()
+        registry.register(timezone)
+        registry.register(timezone, false)
+        registry.register(timezone, true)
     }
 
     @Test
     @DisplayName("clear does not throw")
     fun `clear is no-op`() {
-        // Should not throw
+        // Passes if it doesn't throw.
         registry.clear()
     }
 
@@ -66,12 +70,11 @@ class SimpleTimeZoneRegistryTest {
     }
 
     @Test
-    @DisplayName("getZoneId returns null for invalid timezone")
-    fun `getZoneId returns null for invalid`() {
-        assertNull(registry.getZoneId("Invalid/Timezone"))
-        assertNull(registry.getZoneId(null))
-        assertNull(registry.getZoneId(""))
-        assertNull(registry.getZoneId("   "))
+    @DisplayName("getZoneId throws DateTimeException for invalid timezone")
+    fun `getZoneId throws for invalid`() {
+        for (id in listOf("Invalid/Timezone", "", "   ")) {
+            assertFailsWith<DateTimeException>(id) { registry.getZoneId(id) }
+        }
     }
 
     @Test
@@ -95,7 +98,6 @@ class SimpleTimeZoneRegistryTest {
     fun `getTzId passes through`() {
         assertEquals("America/New_York", registry.getTzId("America/New_York"))
         assertEquals("UTC", registry.getTzId("UTC"))
-        assertNull(registry.getTzId(null))
     }
 
     // ==================== Properties File Fallback (Issue #45) ====================
@@ -104,9 +106,8 @@ class SimpleTimeZoneRegistryTest {
     @DisplayName("getZoneId resolves India Standard Time via properties file")
     fun `getZoneId resolves India Standard Time`() {
         val zone = registry.getZoneId("India Standard Time")
-        assertNotNull(zone, "India Standard Time should resolve via properties file")
-        // Verify it produces the correct UTC+5:30 offset
-        val offset = zone!!.rules.getOffset(java.time.Instant.now())
+        // UTC+5:30, which has no DST.
+        val offset = zone.rules.getOffset(java.time.Instant.now())
         assertEquals(java.time.ZoneOffset.ofHoursMinutes(5, 30), offset)
     }
 
@@ -114,8 +115,7 @@ class SimpleTimeZoneRegistryTest {
     @DisplayName("getZoneId resolves Tokyo Standard Time via properties file")
     fun `getZoneId resolves Tokyo Standard Time`() {
         val zone = registry.getZoneId("Tokyo Standard Time")
-        assertNotNull(zone, "Tokyo Standard Time should resolve via properties file")
-        val offset = zone!!.rules.getOffset(java.time.Instant.now())
+        val offset = zone.rules.getOffset(java.time.Instant.now())
         assertEquals(java.time.ZoneOffset.ofHours(9), offset)
     }
 

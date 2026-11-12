@@ -269,14 +269,14 @@ object InputValidator {
             // Each value is either a YYYY-MM-DD or a datetime string
             val asDate = validateDate(v, "$fieldName[$i]")
             if (asDate is ValidationResult.Valid) continue
-            // RDATE/EXDATE values are date or UTC-instant only. A numeric offset would
-            // pass validateDateTime but the downstream writer (IcsBuilder/IcsPatcher
-            // toRecurrenceDateTime) appends 'Z' and Instant.parse would then throw, so
-            // reject offsets here.
+            // RDATE/EXDATE values are a date, a local date-time (read in the event's zone by
+            // IcsBuilder.recurrenceDates) or a UTC instant. A numeric offset would pass
+            // validateDateTime but the writer has no form for it, so reject offsets here.
             val withoutZ = v.removeSuffix("Z")
             if (hasExplicitZone(withoutZ)) {
                 return ValidationResult.Invalid(
-                    "$fieldName[$i] must be a date (YYYY-MM-DD) or a UTC datetime (…Z), not an offset datetime"
+                    "$fieldName[$i] must be a date (YYYY-MM-DD), a local date-time read in the event's zone " +
+                        "(YYYY-MM-DDTHH:MM:SS), or a UTC date-time ending in Z, not an offset datetime"
                 )
             }
             val asDateTime = validateDateTime(withoutZ, "$fieldName[$i]")

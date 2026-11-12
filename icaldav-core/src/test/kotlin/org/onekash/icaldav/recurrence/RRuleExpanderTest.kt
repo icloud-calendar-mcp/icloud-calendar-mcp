@@ -144,7 +144,7 @@ class RRuleExpanderTest {
             recurrenceId = ICalDateTime.parse("20231203T150000Z")
         )
 
-        val overrides = RRuleExpander.buildOverrideMap(listOf(overrideEvent))
+        val overrides = listOf(overrideEvent)
 
         val occurrences = expander.expand(
             masterEvent,
@@ -227,25 +227,31 @@ class RRuleExpanderTest {
     }
 
     @Test
-    fun `buildOverrideMap creates correct mapping`() {
+    fun `overrides replace their occurrences by RECURRENCE-ID and events without one are ignored`() {
+        val utc = java.time.ZoneOffset.UTC
+        val master = createTestEvent(
+            startDate = ZonedDateTime.of(2023, 12, 1, 10, 0, 0, 0, utc),
+            rrule = RRule(freq = Frequency.DAILY, interval = 1, count = 20)
+        )
         val override1 = createTestEvent(
-            uid = "event-1",
+            summary = "Override 1",
+            startDate = ZonedDateTime.of(2023, 12, 1, 12, 0, 0, 0, utc),
             recurrenceId = ICalDateTime.parse("20231201T100000Z")
         )
         val override2 = createTestEvent(
-            uid = "event-2",
+            summary = "Override 2",
+            startDate = ZonedDateTime.of(2023, 12, 15, 12, 0, 0, 0, utc),
             recurrenceId = ICalDateTime.parse("20231215T100000Z")
         )
-        val nonOverride = createTestEvent(
-            uid = "event-3",
-            recurrenceId = null
+        val nonOverride = createTestEvent(summary = "Not an override", recurrenceId = null)
+
+        val occurrences = expander.expand(
+            master, TimeRange.forMonth(2023, 12, utc), listOf(override1, override2, nonOverride)
         )
 
-        val map = RRuleExpander.buildOverrideMap(listOf(override1, override2, nonOverride))
-
-        assertEquals(2, map.size)
-        assertTrue(map.containsKey("20231201"))
-        assertTrue(map.containsKey("20231215"))
+        assertEquals(20, occurrences.size)
+        assertEquals(listOf("Override 1", "Override 2"), occurrences.map { it.summary }.filter { it != "Test Event" })
+        assertFalse(occurrences.any { it.summary == "Not an override" })
     }
 
     @Test
@@ -356,6 +362,23 @@ class RRuleExpanderTest {
             listOf("9:00", "9:30", "12:00", "12:30", "9:00", "9:30", "12:00", "12:30"),
             timeOfDay,
         )
+    }
+
+    @Test
+    fun `a repeated BYDAY entry expands to distinct occurrences and COUNT counts each once`() {
+        // RFC 5545 3.3.10: the recurrence set is a set, so a BYDAY value listed twice
+        // selects the same days as listing it once.
+        val event = createTestEvent(
+            startDate = ZonedDateTime.of(2023, 12, 4, 10, 0, 0, 0, zone), // a Monday
+            rrule = RRule.parse("FREQ=WEEKLY;BYDAY=MO,MO;COUNT=4")
+        )
+
+        val occurrences = expander.expand(event, TimeRange.forMonth(2023, 12, zone))
+
+        val starts = occurrences.map { it.dtStart.timestamp }
+        assertEquals(4, starts.size, "COUNT=4 yields four occurrences: ${occurrences.map { it.dtStart.toDayCode() }}")
+        assertEquals(starts.size, starts.toSet().size, "no duplicate instant")
+        assertEquals(listOf("20231204", "20231211", "20231218", "20231225"), occurrences.map { it.dtStart.toDayCode() })
     }
 
     private fun createTestEvent(

@@ -8,11 +8,15 @@ import org.onekash.icaldav.model.ICalEvent
 import org.onekash.icaldav.model.RRule
 import org.onekash.icaldav.model.Transparency
 import org.onekash.icaldav.parser.ICalGenerator
+import org.onekash.icaldav.recurrence.RRuleExpander
 import org.onekash.icaldav.util.DurationUtils
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.temporal.ChronoUnit
 import java.util.UUID
 
@@ -55,6 +59,12 @@ data class AlarmSpec(
  */
 class IcsBuilder {
 
+    /**
+     * A date-only RDATE/EXDATE value on a series with several occurrences per day: the date names
+     * no single occurrence. The caller must send the occurrence's exact start.
+     */
+    class AmbiguousRecurrenceDateException(override val message: String) : IllegalArgumentException(message)
+
     companion object {
         private const val PRODID = "-//OnekashMCP//AppleCalendarMCP 1.0//EN"
 
@@ -72,6 +82,65 @@ class IcsBuilder {
          * [IcsBuilder] and [IcsPatcher] to detect an explicit zone on a timed value.
          */
         internal val OFFSET_SUFFIX = Regex("""[+-]\d{2}:\d{2}$""")
+
+        /**
+         * RDATE/EXDATE input values as stored on [series] (the event they are written to, with
+         * its final DTSTART, RRULE and, for EXDATE, RDATEs). Three input forms:
+         * - a UTC instant ending in Z: stored as that instant;
+         * - a naive date-time: read in the series' zone ([RRuleExpander.eventZoneOf]: its TZID,
+         *   UTC for a UTC series, the JVM zone for a floating one) and stored in that form;
+         * - a date (YYYY-MM-DD): on a timed series with one occurrence per day, that day's
+         *   occurrence (DTSTART's local time on that date); on a series with several occurrences
+         *   per day it names no single occurrence, so it throws [AmbiguousRecurrenceDateException].
+         * On an all-day series every form becomes a DATE: a naive value as written, a Z value by
+         * its UTC date.
+         */
+        /**
+         * [series] with its RDATE and EXDATE inputs applied ([recurrenceDates]); a null list keeps
+         * the existing values. RDATEs go first, so EXDATE forms are read against the final RDATEs.
+         */
+        internal fun withRecurrenceDates(series: ICalEvent, rdates: List<String>?, exdates: List<String>?): ICalEvent {
+            val withRdates = if (rdates != null) {
+                series.copy(rdates = recurrenceDates(rdates, series.copy(rdates = emptyList())))
+            } else series
+            return if (exdates != null) withRdates.copy(exdates = recurrenceDates(exdates, withRdates)) else withRdates
+        }
+
+        internal fun recurrenceDates(values: List<String>, series: ICalEvent): List<ICalDateTime> {
+            if (series.isAllDay) {
+                return values.map { v ->
+                    val date = when {
+                        v.endsWith("Z") -> Instant.parse(v).atZone(ZoneOffset.UTC).toLocalDate()
+                        v.contains('T') -> LocalDateTime.parse(v).toLocalDate()
+                        else -> LocalDate.parse(v)
+                    }
+                    ICalDateTime.fromLocalDate(date)
+                }
+            }
+            val zone: ZoneId = RRuleExpander.eventZoneOf(series)
+            val tzid: ZoneId? = zone.takeIf { !series.dtStart.isUtc }
+            val startTime = series.dtStart.toInstant().atZone(zone).toLocalTime()
+            val multiPerDay by lazy { RRuleExpander.isMultiPerDay(series) }
+            fun stored(local: LocalDateTime): ICalDateTime =
+                if (tzid == null) ICalDateTime.fromTimestamp(local.toInstant(ZoneOffset.UTC).toEpochMilli())
+                else ICalDateTime.fromZonedDateTime(local.atZone(tzid), isDate = false)
+            return values.map { v ->
+                when {
+                    v.endsWith("Z") -> ICalDateTime.fromTimestamp(Instant.parse(v).toEpochMilli())
+                    v.contains('T') -> stored(LocalDateTime.parse(v))
+                    else -> {
+                        if (multiPerDay) {
+                            throw AmbiguousRecurrenceDateException(
+                                "The date $v names no single occurrence of a series with several occurrences " +
+                                    "per day. Give the occurrence's exact start (a UTC instant ending in Z, or a " +
+                                    "local date-time in the event's zone)."
+                            )
+                        }
+                        stored(LocalDate.parse(v).atTime(startTime))
+                    }
+                }
+            }
+        }
 
         /**
          * Map an [AlarmSpec] (MCP wire shape) to an icaldav [ICalAlarm]. Shared with
@@ -126,9 +195,11 @@ class IcsBuilder {
      * @param endTimezone Optional IANA timezone for DTEND (cross-timezone events e.g.
      *   flights JFK->LAX). When null or equal to [timezone], DTEND reuses [timezone].
      *   When distinct, both VTIMEZONE blocks are emitted.
-     * @param rdates Additional occurrence dates (RFC 5545 §3.8.5.2 — RDATE). One line per value.
-     *   ISO 8601 instants for timed events; YYYY-MM-DD for all-day. null/empty => no RDATE emitted.
-     * @param exdates Excluded occurrence dates (RFC 5545 §3.8.5.1 — EXDATE). Same form as rdates.
+     * @param rdates Additional occurrence dates (RFC 5545 §3.8.5.2, RDATE). One line per value; see
+     *   [recurrenceDates] for the accepted forms. null/empty => no RDATE emitted.
+     * @param exdates Excluded occurrence dates (RFC 5545 §3.8.5.1, EXDATE). Same forms as rdates.
+     * @throws AmbiguousRecurrenceDateException for a date value on a series with several
+     *   occurrences per day.
      * @param alarms RFC 5545 §3.6.6 VALARM components; one block per element.
      *   null/empty emits nothing.
      */
@@ -189,8 +260,8 @@ class IcsBuilder {
             status = status?.takeIf { it.isNotBlank() }?.let { EventStatus.fromString(it) },
             sequence = 0,
             rrule = if (recurring) parseRRuleOrNull(rrule) else null,
-            exdates = (exdates ?: emptyList()).map { toRecurrenceDateTime(it, isAllDay) },
-            rdates = (rdates ?: emptyList()).map { toRecurrenceDateTime(it, isAllDay) },
+            exdates = emptyList(),
+            rdates = emptyList(),
             recurrenceId = null,
             alarms = (alarms ?: emptyList()).map { toICalAlarm(it) },
             categories = categories ?: emptyList(),
@@ -206,8 +277,10 @@ class IcsBuilder {
             rawProperties = emptyMap()
         )
 
+        val complete = withRecurrenceDates(event, rdates.orEmpty(), exdates.orEmpty())
+
         // method = null → no METHOD line (plain CalDAV storage PUT, not an iTIP message).
-        return generator.generate(event, method = null, preserveDtstamp = false, includeVTimezone = true)
+        return generator.generate(complete, method = null, preserveDtstamp = false, includeVTimezone = true)
     }
 
     /** DTSTART / DTEND / DURATION resolved for one of the three supported event shapes. */
@@ -312,10 +385,6 @@ class IcsBuilder {
         val basic = iso.removeSuffix("Z").replace("-", "").replace(":", "") // yyyyMMddTHHmmss
         return ICalDateTime.parse(basic, tzid)
     }
-
-    /** RDATE/EXDATE value → [ICalDateTime]: VALUE=DATE for all-day, UTC instant otherwise. */
-    private fun toRecurrenceDateTime(value: String, isAllDay: Boolean): ICalDateTime =
-        if (isAllDay) ICalDateTime.fromLocalDate(LocalDate.parse(value)) else utcICalDateTime(value)
 
     private fun toUtcICalDateTime(instant: Instant): ICalDateTime =
         ICalDateTime.fromTimestamp(instant.toEpochMilli(), timezone = null, isDate = false)

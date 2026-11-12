@@ -648,4 +648,14 @@ class RRuleTest {
             assertEquals(listOf(-1), rrule.bySecond)
         }
     }
+
+    @Test
+    fun `a BYDAY ordinal outside -53 to 53, or zero, is rejected`() {
+        for (bad in listOf("FREQ=YEARLY;BYDAY=54MO", "FREQ=YEARLY;BYDAY=-54MO", "FREQ=MONTHLY;BYDAY=0MO", "FREQ=YEARLY;BYDAY=99SU")) {
+            assertThrows<IllegalArgumentException>(bad) { RRule.parse(bad) }
+        }
+        for (good in listOf("FREQ=YEARLY;BYDAY=53SU", "FREQ=YEARLY;BYDAY=-53MO", "FREQ=MONTHLY;BYDAY=+1FR", "FREQ=MONTHLY;BYDAY=-1SU")) {
+            assertNotNull(RRule.parse(good), good)
+        }
+    }
 }

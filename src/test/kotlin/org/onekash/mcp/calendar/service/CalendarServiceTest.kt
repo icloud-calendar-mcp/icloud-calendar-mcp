@@ -252,6 +252,81 @@ class CalendarServiceTest {
     }
 
     @Test
+    fun `a date exdate on a multi-per-day series is a VALIDATION_ERROR on create and update`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
+        )
+        val created = service.createEvent(
+            calendarId = "cal-1",
+            summary = "Twice daily",
+            startTime = "2025-01-15T09:00:00Z",
+            endTime = "2025-01-15T09:15:00Z",
+            rrule = "FREQ=DAILY;BYHOUR=9,17;COUNT=6",
+            exdates = listOf("2025-01-16")
+        )
+        assertTrue(created is ServiceResult.Error, "$created")
+        assertEquals(400, (created as ServiceResult.Error).code)
+        assertNull(mockClient.lastCreatedIcs, "nothing is sent")
+        val tool = org.onekash.mcp.calendar.error.SecureErrorHandler.serviceError(created.code, created.message)
+        val text = (tool.content.first() as io.modelcontextprotocol.kotlin.sdk.types.TextContent).text
+        assertTrue(text.contains("VALIDATION_ERROR"), text)
+        assertTrue(text.contains("exact start"), "the error says what to send instead: $text")
+
+        val event = registerDailySeries(rrule = "RRULE:FREQ=DAILY;BYHOUR=9,17;COUNT=6")
+        val updated = service.updateEvent(EventHandle.encode(event.href, event.etag), exdates = listOf("2025-01-16"))
+        assertTrue(updated is ServiceResult.Error, "$updated")
+        assertEquals(400, (updated as ServiceResult.Error).code)
+    }
+
+    /** A client whose createEvent is refused with a bare 403, as iCloud refuses a reminders list. */
+    private fun refusingCreate() = object : org.onekash.mcp.calendar.caldav.CalDavClient by mockClient {
+        override fun createEvent(calendarId: String, icalData: String) = CalDavResult.Error(403, "Access denied")
+    }
+
+    @Test
+    fun `an update of a blank-UID event through its handle writes a non-blank UID`() {
+        val event = CalDavEvent(
+            uid = "", href = "/cal/blank.ics", url = "https://test.com/cal/blank.ics", etag = "\"e-blank\"",
+            icalData = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//Test//EN\r\nBEGIN:VEVENT\r\nUID:\r\n" +
+                "DTSTART:20250115T090000Z\r\nDTEND:20250115T100000Z\r\nSUMMARY:No UID\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        mockClient.registeredEvents["blank"] = event
+        val result = service.updateEvent(EventHandle.encode(event.href, event.etag), summary = "Renamed")
+        assertTrue(result is ServiceResult.Success, "$result")
+        val uidLine = mockClient.lastUpdatedIcs!!.replace("\r\n", "\n").lines().single { it.startsWith("UID:") }
+        assertTrue(uidLine.removePrefix("UID:").isNotBlank(), mockClient.lastUpdatedIcs!!)
+    }
+
+    @Test
+    fun `a 403 create into a calendar without VEVENT support says why`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("tasks", "/tasks/", "https://test.com/tasks/", "Reminders", null, null, false, setOf("VTODO"))
+        )
+        val refusing = refusingCreate()
+        val result = CalendarService(refusing).createEvent(
+            calendarId = "tasks", summary = "Event", startTime = "2025-01-15T09:00:00Z", endTime = "2025-01-15T10:00:00Z"
+        )
+        assertTrue(result is ServiceResult.Error, "$result")
+        val error = result as ServiceResult.Error
+        assertEquals(403, error.code)
+        assertTrue(error.message.contains("HTTP 403"), error.message)
+        assertTrue(error.message.contains("gave no reason"), error.message)
+        assertTrue(error.message.contains("does not accept events"), error.message)
+    }
+
+    @Test
+    fun `a 403 create into an event calendar keeps the client's message`() {
+        mockClient.calendars = listOf(
+            CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false, setOf("VEVENT", "VTODO"))
+        )
+        val refusing = refusingCreate()
+        val result = CalendarService(refusing).createEvent(
+            calendarId = "cal-1", summary = "Event", startTime = "2025-01-15T09:00:00Z", endTime = "2025-01-15T10:00:00Z"
+        )
+        assertEquals("Access denied", (result as ServiceResult.Error).message)
+    }
+
+    @Test
     fun `create all-day event`() {
         mockClient.calendars = listOf(
             CalDavCalendar("cal-1", "/cal/", "https://test.com/cal/", "Cal", null, null, false)
@@ -1334,6 +1409,28 @@ class CalendarServiceTest {
         assertTrue(ics.contains("SUMMARY:Renamed series"), "master summary changed:\n$ics")
         assertTrue(ics.contains("RRULE:FREQ=DAILY"), "still a series:\n$ics")
         assertFalse(ics.contains("RECURRENCE-ID"), "whole-series edit adds no exception:\n$ics")
+    }
+
+    @Test
+    fun `an all_events edit after a this_occurrence edit keeps the edited occurrence`() {
+        val event = registerDailySeries(rrule = "RRULE:FREQ=DAILY;COUNT=5")
+        // First edit one occurrence; the mock stores the resulting master + override resource.
+        val occurrence = EventHandle.encode(event.href, event.etag, "20250116T090000Z")
+        assertTrue(service.updateEvent(occurrence, summary = "Moved standup", scope = EventScope.THIS_OCCURRENCE)
+            is ServiceResult.Success)
+        val withOverride = mockClient.lastUpdatedIcs!!
+        assertTrue(withOverride.contains("RECURRENCE-ID"), "override stored:\n$withOverride")
+        mockClient.registeredEvents[event.uid] = event.copy(icalData = withOverride)
+
+        val series = EventHandle.encode(event.href, event.etag)
+        val result = service.updateEvent(series, summary = "Renamed standup", scope = EventScope.ALL_EVENTS)
+
+        assertTrue(result is ServiceResult.Success, "$result")
+        val ics = mockClient.lastUpdatedIcs!!
+        assertTrue(ics.contains("SUMMARY:Renamed standup"), "master renamed:\n$ics")
+        assertTrue(ics.contains("RRULE:FREQ=DAILY;COUNT=5"), "still a series:\n$ics")
+        assertTrue(ics.contains("RECURRENCE-ID:20250116T090000Z"), "override kept:\n$ics")
+        assertTrue(ics.contains("SUMMARY:Moved standup"), "override keeps its edit:\n$ics")
     }
 
     @Test

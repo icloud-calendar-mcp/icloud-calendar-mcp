@@ -418,6 +418,28 @@ class ICloudXmlParser {
     // HELPERS
     // ═══════════════════════════════════════════════════════════════════
 
+    /**
+     * The precondition and postcondition names in a DAV:error body (RFC 4918 section 16; RFC 4791
+     * 5.3.2.1 defines CalDAV's, e.g. supported-calendar-component): the local names of the root
+     * error element's child elements, at most [MAX_PRECONDITIONS], each matching
+     * [PRECONDITION_NAME]. Text, hrefs and any other body content are ignored, so nothing the
+     * server wrote beyond element names reaches a caller. Never throws: a body that is empty, not
+     * XML, not a DAV:error, or carries a DOCTYPE (disallowed by the parser factory) yields none.
+     */
+    fun parsePreconditions(xml: String): List<String> {
+        if (xml.isBlank()) return emptyList()
+        val root = parseXml(xml)?.documentElement ?: return emptyList()
+        if (root.localName != "error" || root.namespaceURI != "DAV:") return emptyList()
+        val names = mutableListOf<String>()
+        val children = root.childNodes
+        for (i in 0 until children.length) {
+            val name = (children.item(i) as? Element)?.localName ?: continue
+            if (PRECONDITION_NAME.matches(name)) names += name
+            if (names.size == MAX_PRECONDITIONS) break
+        }
+        return names
+    }
+
     private fun parseXml(xml: String): Document? {
         return try {
             val builder = docBuilderFactory.newDocumentBuilder()
@@ -474,5 +496,12 @@ class ICloudXmlParser {
         val base = baseUrl.trimEnd('/')
         val path = if (href.startsWith("/")) href else "/$href"
         return "$base$path"
+    }
+
+    internal companion object {
+        const val MAX_PRECONDITIONS = 5
+
+        /** The shape a precondition name must have to reach an error message. */
+        val PRECONDITION_NAME = Regex("[A-Za-z-]{1,64}")
     }
 }

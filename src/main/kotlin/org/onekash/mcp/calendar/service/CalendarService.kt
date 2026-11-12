@@ -414,24 +414,28 @@ class CalendarService(
         // (RFC 5545 §3.8.7.1/.3); subsequent edits go through IcsPatcher which refreshes
         // LAST-MODIFIED and preserves CREATED.
         val now = java.time.Instant.now()
-        val ics = builder.build(
-            summary = summary,
-            startTime = startTime,
-            endTime = endTime,
-            startDate = startDate,
-            endDate = endDate,
-            isAllDay = isAllDay,
-            description = description,
-            location = location,
-            timezone = timezone,
-            rrule = rrule,
-            createdAt = now,
-            lastModified = now,
-            endTimezone = endTimezone,
-            rdates = rdates,
-            exdates = exdates,
-            alarms = alarms
-        )
+        val ics = try {
+            builder.build(
+                summary = summary,
+                startTime = startTime,
+                endTime = endTime,
+                startDate = startDate,
+                endDate = endDate,
+                isAllDay = isAllDay,
+                description = description,
+                location = location,
+                timezone = timezone,
+                rrule = rrule,
+                createdAt = now,
+                lastModified = now,
+                endTimezone = endTimezone,
+                rdates = rdates,
+                exdates = exdates,
+                alarms = alarms
+            )
+        } catch (e: IcsBuilder.AmbiguousRecurrenceDateException) {
+            return ServiceResult.Error(400, e.message)
+        }
 
         // Create via CalDAV
         return when (val result = client.createEvent(calendarId, ics)) {
@@ -452,7 +456,18 @@ class CalendarService(
                 }
             }
             is CalDavResult.Error -> {
-                result.toServiceError()
+                // iCloud refuses an event in a calendar that holds no events (a reminders list)
+                // with a bare 403. Say why when the listing shows the calendar has no VEVENT.
+                val noEvents = calendar.supportedComponents.isNotEmpty() && "VEVENT" !in calendar.supportedComponents
+                if (result.code == 403 && noEvents && result.preconditions.isEmpty()) {
+                    ServiceResult.Error(
+                        403,
+                        "iCloud refused the write (HTTP 403) and gave no reason. This calendar's " +
+                            "supportedComponents do not include VEVENT, so it does not accept events."
+                    )
+                } else {
+                    result.toServiceError()
+                }
             }
         }
     }
@@ -552,6 +567,8 @@ class CalendarService(
                     exdates = exdates,
                     alarms = alarms
                 )
+            } catch (e: IcsBuilder.AmbiguousRecurrenceDateException) {
+                return@withStaleEtagRetry ServiceResult.Error(400, e.message)
             } catch (e: IcsPatcher.UnparseableExistingIcsException) {
                 return@withStaleEtagRetry ServiceResult.Error(
                     422,

@@ -46,7 +46,7 @@ class CalDavRecoveryTest {
                        http: OkHttpClient = OkHttpClient.Builder()
                            .readTimeout(100, TimeUnit.MILLISECONDS).build()) =
         OkHttpCalDavClient(server.url("/").toString().trimEnd('/'),
-            CalDavCredentials("test@icloud.com", "test-password"), http, clock, clock::sleep)
+            CalDavCredentials("test@example.com", "test-password"), http, clock, clock::sleep)
             .also { it.skipWellKnownDiscovery() }
 
     private fun error(result: CalDavResult<*>, code: Int, retryAt: Instant? = null): CalDavResult.Error =
@@ -772,6 +772,36 @@ class CalDavRecoveryTest {
                 assertIs<CalDavResult.Error>(client.deleteEvent("/event.ics", "etag"), "DELETE $code")
                 assertEquals(listOf("PUT", "DELETE"), listOf(server.takeRequest().method, server.takeRequest().method))
                 assertEquals(2, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `a refused write names the precondition from a DAV error body and keeps its code`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                server.enqueue(MockResponse().setResponseCode(403).addHeader("Content-Type", "application/xml")
+                    .setBody("<D:error xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">" +
+                        "<C:supported-calendar-component/><D:href>/123456789/calendars/x/</D:href></D:error>"))
+                val result = error(client.updateEvent("/event.ics", ics, "etag"), 403)
+                assertTrue(result.message.contains("supported-calendar-component"), result.message)
+                assertFalse(result.message.contains("123456789"), "no body text beyond element names: ${result.message}")
+                assertFalse(result.outcomeUnknown)
+            }
+        }
+    }
+
+    @Test
+    fun `a refused write without a DAV error body keeps the status message`() {
+        // The last body is a DAV:error that names a precondition but runs past the 64 KB read cap.
+        val oversized = "<D:error xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">" +
+            "<C:supported-calendar-component/><D:pad>${"x".repeat(70_000)}</D:pad></D:error>"
+        for (body in listOf("", "Forbidden", "<html>nope</html>", oversized)) MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                server.enqueue(MockResponse().setResponseCode(403).setBody(body))
+                assertEquals("Access denied", error(client.deleteEvent("/event.ics", "etag"), 403).message)
             }
         }
     }

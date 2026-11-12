@@ -23,6 +23,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached as an empty result.
 - Read the response ETag header case-insensitively, which removes an extra
   PROPFIND per event read and write over HTTP/2.
+- `update_event` on a whole series keeps its edited occurrences. It used to
+  write back only the first VEVENT of the resource, dropping every
+  RECURRENCE-ID override, and if iCloud listed an override first it patched
+  that one and turned the series into a single event. Clearing the RRULE still
+  drops the overrides when no RDATE is left.
+- A UTC `UNTIL` on a series in another zone now ends the series at that
+  instant. It was read as a UTC wall clock, which kept one occurrence too many
+  west of UTC and dropped the last one east of it.
+- EXDATE matching: a DATE-TIME EXDATE first removes the occurrence at its
+  exact instant, so deleting one of two same-day occurrences no longer hides
+  both. If it matches no instant, a series with one occurrence per day still
+  removes the occurrence on the EXDATE's day, now taken in the event's zone
+  (a UTC EXDATE used to be read on its UTC date, which removed the wrong day
+  for Seoul mornings and US evenings). A DATE EXDATE removes its whole date.
+  An EXDATE stored as UTC midnight (`...T000000Z`) on a non-UTC series can now
+  land on the neighbouring day.
+- RDATEs are deduplicated against the RRULE by instant, so an RDATE at another
+  time of an occupied day adds its own occurrence. Two edited occurrences on
+  the same day both appear. A floating EXDATE or RDATE on a TZID series is read
+  in that TZID instead of the JVM zone, and is written back with it.
+- `exdates` and `rdates` accept a UTC instant ending in Z, a local date-time
+  read in the event's zone, or a date. A date on a timed series means that
+  day's occurrence; it is rejected with VALIDATION_ERROR on a series with
+  several occurrences per day. On an all-day series every form becomes a date.
+- Moving a series' start with `update_event` moves its `UNTIL` by the same
+  amount, so the series keeps its last occurrence, also across DST and zone
+  changes. The continuing series of a `this_and_future` edit that moves the
+  time does the same.
+- Properties the server does not model (X-APPLE-STRUCTURED-LOCATION, repeated
+  X- properties, COMMENT) are written back as their original lines on update.
+  Repeated properties used to collapse to the last one and quoted parameters
+  lost their quotes. Editing LOCATION does not update a structured location.
+- An uppercase `\N` in text decodes to a newline. A blank UID is treated as a
+  missing one. VALARM DESCRIPTION, SUMMARY and RELATED-TO are escaped, and a CR
+  inside any text value is written as a newline. A BYDAY ordinal outside
+  -53..53, or 0, is rejected.
+- A refused write names the CalDAV precondition from iCloud's error body, and
+  `create_event` into a calendar without event support (such as a reminders
+  list, which iCloud refuses with a bare 403) says why.
+- An RRULE occurrence starting exactly at the end of an expansion range is no
+  longer returned, matching the documented exclusive end.
+
+### Changed
+- ical4j 4.4.0 (from 4.3.0). Its repeated-BYDAY fix removes duplicate
+  occurrences that COUNT also miscounted.
+
+### Known limitations
+- On a series with several occurrences per day, moving the series' time does
+  not move its EXDATEs, so a deleted occurrence can reappear. Resend `exdates`
+  after such a move.
+- A text value with a backslash directly before a line break reads back with
+  the line break as a literal `\n` (an ical4j decoding bug).
 
 ## [3.2.0] - 2026-08-14
 

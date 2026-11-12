@@ -12,17 +12,19 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.OffsetDateTime
+import java.time.temporal.ChronoUnit
 
 /**
  * Patches existing ICS content, preserving properties not being updated.
  *
  * Full adoption of the vendored icaldav-core: parse the existing ICS into an
  * [ICalEvent], apply the patch fields via [ICalEvent.copy], and re-serialize with
- * [ICalGenerator]. The model's structured fields plus its `rawProperties` map
+ * [ICalGenerator]. The model's structured fields plus its unknown property lines
  * carry everything through the round-trip:
  * - VALARM blocks (reminders) are preserved (unless [patch] is given a new list)
  * - ATTENDEE / ORGANIZER are preserved (structured fields)
- * - X-APPLE-* and other unknown X-* properties are preserved (rawProperties)
+ * - X-APPLE-* and other unknown properties are written back as their original lines
+ *   (unknownPropertyLines; the rawProperties map when lines are unavailable)
  * - CREATED is preserved unchanged (RFC 5545 §3.8.7.1)
  *
  * Falls back to IcsBuilder when existing ICS is null/blank (the patcher is
@@ -135,8 +137,8 @@ class IcsPatcher(
         // Parse the existing ICS. parseAllEvents() folds any parse exception into a
         // ParseResult.Error; a well-formed calendar with no VEVENT yields an empty
         // Success. Both are "cannot patch" — surface UnparseableExistingIcsException.
-        val original = when (val result = parser.parseAllEvents(existingIcs)) {
-            is ParseResult.Success -> result.value.firstOrNull() ?: run {
+        val events = when (val result = parser.parseAllEvents(existingIcs)) {
+            is ParseResult.Success -> result.value.ifEmpty {
                 logFailure(uid, existingIcs, "No VEVENT found")
                 throw UnparseableExistingIcsException(
                     "Could not patch event: existing ICS is unparseable (No VEVENT found)"
@@ -152,15 +154,29 @@ class IcsPatcher(
             }
         }
 
+        // A series resource holds the master plus its RECURRENCE-ID overrides, and RFC 5545 puts
+        // no order on them. Patch the master (the VEVENT with no RECURRENCE-ID) wherever it
+        // sits; a resource holding only overrides (RFC 4791 4.1) patches its first VEVENT.
+        val original = events.firstOrNull { it.recurrenceId == null } ?: events.first()
         val patched = applyPatch(
             original, safeSummary, startTime, endTime, startDate, endDate,
             isAllDay, safeDescription, safeLocation, timezone, safeRrule, safeStatus, safeUrl,
             safeCategories, priority, endTimezone, safeRdates, safeExdates, alarms
         )
 
+        // The other VEVENTs ride through unchanged. A master that no longer recurs (RRULE
+        // cleared, no RDATE) keeps no overrides: they would describe occurrences that no
+        // longer exist.
+        val nowSingle = original.recurrenceId == null && patched.rrule == null && patched.rdates.isEmpty()
+        val others = if (nowSingle) emptyList() else events.filter { it !== original }
+
         // method = null → no METHOD line (plain CalDAV storage PUT).
         // preserveDtstamp = false → DTSTAMP regenerated to now on every patch.
-        return generator.generate(patched, method = null, preserveDtstamp = false, includeVTimezone = true)
+        if (others.isEmpty()) {
+            return generator.generate(patched, method = null, preserveDtstamp = false, includeVTimezone = true)
+        }
+        // The patched VEVENT is written first, so a caller reading the first event gets it.
+        return generator.generateBatch(listOf(patched) + others, includeMethod = false, includeVTimezone = true)
     }
 
     /**
@@ -422,11 +438,21 @@ class IcsPatcher(
                 r
             }
         }
+        // The new series starts at the occurrence, written in the master's own form (its TZID or
+        // UTC): a RECURRENCE-ID can arrive in UTC form on a TZID series, and the series zone must
+        // not change with it (shiftedUntil measures a later move in that zone).
+        val masterZone = master.dtStart.timezone
+        val start = when {
+            recid.isDate -> recid
+            master.dtStart.isUtc -> ICalDateTime.fromTimestamp(recid.timestamp)
+            masterZone != null -> ICalDateTime.fromZonedDateTime(recid.toInstant().atZone(masterZone), isDate = false)
+            else -> recid
+        }
         return master.copy(
             uid = freshUid,
             importId = freshUid,
             recurrenceId = null,
-            dtStart = recid,
+            dtStart = start,
             dtEnd = dtEnd,
             duration = if (master.dtEnd == null) master.duration else null,
             rrule = newRrule,
@@ -441,7 +467,7 @@ class IcsPatcher(
     /**
      * Instants of the master's occurrences strictly before [targetTs]. [applyExdates] =
      * false counts pure RRULE/RDATE occurrences (for reducing COUNT, which per RFC 5545
-     * bounds RRULE generation independent of EXDATE); true removes EXDATE'd days (for the
+     * bounds RRULE generation independent of EXDATE); true applies EXDATE (for the
      * kept set, so a cancelled tail day is not treated as the last kept occurrence).
      */
     private fun occurrenceInstantsBefore(master: ICalEvent, targetTs: Long, applyExdates: Boolean): List<Long> {
@@ -590,13 +616,14 @@ class IcsPatcher(
 
     /**
      * Apply the patch fields to [original] via [ICalEvent.copy]. Each nullable
-     * parameter follows "null = leave existing untouched"; the only exceptions are
-     * blank strings for description/location/url/rrule, which clear the property
-     * (matching the previous patcher's remove-on-blank behavior).
+     * parameter follows "null = leave existing untouched", with two exceptions: blank
+     * strings for description/location/url/rrule clear the property (matching the
+     * previous patcher's remove-on-blank behavior), and a null rrule keeps the rule but
+     * moves its UNTIL with a DTSTART move ([shiftedUntil]).
      *
      * SEQUENCE is incremented; LAST-MODIFIED refreshed to now; CREATED preserved;
      * DTSTAMP regenerated by the generator. All unlisted fields (attendees,
-     * organizer, rawProperties/X-*, color, etc.) ride through unchanged.
+     * organizer, unknown property lines, color, etc.) ride through unchanged.
      */
     private fun applyPatch(
         original: ICalEvent,
@@ -621,7 +648,7 @@ class IcsPatcher(
     ): ICalEvent {
         val times = applyDateTimes(original, startTime, endTime, startDate, endDate, isAllDay, timezone, endTimezone)
 
-        return original.copy(
+        val fields = original.copy(
             summary = summary ?: original.summary,
             description = if (description != null) description.takeIf { it.isNotBlank() } else original.description,
             location = if (location != null) location.takeIf { it.isNotBlank() } else original.location,
@@ -631,9 +658,8 @@ class IcsPatcher(
             isAllDay = times.isAllDay,
             status = if (status != null && status.isNotBlank()) EventStatus.fromString(status) else original.status,
             sequence = original.sequence + 1,
-            rrule = if (rrule != null) (if (rrule.isNotBlank()) parseRRuleOrNull(rrule) else null) else original.rrule,
-            exdates = if (exdates != null) exdates.map { toRecurrenceDateTime(it, times.isAllDay) } else original.exdates,
-            rdates = if (rdates != null) rdates.map { toRecurrenceDateTime(it, times.isAllDay) } else original.rdates,
+            rrule = if (rrule != null) (if (rrule.isNotBlank()) parseRRuleOrNull(rrule) else null)
+                else original.rrule?.let { shiftedUntil(it, original, times) },
             categories = categories ?: original.categories,
             url = if (url != null) url.takeIf { it.isNotBlank() } else original.url,
             priority = priority ?: original.priority,
@@ -642,6 +668,35 @@ class IcsPatcher(
             // CREATED intentionally preserved (RFC 5545 §3.8.7.1: never changes after first set).
             created = original.created
         )
+        // RDATE and EXDATE inputs are read against the patched series.
+        return IcsBuilder.withRecurrenceDates(fields, rdates, exdates)
+    }
+
+    /**
+     * [rule] with its UNTIL moved to follow a DTSTART move, so the series keeps its last
+     * occurrence: the old UNTIL's local date-time in the old series zone, plus the change in
+     * DTSTART's local date-time, resolved in the new series zone. This holds for moves earlier and
+     * later, across DST, and across a zone change. An all-day series' DATE UNTIL moves by the
+     * change in DTSTART's date. Unchanged when DTSTART did not move, when the series switched
+     * between all-day and timed, or when UNTIL is a DATE on a timed series or floating.
+     */
+    private fun shiftedUntil(rule: RRule, original: ICalEvent, times: PatchedTimes): RRule {
+        val until = rule.until ?: return rule
+        if (times.dtStart == original.dtStart || times.isAllDay != original.isAllDay) return rule
+        if (times.isAllDay) {
+            if (!until.isDate) return rule
+            val days = ChronoUnit.DAYS.between(original.dtStart.toLocalDate(), times.dtStart.toLocalDate())
+            return rule.copy(until = ICalDateTime.fromLocalDate(until.toLocalDate().plusDays(days)))
+        }
+        if (until.isDate || !until.isUtc) return rule
+        val oldZone = RRuleExpander.eventZoneOf(original)
+        val newZone = RRuleExpander.eventZoneOf(original.copy(dtStart = times.dtStart))
+        val shift = Duration.between(
+            original.dtStart.toInstant().atZone(oldZone).toLocalDateTime(),
+            times.dtStart.toInstant().atZone(newZone).toLocalDateTime()
+        )
+        val untilLocal = until.toInstant().atZone(oldZone).toLocalDateTime().plus(shift)
+        return rule.copy(until = ICalDateTime.fromTimestamp(untilLocal.atZone(newZone).toInstant().toEpochMilli()))
     }
 
     /** DTSTART / DTEND / DURATION / isAllDay after applying any date/time patch fields. */
@@ -726,13 +781,6 @@ class IcsPatcher(
         val instant = Instant.parse(iso)
         return ICalDateTime.fromTimestamp(instant.toEpochMilli(), timezone = null, isDate = false)
     }
-
-    private fun toRecurrenceDateTime(value: String, isAllDay: Boolean): ICalDateTime =
-        if (isAllDay) {
-            ICalDateTime.fromLocalDate(LocalDate.parse(value))
-        } else {
-            utcICalDateTime(if (value.endsWith("Z")) value else "${value}Z")
-        }
 
     /**
      * Sanitize text values to prevent ICS injection via CRLF.

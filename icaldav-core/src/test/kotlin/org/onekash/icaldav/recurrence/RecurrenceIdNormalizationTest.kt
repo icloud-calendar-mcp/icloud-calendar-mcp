@@ -56,7 +56,7 @@ class RecurrenceIdNormalizationTest {
         run {
             val events = parser.parseAllEvents(ics).getOrThrow()
             val master = events.first { it.recurrenceId == null }
-            val overrides = RRuleExpander.buildOverrideMap(events.filter { it.recurrenceId != null })
+            val overrides = events.filter { it.recurrenceId != null }
             expander.expand(master, TimeRange(from.toInstant(), to.toInstant()), overrides)
         }
 

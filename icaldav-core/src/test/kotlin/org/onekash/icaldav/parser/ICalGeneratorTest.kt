@@ -476,4 +476,34 @@ class ICalGeneratorTest {
             rawProperties = emptyMap()
         )
     }
+
+    @Test
+    fun `VALARM DESCRIPTION, SUMMARY and RELATED-TO are TEXT-escaped with CR normalized`() {
+        val alarm = ICalAlarm(
+            action = AlarmAction.EMAIL,
+            trigger = java.time.Duration.ofMinutes(-15),
+            triggerAbsolute = null,
+            description = "Bring a, b; c\\d\r\nnext\rlast",
+            summary = "Subject, with; marks",
+            relatedTo = "rel;1,2"
+        )
+        val event = ICalEvent(
+            uid = "alarm-escape@test", importId = "alarm-escape@test", summary = "Escapes", description = null,
+            location = null, dtStart = ICalDateTime.parse("20260301T090000Z"), dtEnd = ICalDateTime.parse("20260301T100000Z"),
+            duration = null, isAllDay = false, status = EventStatus.CONFIRMED, sequence = 0, rrule = null,
+            exdates = emptyList(), recurrenceId = null, alarms = listOf(alarm), categories = emptyList(), organizer = null,
+            attendees = emptyList(), color = null, dtstamp = null, lastModified = null, created = null,
+            transparency = Transparency.OPAQUE, url = null, rawProperties = emptyMap()
+        )
+        val ics = ICalGenerator().generate(event)
+        val unfolded = ics.replace(Regex("\r\n[ \t]"), "")
+        assertTrue(unfolded.contains("""DESCRIPTION:Bring a\, b\; c\\d\nnext\nlast"""), unfolded)
+        assertTrue(unfolded.contains("""SUMMARY:Subject\, with\; marks"""), unfolded)
+        assertTrue(unfolded.contains("""RELATED-TO:rel\;1\,2"""), unfolded)
+        assertFalse(unfolded.contains("\r\nnext"), "no raw line break inside the value")
+
+        val parsed = (org.onekash.icaldav.parser.ICalParser().parseAllEvents(ics) as ParseResult.Success).value.single()
+        assertEquals("Bring a, b; c\\d\nnext\nlast", parsed.alarms.single().description)
+        assertEquals("Subject, with; marks", parsed.alarms.single().summary)
+    }
 }

@@ -48,7 +48,7 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
 
-    // ICS parsing/generation — vendored icaldav-core (ical4j 4.3.0 confined to that
+    // ICS parsing/generation: vendored icaldav-core (ical4j 4.4.0 confined to that
     // subproject). The MCP source depends on icaldav's API only; ical4j is NOT a
     // direct dependency here and must not be re-added (two ical4j majors on one
     // classpath collide on net.fortuna.ical4j.* classes).
@@ -62,6 +62,8 @@ dependencies {
     testImplementation(libs.mockk)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.okhttp.mockwebserver)
+    // Property-test harness (testutil.PropertyRuns and kotest-property), shared from icaldav-core.
+    testImplementation(testFixtures(project(":icaldav-core")))
 }
 
 tasks.test {
@@ -91,6 +93,15 @@ tasks.test {
         System.getProperty("user.timezone")?.takeIf { it.isNotBlank() }
             ?: TimeZone.getDefault().id
     )
+    // Property tests (testutil.PropertyRuns): -PpropertySeed=<seed>|random replays a printed seed
+    // or draws a new one, -PpropertyIterations=<n> multiplies the iterations. Never up to date
+    // while set, so a repeated random run draws again.
+    listOf("propertySeed", "propertyIterations").forEach { key ->
+        if (project.hasProperty(key)) {
+            systemProperty(key, project.property(key).toString())
+            outputs.upToDateWhen { false }
+        }
+    }
     // Integration tests share a single real iCloud account, so serialize them to
     // avoid ETag races and cross-test event collisions on the same calendar.
     if (project.hasProperty("integration")) {

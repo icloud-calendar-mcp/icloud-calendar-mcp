@@ -423,4 +423,79 @@ class ICalParserTest {
         val event = result.getOrNull()!![0]
         assertEquals("-33.8688;151.2093", event.geo)
     }
+
+    // ========== TEXT escapes and blank UID ==========
+
+    private fun parseOne(vevent: String): org.onekash.icaldav.model.ICalEvent {
+        val ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//Test//EN\r\nBEGIN:VEVENT\r\n" +
+            vevent.trimIndent().replace("\n", "\r\n") + "\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        return (parser.parseAllEvents(ics) as ParseResult.Success).value.single()
+    }
+
+    @Test
+    fun `an uppercase N escape decodes to a newline in SUMMARY, DESCRIPTION and LOCATION`() {
+        val event = parseOne("""
+            UID:upper-n@test
+            DTSTART:20260301T090000Z
+            SUMMARY:Line one\NLine two
+            DESCRIPTION:A\NB\nC
+            LOCATION:Room 1\NFloor 2
+        """)
+        assertEquals("Line one\nLine two", event.summary)
+        assertEquals("A\nB\nC", event.description)
+        assertEquals("Room 1\nFloor 2", event.location)
+    }
+
+    @Test
+    fun `an escaped backslash followed by N stays a backslash and N`() {
+        val event = parseOne("""
+            UID:path@test
+            DTSTART:20260301T090000Z
+            SUMMARY:Path
+            DESCRIPTION:C:\\Notes\, semi\; done
+        """)
+        assertEquals("C:\\Notes, semi; done", event.description)
+    }
+
+    @Test
+    fun `a blank UID is treated like a missing one`() {
+        val event = parseOne("""
+            UID:
+            DTSTART:20260301T090000Z
+            SUMMARY:No UID
+        """)
+        assertTrue(event.uid.isNotBlank(), "a blank UID gets the missing-UID fallback: '${event.uid}'")
+        val spaces = parseOne("UID:   \nDTSTART:20260301T090000Z\nSUMMARY:Spaces")
+        assertTrue(spaces.uid.isNotBlank(), "a whitespace UID gets the missing-UID fallback: '${spaces.uid}'")
+    }
+
+    // ========== Review fixes: uppercase N scope, shared blank UID ==========
+
+    @Test
+    fun `an uppercase N outside TEXT values is left as written`() {
+        val ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//Test//EN\r\nBEGIN:VEVENT\r\n" +
+            "UID:WIN\\Name-123\r\nDTSTART:20260301T090000Z\r\nSUMMARY:One\\NTwo\r\n" +
+            "ATTENDEE;CN=CORP\\Nina:mailto:nina@example.com\r\nURL:https://example.com/a\\Nb\r\n" +
+            "X-MS-PATH:C:\\Notes\\New\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        val event = (parser.parseAllEvents(ics) as ParseResult.Success).value.single()
+        assertEquals("One\nTwo", event.summary, "TEXT values still decode \\N")
+        assertEquals("WIN\\Name-123", event.uid)
+        assertEquals("CORP\\Nina", event.attendees.single().name)
+        // ical4j writes the URL's backslash as %5C; the N stays uppercase, so no newline was made.
+        assertEquals("https://example.com/a%5CNb", event.url)
+        assertEquals(listOf("X-MS-PATH:C:\\Notes\\New"), event.unknownPropertyLines)
+    }
+
+    @Test
+    fun `VEVENTs with a blank UID in one resource share one stable fallback UID`() {
+        val ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//Test//EN\r\n" +
+            "BEGIN:VEVENT\r\nUID:\r\nDTSTART:20260301T090000Z\r\nRRULE:FREQ=DAILY;COUNT=3\r\nSUMMARY:Series\r\nEND:VEVENT\r\n" +
+            "BEGIN:VEVENT\r\nUID:\r\nRECURRENCE-ID:20260302T090000Z\r\nDTSTART:20260302T100000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\n" +
+            "END:VCALENDAR\r\n"
+        val first = (parser.parseAllEvents(ics) as ParseResult.Success).value
+        val second = (parser.parseAllEvents(ics) as ParseResult.Success).value
+        assertEquals(1, first.map { it.uid }.toSet().size, "master and override share the fallback UID")
+        assertTrue(first[0].uid.isNotBlank())
+        assertEquals(first.map { it.uid }, second.map { it.uid }, "the fallback UID is the same on every parse")
+    }
 }

@@ -2,6 +2,7 @@ package org.onekash.mcp.calendar.ics
 
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
+import kotlin.test.assertFailsWith
 import java.time.Instant
 
 /**
@@ -1078,5 +1079,65 @@ class IcsBuilderTest {
             alarms = emptyList()
         )
         assertFalse(ics.contains("BEGIN:VALARM"), "Empty alarms list emits nothing:\n$ics")
+    }
+
+    // ========== exdates / rdates input forms ==========
+
+    private fun buildNy(rrule: String, exdates: List<String>? = null, rdates: List<String>? = null) = builder.build(
+        uid = "forms@test", summary = "Forms",
+        startTime = "2026-03-01T10:00:00", endTime = "2026-03-01T11:00:00", timezone = "America/New_York",
+        rrule = rrule, exdates = exdates, rdates = rdates
+    )
+
+    @Test
+    fun `a date exdate on a one-per-day timed series becomes that day's occurrence in the series zone`() {
+        val ics = buildNy("FREQ=DAILY;COUNT=5", exdates = listOf("2026-03-03"))
+        assertTrue(ics.contains("EXDATE;TZID=America/New_York:20260303T100000"), ics)
+    }
+
+    @Test
+    fun `a date exdate on a multi-per-day timed series is rejected`() {
+        assertFailsWith<IcsBuilder.AmbiguousRecurrenceDateException> {
+            buildNy("FREQ=DAILY;BYHOUR=10,17;COUNT=6", exdates = listOf("2026-03-03"))
+        }
+    }
+
+    @Test
+    fun `a naive date-time exdate is read in the series zone`() {
+        val ics = buildNy("FREQ=DAILY;COUNT=5", exdates = listOf("2026-03-03T10:00:00"))
+        assertTrue(ics.contains("EXDATE;TZID=America/New_York:20260303T100000"), ics)
+    }
+
+    @Test
+    fun `a UTC exdate is stored as that instant`() {
+        val ics = buildNy("FREQ=DAILY;COUNT=5", exdates = listOf("2026-03-03T15:00:00Z"))
+        assertTrue(ics.contains("EXDATE:20260303T150000Z"), ics)
+    }
+
+    @Test
+    fun `date-time exdates on an all-day series become dates`() {
+        val ics = builder.build(
+            uid = "allday-forms@test", summary = "All day", startDate = "2026-03-01", endDate = "2026-03-01",
+            isAllDay = true, rrule = "FREQ=DAILY;COUNT=5",
+            exdates = listOf("2026-03-02T10:00:00", "2026-03-03T23:00:00Z")
+        )
+        val exdateLines = ics.replace("\r\n", "\n").lines().filter { it.startsWith("EXDATE") }
+        assertTrue(exdateLines.isNotEmpty() && exdateLines.all { it.startsWith("EXDATE;VALUE=DATE:") }, ics)
+        assertTrue(exdateLines.joinToString(",").contains("20260302"), ics)
+        assertTrue(exdateLines.joinToString(",").contains("20260303"), "the Z value lands on its UTC date:\n$ics")
+        assertFalse(ics.contains("EXDATE:2026"), "no DATE-TIME EXDATE on an all-day series:\n$ics")
+    }
+
+    @Test
+    fun `rdates take the same three forms as exdates`() {
+        val dated = buildNy("FREQ=DAILY;COUNT=5", rdates = listOf("2026-03-10"))
+        assertTrue(dated.contains("RDATE;TZID=America/New_York:20260310T100000"), dated)
+        val naive = buildNy("FREQ=DAILY;COUNT=5", rdates = listOf("2026-03-10T15:00:00"))
+        assertTrue(naive.contains("RDATE;TZID=America/New_York:20260310T150000"), naive)
+        val utcSeries = builder.build(
+            uid = "utc-rdate@test", summary = "UTC", startTime = "2026-03-01T10:00:00Z", endTime = "2026-03-01T11:00:00Z",
+            rrule = "FREQ=DAILY;COUNT=5", rdates = listOf("2026-03-10T15:00:00")
+        )
+        assertTrue(utcSeries.contains("RDATE:20260310T150000Z"), "a naive value on a UTC series is UTC:\n$utcSeries")
     }
 }

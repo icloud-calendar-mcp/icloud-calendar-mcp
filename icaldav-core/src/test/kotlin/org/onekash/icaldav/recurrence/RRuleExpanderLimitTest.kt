@@ -27,7 +27,7 @@ import kotlin.test.assertTrue
  *
  * Two properties are asserted together:
  *  - EFFECTIVE: a far-seed FREQ=SECONDLY (a seed decades before the window) aborts
- *    quickly. This is the case ical4j 4.3.0 mishandles: its own seed fast-forward in
+ *    quickly. This is the case ical4j mishandles (4.3.0 and 4.4.0): its own seed fast-forward in
  *    RecurDateSpliterator doubles an int multiplier and overflows to 0 for a large
  *    seconds gap, spinning forever. The expander fast-forwards the seed itself with
  *    overflow-safe long math to avoid it.
@@ -116,7 +116,7 @@ class RRuleExpanderLimitTest {
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS)
     fun `far-seed SECONDLY from 1970 aborts fast (ical4j overflow guard)`() {
-        // DTSTART decades before the window. Handed straight to ical4j 4.3.0 this
+        // DTSTART decades before the window. Handed straight to ical4j (4.4.0 too) this
         // hangs forever (its int-multiplier seed fast-forward overflows to 0). The
         // expander fast-forwards the seed itself, then aborts at the bound.
         val event = event(rrule = RRule(freq = Frequency.SECONDLY), start = zdt(1970, 1, 1))

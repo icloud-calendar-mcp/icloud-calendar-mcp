@@ -23,7 +23,7 @@ class CalDavBackoffTest {
                 .build()
             OkHttpCalDavClient(
                 server.url("/").toString().trimEnd('/'),
-                CalDavCredentials("test@icloud.com", "test-password"),
+                CalDavCredentials("test@example.com", "test-password"),
                 http
             ).use { client ->
                 client.skipWellKnownDiscovery()

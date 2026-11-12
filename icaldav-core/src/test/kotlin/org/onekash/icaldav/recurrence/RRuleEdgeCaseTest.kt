@@ -636,7 +636,7 @@ class RRuleEdgeCaseTest {
                 summary = "Modified Event"
             )
 
-            val overrides = RRuleExpander.buildOverrideMap(listOf(overrideEvent))
+            val overrides = listOf(overrideEvent)
 
             val range = TimeRange(
                 startZdt.toInstant(),
@@ -655,36 +655,39 @@ class RRuleEdgeCaseTest {
         }
 
         @Test
-        fun `buildOverrideMap creates correct day code mapping`() {
-            val recIdZdt = LocalDateTime.of(2024, 1, 15, 10, 0)
-                .atZone(ZoneId.systemDefault())
-
+        fun `an override replaces the occurrence at its RECURRENCE-ID instant`() {
+            val utc = java.time.ZoneOffset.UTC
+            val recIdZdt = LocalDateTime.of(2024, 1, 15, 10, 0).atZone(utc)
+            val master = createEvent(
+                uid = "test",
+                dtStart = ICalDateTime.fromZonedDateTime(LocalDateTime.of(2024, 1, 10, 10, 0).atZone(utc), false)
+            ).copy(rrule = RRule(freq = Frequency.DAILY, interval = 1, count = 10))
             val overrideEvent = createEvent(
                 uid = "test",
                 dtStart = ICalDateTime.fromZonedDateTime(recIdZdt.plusHours(4), false)
-            ).copy(
-                recurrenceId = ICalDateTime.fromZonedDateTime(recIdZdt, false)
-            )
+            ).copy(recurrenceId = ICalDateTime.fromZonedDateTime(recIdZdt, false), summary = "Moved")
 
-            val overrideMap = RRuleExpander.buildOverrideMap(listOf(overrideEvent))
+            val occurrences = expander.expand(master, TimeRange.forMonth(2024, 1, utc), listOf(overrideEvent))
 
-            assertEquals(1, overrideMap.size)
-            assertTrue(overrideMap.containsKey("20240115"))
+            val jan15 = occurrences.filter { it.dtStart.toLocalDate() == java.time.LocalDate.of(2024, 1, 15) }
+            assertEquals(1, jan15.size)
+            assertEquals("Moved", jan15[0].summary)
+            assertEquals(14, jan15[0].dtStart.toInstant().atZone(utc).hour)
         }
 
         @Test
-        fun `events without recurrenceId are excluded from override map`() {
-            val regularEvent = createEvent(
+        fun `events without recurrenceId in the override list are ignored`() {
+            val utc = java.time.ZoneOffset.UTC
+            val master = createEvent(
                 uid = "regular",
-                dtStart = ICalDateTime.fromZonedDateTime(
-                    LocalDateTime.of(2024, 1, 1, 10, 0).atZone(ZoneId.systemDefault()),
-                    false
-                )
-            )
+                dtStart = ICalDateTime.fromZonedDateTime(LocalDateTime.of(2024, 1, 1, 10, 0).atZone(utc), false)
+            ).copy(rrule = RRule(freq = Frequency.DAILY, interval = 1, count = 3))
+            val regularEvent = master.copy(rrule = null, summary = "Not an override")
 
-            val overrideMap = RRuleExpander.buildOverrideMap(listOf(regularEvent))
+            val occurrences = expander.expand(master, TimeRange.forMonth(2024, 1, utc), listOf(regularEvent))
 
-            assertTrue(overrideMap.isEmpty())
+            assertEquals(3, occurrences.size)
+            assertTrue(occurrences.none { it.summary == "Not an override" })
         }
     }
 

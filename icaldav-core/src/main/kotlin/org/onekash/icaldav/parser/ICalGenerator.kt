@@ -364,12 +364,7 @@ class ICalGenerator(
             crlfLine("LAST-MODIFIED:${it.toICalString()}")
         }
 
-        // Raw properties (X-*, CLASS, and other unhandled properties for round-trip)
-        event.rawProperties.forEach { (key, value) ->
-            // Key may contain parameters: "X-APPLE-STRUCTURED-LOCATION;VALUE=URI"
-            // In that case, output as-is with the value
-            appendFoldedLine("$key:$value")
-        }
+        appendUnknownProperties(event.unknownPropertyLines, event.rawProperties)
 
         crlfLine("END:VEVENT")
     }
@@ -406,14 +401,14 @@ class ICalGenerator(
         // Description: RFC 5545 §3.6.6 makes DESCRIPTION mandatory for both DISPLAY
         // (text to show) and EMAIL (message body). AUDIO has no DESCRIPTION.
         if (alarm.action == AlarmAction.DISPLAY || alarm.action == AlarmAction.EMAIL) {
-            crlfLine("DESCRIPTION:${alarm.description ?: "Reminder"}")
+            crlfLine("DESCRIPTION:${escapeICalText(alarm.description ?: "Reminder")}")
         }
 
         // Summary: RFC 5545 §3.6.6 makes SUMMARY mandatory for EMAIL (message
         // subject). Emit whenever provided; default it for EMAIL so the required
         // property is never dropped.
         (alarm.summary ?: if (alarm.action == AlarmAction.EMAIL) "Reminder" else null)?.let {
-            crlfLine("SUMMARY:$it")
+            crlfLine("SUMMARY:${escapeICalText(it)}")
         }
 
         // Repeat
@@ -430,7 +425,7 @@ class ICalGenerator(
         }
 
         alarm.relatedTo?.let {
-            crlfLine("RELATED-TO:$it")
+            crlfLine("RELATED-TO:${escapeICalText(it)}")
         }
 
         // RFC 9074: DEFAULT-ALARM
@@ -545,6 +540,20 @@ class ICalGenerator(
     }
 
     /**
+     * Write the properties the model doesn't cover. Original lines from the parser are written
+     * unchanged (RFC 5545 3.2.20), only folded. Components built without them, such as newly
+     * created ones, fall back to the name-value map, whose key may carry parameters
+     * ("X-APPLE-STRUCTURED-LOCATION;VALUE=URI").
+     */
+    private fun StringBuilder.appendUnknownProperties(lines: List<String>, map: Map<String, String>) {
+        if (lines.isNotEmpty()) {
+            lines.forEach { appendFoldedLine(it) }
+        } else {
+            map.forEach { (key, value) -> appendFoldedLine("$key:$value") }
+        }
+    }
+
+    /**
      * Format DTSTAMP as UTC timestamp.
      */
     private fun formatDtStamp(): String {
@@ -557,6 +566,10 @@ class ICalGenerator(
      */
     private fun escapeICalText(text: String): String {
         return text
+            // Normalize CRLF and a lone CR to one LF first: a bare CR is a control character
+            // outside VALUE-CHAR (RFC 5545 3.1), and CRLF must not become two line breaks.
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
             .replace("\\", "\\\\")
             .replace("\n", "\\n")
             .replace(",", "\\,")
@@ -839,10 +852,7 @@ class ICalGenerator(
             crlfLine("LAST-MODIFIED:${it.toICalString()}")
         }
 
-        // Raw properties for round-trip
-        todo.rawProperties.forEach { (key, value) ->
-            appendFoldedLine("$key:$value")
-        }
+        appendUnknownProperties(todo.unknownPropertyLines, todo.rawProperties)
 
         crlfLine("END:VTODO")
     }
@@ -961,10 +971,7 @@ class ICalGenerator(
             crlfLine("LAST-MODIFIED:${it.toICalString()}")
         }
 
-        // Raw properties for round-trip
-        journal.rawProperties.forEach { (key, value) ->
-            appendFoldedLine("$key:$value")
-        }
+        appendUnknownProperties(journal.unknownPropertyLines, journal.rawProperties)
 
         crlfLine("END:VJOURNAL")
     }

@@ -188,7 +188,7 @@ class IcsParser {
                             master,
                             widenedStart,
                             rangeEnd,
-                            RRuleExpander.buildOverrideMap(overridesByUid[master.uid].orEmpty())
+                            overridesByUid[master.uid].orEmpty()
                         )
                     } catch (e: RRuleExpander.ExpansionLimitException) {
                         throw ExpansionLimitException(e.uid, e.limit)

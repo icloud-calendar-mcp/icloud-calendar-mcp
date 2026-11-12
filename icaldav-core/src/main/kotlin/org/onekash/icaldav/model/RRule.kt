@@ -219,6 +219,10 @@ data class WeekdayNum(
                 ?: throw IllegalArgumentException("Invalid weekday: $value")
 
             val ordinal = match.groupValues[1].takeIf { it.isNotEmpty() }?.toIntOrNull()
+            // RFC 5545 3.3.10: ordwk is 1 to 53, with an optional sign; 0 names no week.
+            if (ordinal != null && (ordinal == 0 || ordinal !in -53..53)) {
+                throw IllegalArgumentException("Invalid weekday ordinal: $value")
+            }
             val day = when (match.groupValues[2]) {
                 "MO" -> DayOfWeek.MONDAY
                 "TU" -> DayOfWeek.TUESDAY

@@ -1,5 +1,12 @@
 package org.onekash.mcp.calendar.caldav
 
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.arbitrary
+import io.kotest.property.arbitrary.element
+import io.kotest.property.arbitrary.int
+import io.kotest.property.checkAll
+import kotlinx.coroutines.runBlocking
+import org.onekash.icaldav.testutil.PropertyRuns
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -899,5 +906,69 @@ class ICloudXmlParserTest {
         val etags = parser.parseEtags(xml)
         assertEquals(1, etags.size)
         assertNull(etags["/cal/event.ics"])
+    }
+
+    // ========== DAV:error preconditions (RFC 4918 16, RFC 4791 5.3.2.1) ==========
+
+    @Test
+    fun `parsePreconditions returns the element names inside a DAV error body`() {
+        val body = """<?xml version="1.0" encoding="utf-8"?>
+            <D:error xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+              <C:supported-calendar-component/>
+              <C:valid-calendar-data>details the server wrote</C:valid-calendar-data>
+            </D:error>"""
+        assertEquals(listOf("supported-calendar-component", "valid-calendar-data"), parser.parsePreconditions(body))
+    }
+
+    @org.junit.jupiter.api.Timeout(5)
+    @Test
+    fun `parsePreconditions returns nothing for an empty, non-XML, non-error or entity-laden body`() {
+        assertEquals(emptyList(), parser.parsePreconditions(""))
+        assertEquals(emptyList(), parser.parsePreconditions("Access denied"))
+        assertEquals(emptyList(), parser.parsePreconditions("<D:multistatus xmlns:D=\"DAV:\"><D:response/></D:multistatus>"))
+        assertEquals(emptyList(), parser.parsePreconditions("<D:error xmlns:D=\"DAV:\"><unclosed>"))
+        val laughs = """<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;&lol;">
+            <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;">]><D:error xmlns:D="DAV:"><D:x>&lol3;</D:x></D:error>"""
+        assertEquals(emptyList(), parser.parsePreconditions(laughs))
+    }
+
+    @Test
+    fun `parsePreconditions caps the names at five and drops names outside the allowed pattern`() {
+        val body = "<D:error xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">" +
+            "<C:a/><C:b/><C:has_underscore/><C:${"x".repeat(65)}/><C:c/><C:d/><C:e/><C:f/></D:error>"
+        val names = parser.parsePreconditions(body)
+        assertEquals(listOf("a", "b", "c", "d", "e"), names)
+    }
+
+    @org.junit.jupiter.api.Timeout(20)
+    @Test
+    fun `parsePreconditions never throws and returns at most five well-formed names`(): Unit = runBlocking {
+        val namePart = arbitrary {
+            val n = StringBuilder()
+            repeat(Arb.int(1..70).bind()) {
+                n.append(Arb.element("a", "Z", "-", "_", "1", ".").bind())
+            }
+            "x$n"
+        }
+        val docs = arbitrary {
+            if (Arb.int(0..2).bind() == 0) {
+                // Arbitrary text, often not XML at all.
+                val t = StringBuilder()
+                repeat(Arb.int(0..200).bind()) {
+                    t.append(Arb.element("<", ">", "/", "D:", "error", "&", ";", "\"", "a", " ", "\u0000", "é").bind())
+                }
+                t.toString()
+            } else {
+                // A well-formed DAV:error whose child names often fall outside the allowed pattern.
+                val children = StringBuilder()
+                repeat(Arb.int(0..12).bind()) { children.append("<C:${namePart.bind()}/>") }
+                "<D:error xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">$children</D:error>"
+            }
+        }
+        checkAll(PropertyRuns.config(300), docs) { doc ->
+            val names = parser.parsePreconditions(doc)
+            assertTrue(names.size <= ICloudXmlParser.MAX_PRECONDITIONS, "$doc -> $names")
+            assertTrue(names.all { ICloudXmlParser.PRECONDITION_NAME.matches(it) }, "$doc -> $names")
+        }
     }
 }

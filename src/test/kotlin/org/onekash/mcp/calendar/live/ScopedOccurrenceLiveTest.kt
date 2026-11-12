@@ -137,4 +137,95 @@ class ScopedOccurrenceLiveTest : LiveCalendarTestBase() {
         assertTrue(newAfter.all { it.summary.contains("renamed onward") }, "new series carries the patch: $newAfter")
         assertTrue(newAfter.all { it.startDay() >= splitDay }, "new series starts at the split: $newAfter")
     }
+
+    @Test
+    @DisplayName("renaming a series with all_events keeps an occurrence edited with this_occurrence")
+    fun renameSeriesKeepsEditedOccurrence() {
+        val start = base.plusDays(30)
+        val series = createTracked(
+            summary = "scoped rename series",
+            startTime = "${start}T09:00:00Z",
+            endTime = "${start}T09:30:00Z",
+            rrule = "FREQ=DAILY;COUNT=4"
+        )
+        val before = occurrences(series.uid, start.minusDays(1), start.plusDays(5))
+        assertEquals(4, before.size, "series expands to four occurrences")
+
+        val editedDay = start.plusDays(1).toString()
+        val target = before.first { it.startDay() == editedDay }
+        val edited = service.updateEvent(
+            target.handle!!,
+            summary = prefixed("edited occurrence"),
+            scope = EventScope.THIS_OCCURRENCE
+        )
+        assertTrue(edited is ServiceResult.Success, "occurrence edit succeeds: $edited")
+
+        val renamed = service.updateEvent(
+            series.handle!!,
+            summary = prefixed("renamed series"),
+            scope = EventScope.ALL_EVENTS
+        )
+        assertTrue(renamed is ServiceResult.Success, "series rename succeeds: $renamed")
+
+        val after = occurrences(series.uid, start.minusDays(1), start.plusDays(5))
+        assertEquals(4, after.size, "still four occurrences after the rename: $after")
+        assertEquals(
+            prefixed("edited occurrence"), after.first { it.startDay() == editedDay }.summary,
+            "the edited occurrence keeps its own summary: $after"
+        )
+        assertTrue(
+            after.filter { it.startDay() != editedDay }.all { it.summary == prefixed("renamed series") },
+            "the other occurrences carry the new series name: $after"
+        )
+    }
+
+    @Test
+    @DisplayName("delete this_occurrence on a twice-daily series removes one instance; its same-day sibling stays")
+    fun deleteOneOfTwoSameDayOccurrences() {
+        val start = base.plusDays(40)
+        val series = createTracked(
+            summary = "scoped twice-daily series",
+            startTime = "${start}T09:00:00Z",
+            endTime = "${start}T09:30:00Z",
+            rrule = "FREQ=DAILY;BYHOUR=9,17;COUNT=4"
+        )
+        val before = occurrences(series.uid, start.minusDays(1), start.plusDays(3))
+        assertEquals(4, before.size, "two days of 09:00 and 17:00: $before")
+
+        val day2 = start.plusDays(1).toString()
+        val victim = before.first { it.startDay() == day2 && it.startHour() == "09" }
+        val deleted = service.deleteEvent(victim.handle!!, scope = EventScope.THIS_OCCURRENCE)
+        assertTrue(deleted is ServiceResult.Success, "occurrence delete succeeds: $deleted")
+
+        val after = occurrences(series.uid, start.minusDays(1), start.plusDays(3))
+        assertEquals(3, after.size, "one instance gone: $after")
+        assertFalse(after.any { it.startDay() == day2 && it.startHour() == "09" }, "the deleted 09:00 is absent: $after")
+        assertTrue(after.any { it.startDay() == day2 && it.startHour() == "17" }, "the same-day 17:00 stays: $after")
+    }
+
+    @Test
+    @DisplayName("an exdate equal to an occurrence's UTC startTime removes exactly it in Seoul and Los Angeles")
+    fun exdateFromStartTimeInNonUtcZones() {
+        for ((offset, zone, localTime) in listOf(Triple(50L, "Asia/Seoul", "08:00"), Triple(60L, "America/Los_Angeles", "20:00"))) {
+            val start = base.plusDays(offset)
+            val series = createTracked(
+                summary = "exdate $zone series",
+                startTime = "${start}T$localTime:00",
+                endTime = "${start}T${localTime.take(2)}:30:00",
+                timezone = zone,
+                rrule = "FREQ=DAILY;COUNT=5"
+            )
+            val before = occurrences(series.uid, start.minusDays(1), start.plusDays(6))
+            assertEquals(5, before.size, "$zone: five occurrences: $before")
+            val victim = before.sortedBy { it.startTime }[2]
+            val updated = service.updateEvent(series.handle!!, exdates = listOf(victim.startTime!!))
+            assertTrue(updated is ServiceResult.Success, "$zone: exdate update succeeds: $updated")
+
+            val after = occurrences(series.uid, start.minusDays(1), start.plusDays(6))
+            assertEquals(
+                before.mapNotNull { it.startTime }.sorted() - victim.startTime!!, after.mapNotNull { it.startTime }.sorted(),
+                "$zone: exactly the chosen occurrence is gone"
+            )
+        }
+    }
 }

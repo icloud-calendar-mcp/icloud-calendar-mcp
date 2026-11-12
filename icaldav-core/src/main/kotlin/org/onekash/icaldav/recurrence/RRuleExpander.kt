@@ -51,16 +51,16 @@ class RRuleExpander {
      * RecurrenceSet = (DTSTART ∪ RRULE ∪ RDATE) - EXDATE
      *
      * @param masterEvent The event with RRULE and/or RDATE
-     * @param rangeStart Start of expansion range (inclusive)
+     * @param rangeStart Start of expansion range (inclusive); an all-day series counts from the start of its day
      * @param rangeEnd End of expansion range (exclusive)
-     * @param overrides Map of RECURRENCE-ID daycodes to modified ICalEvent
+     * @param overrides The series' RECURRENCE-ID override events, matched to occurrences by instant
      * @return List of occurrence events with adjusted timestamps
      */
     fun expand(
         masterEvent: ICalEvent,
         rangeStart: Instant,
         rangeEnd: Instant,
-        overrides: Map<String, ICalEvent> = emptyMap()
+        overrides: List<ICalEvent> = emptyList()
     ): List<ICalEvent> {
         val rrule = masterEvent.rrule
 
@@ -69,44 +69,16 @@ class RRuleExpander {
             return listOf(masterEvent)
         }
 
-        val occurrences = mutableListOf<ICalEvent>()
-
-        // Get the event's timezone for calculations. This MUST match the zone
-        // `ICalDateTime.toZonedDateTime()` resolves the master's DTSTART in, since
-        // the seed's local time is re-interpreted in this zone to build each
-        // occurrence. For all-day events (isDate=true) and UTC (Z-form) events,
-        // that zone is UTC — reading the nullable `timezone` field alone would fall
-        // back to the machine default and desync the seed from the occurrences on a
-        // non-UTC host.
-        val eventZone = when {
-            masterEvent.isAllDay -> ZoneOffset.UTC
-            masterEvent.dtStart.isUtc -> ZoneOffset.UTC
-            else -> masterEvent.dtStart.timezone ?: ZoneId.systemDefault()
-        }
-
-        // Calculate event duration for creating occurrence end times
+        val eventZone = eventZoneOf(masterEvent)
         val eventDuration = calculateDuration(masterEvent)
 
-        // Build set of excluded day codes from EXDATE
-        val excludedDayCodes = masterEvent.exdates.map { it.toDayCode() }.toSet()
-
-        // Index overrides by the INSTANT of their RECURRENCE-ID, normalized to
-        // the master's value type/zone. RECURRENCE-ID identifies the original
-        // occurrence's instant (RFC 5545 §3.8.4.4), not a calendar day — matching
-        // by instant is timezone-independent, unlike the day-code path which
-        // resolved Z-form/floating values in the JVM default zone. `overrides` is
-        // keyed by day code (buildOverrideMap's public contract) but its keys are
-        // ignored here; only the values' RECURRENCE-IDs drive matching.
-        val overridesByInstant: List<Pair<Long, ICalEvent>> = overrides.values
-            .mapNotNull { ovr ->
-                ovr.recurrenceId?.let { recId ->
-                    normalizeToMasterValueType(recId, masterEvent.dtStart).timestamp to ovr
-                }
-            }
+        // Index overrides by the INSTANT of their RECURRENCE-ID, normalized to the master's value
+        // type/zone. RECURRENCE-ID identifies the original occurrence's instant (RFC 5545
+        // 3.8.4.4), not a calendar day, so two overrides on one day stay distinct.
+        val overridesByInstant: List<Pair<Long, ICalEvent>> = overrides.mapNotNull { ovr ->
+            ovr.recurrenceId?.let { recId -> normalizeToMasterValueType(recId, masterEvent.dtStart).timestamp to ovr }
+        }
         val usedOverrides = HashSet<ICalEvent>()
-
-        // Track generated day codes to avoid duplicates between RRULE and RDATE
-        val generatedDayCodes = mutableSetOf<String>()
 
         // Find an as-yet-unused override whose normalized RECURRENCE-ID instant
         // matches [occurrenceInstantMs] within tolerance.
@@ -120,17 +92,31 @@ class RRuleExpander {
                 ?.also { usedOverrides.add(it) }
         }
 
-        // ========== RRULE Expansion ==========
+        // The EXDATE day fallback (excludedInstants) counts the instances on a day, so when it can
+        // apply (a one-per-day series with a DATE-TIME EXDATE) generate over whole days in the
+        // event's zone; a day the requested range cuts still shows all its instances. That adds at
+        // most one instance at each end. The result is cut back to the requested range below.
+        val multiPerDay = isMultiPerDay(masterEvent)
+        val dayFallback = masterEvent.exdates.any { !it.isDate } && !multiPerDay
+        val rangeStartDay = rangeStart.atZone(eventZone).toLocalDate().atStartOfDay(eventZone).toInstant()
+        val genStart = if (!dayFallback) rangeStart else minOf(rangeStart, rangeStartDay)
+        val genEnd = if (!dayFallback) rangeEnd else
+            maxOf(rangeEnd, rangeEnd.atZone(eventZone).toLocalDate().plusDays(1).atStartOfDay(eventZone).toInstant())
+        // All-day RRULE instances count from the start of the range start's day (UTC midnight);
+        // every other instance from the range start's instant. The end is exclusive for all.
+        val allDayFloorMs = rangeStartDay.toEpochMilli()
+
+        // ========== Candidate instances: RRULE, then RDATE ==========
+        val candidates = mutableListOf<Candidate>()
         if (rrule != null) {
             // Build ical4j Recur from our RRule
-            val recur = buildRecur(rrule)
+            val recur = buildRecur(rrule, eventZone, masterEvent.isAllDay)
 
             // Get start date for recurrence calculation
             val eventStartZdt = masterEvent.dtStart.toZonedDateTime()
 
-            // Generate occurrence dates using ical4j
-            val periodStart = ZonedDateTime.ofInstant(rangeStart, eventZone)
-            val periodEnd = ZonedDateTime.ofInstant(rangeEnd, eventZone)
+            val periodStart = ZonedDateTime.ofInstant(genStart, eventZone)
+            val periodEnd = ZonedDateTime.ofInstant(genEnd, eventZone)
 
             // Always use LocalDateTime - for all-day events, use midnight
             val seed = if (masterEvent.isAllDay) {
@@ -154,7 +140,7 @@ class RRuleExpander {
             // Bound expansion to MAX_ITERATIONS generated instances per series (US2,
             // CWE-400). Two parts:
             //  1. Fast-forward the seed toward the window ourselves (fastForwardSeed):
-            //     ical4j 4.3.0's own fast-forward (RecurDateSpliterator) doubles an int
+            //     ical4j's own fast-forward (RecurDateSpliterator, still in 4.4.0) doubles an int
             //     multiplier and overflows to 0 for a far-seed FREQ=SECONDLY, spinning
             //     forever. Advancing the seed to the window sidesteps that loop.
             //  2. Cap in-window generation with maxCount = MAX_ITERATIONS + 1; if the
@@ -166,40 +152,53 @@ class RRuleExpander {
             if (dates.size > MAX_ITERATIONS) {
                 throw ExpansionLimitException(masterEvent.uid, MAX_ITERATIONS)
             }
-
             for (date in dates) {
-                val occurrenceZdt = date.atZone(eventZone)
-                val occurrenceDayCode = "%04d%02d%02d".format(
-                    occurrenceZdt.year,
-                    occurrenceZdt.monthValue,
-                    occurrenceZdt.dayOfMonth
+                val zdt = date.atZone(eventZone)
+                candidates.add(Candidate(zdt.toInstant().toEpochMilli(), zdt.toLocalDate(), rrule = zdt, rdate = null))
+            }
+        }
+
+        // RDATEs add instances; an RDATE at an instant RRULE already generated counts once
+        // (RFC 5545 3.8.5.3). The dedupe is by instant, so an RDATE at another time of an
+        // occupied day adds its own instance.
+        val generatedInstants = candidates.mapTo(HashSet()) { it.instantMs }
+        for (rdate in masterEvent.rdates) {
+            if (rdate.timestamp < genStart.toEpochMilli() || rdate.timestamp >= genEnd.toEpochMilli()) continue
+            if (!generatedInstants.add(rdate.timestamp)) continue
+            candidates.add(Candidate(rdate.timestamp, dayOf(rdate, eventZone), rrule = null, rdate = rdate))
+        }
+
+        // ========== EXDATE ==========
+        val excluded = excludedInstants(masterEvent, candidates, generatedInstants, multiPerDay, eventZone)
+
+        // ========== Occurrences in [rangeStart, rangeEnd) ==========
+        val occurrences = mutableListOf<ICalEvent>()
+        for (candidate in candidates) {
+            if (candidate.instantMs in excluded) continue
+            val lowerMs = if (masterEvent.isAllDay && candidate.rrule != null) allDayFloorMs else rangeStart.toEpochMilli()
+            if (candidate.instantMs < lowerMs || candidate.instantMs >= rangeEnd.toEpochMilli()) continue
+
+            // If there's an override for this occurrence's instant, use it instead
+            val override = matchOverride(candidate.instantMs)
+            if (override != null) {
+                occurrences.add(override)
+                continue
+            }
+
+            val occurrenceStart = candidate.rrule?.let { ICalDateTime.fromZonedDateTime(it, masterEvent.isAllDay) }
+                ?: candidate.rdate!!
+            val occurrenceEnd = eventDuration?.let { dur ->
+                ICalDateTime.fromTimestamp(
+                    occurrenceStart.timestamp + dur.toMillis(),
+                    occurrenceStart.timezone,
+                    masterEvent.isAllDay
                 )
-
-                // Skip if excluded by EXDATE
-                if (occurrenceDayCode in excludedDayCodes) continue
-
-                // Track this day code as generated
-                generatedDayCodes.add(occurrenceDayCode)
-
-                // If there's an override for this occurrence's instant, use it instead
-                val override = matchOverride(occurrenceZdt.toInstant().toEpochMilli())
-                if (override != null) {
-                    occurrences.add(override)
-                    continue
-                }
-
-                // Create occurrence event with adjusted timestamps
-                val occurrenceStart = ICalDateTime.fromZonedDateTime(occurrenceZdt, masterEvent.isAllDay)
-                val occurrenceEnd = eventDuration?.let { dur ->
-                    ICalDateTime.fromTimestamp(
-                        occurrenceStart.timestamp + dur.toMillis(),
-                        occurrenceStart.timezone,
-                        masterEvent.isAllDay
-                    )
-                }
-
-                val occurrence = masterEvent.copy(
-                    importId = "${masterEvent.uid}:OCC:$occurrenceDayCode",
+            }
+            val dayCode = candidate.rdate?.toDayCode()
+                ?: "%04d%02d%02d".format(candidate.day.year, candidate.day.monthValue, candidate.day.dayOfMonth)
+            occurrences.add(
+                masterEvent.copy(
+                    importId = "${masterEvent.uid}:OCC:$dayCode",
                     dtStart = occurrenceStart,
                     dtEnd = occurrenceEnd,
                     rrule = null,
@@ -207,59 +206,58 @@ class RRuleExpander {
                     rdates = emptyList(),
                     recurrenceId = null
                 )
-
-                occurrences.add(occurrence)
-            }
-        }
-
-        // ========== RDATE Expansion ==========
-        // Add occurrences from RDATE that are within range, not excluded, and not duplicates
-        for (rdate in masterEvent.rdates) {
-            // Check if within range
-            if (rdate.timestamp < rangeStart.toEpochMilli() ||
-                rdate.timestamp >= rangeEnd.toEpochMilli()) continue
-
-            val rdateDayCode = rdate.toDayCode()
-
-            // Skip if excluded by EXDATE
-            if (rdateDayCode in excludedDayCodes) continue
-
-            // Skip if already generated by RRULE (avoid duplicates)
-            if (rdateDayCode in generatedDayCodes) continue
-
-            // Track this day code
-            generatedDayCodes.add(rdateDayCode)
-
-            // If there's an override for this occurrence's instant, use it instead
-            val override = matchOverride(rdate.timestamp)
-            if (override != null) {
-                occurrences.add(override)
-                continue
-            }
-
-            // Create occurrence from RDATE
-            val occurrenceEnd = eventDuration?.let { dur ->
-                ICalDateTime.fromTimestamp(
-                    rdate.timestamp + dur.toMillis(),
-                    rdate.timezone,
-                    masterEvent.isAllDay
-                )
-            }
-
-            val occurrence = masterEvent.copy(
-                importId = "${masterEvent.uid}:OCC:$rdateDayCode",
-                dtStart = rdate,
-                dtEnd = occurrenceEnd,
-                rrule = null,
-                exdates = emptyList(),
-                rdates = emptyList(),
-                recurrenceId = null
             )
-
-            occurrences.add(occurrence)
         }
 
         return occurrences.sortedBy { it.dtStart.timestamp }
+    }
+
+    /**
+     * One generated instance before EXDATE: its instant, its calendar [day] in the event's zone,
+     * and where it came from ([rrule] for an RRULE instance, [rdate] for an RDATE).
+     */
+    private class Candidate(
+        val instantMs: Long,
+        val day: LocalDate,
+        val rrule: ZonedDateTime?,
+        val rdate: ICalDateTime?
+    )
+
+    /**
+     * The candidate instants EXDATE removes (RFC 5545 3.8.5.1), with hybrid matching:
+     * - a DATE-TIME EXDATE removes the instance at its exact instant;
+     * - if it matches no instance, a series with one occurrence per day ([isMultiPerDay] false)
+     *   removes the instance on the EXDATE's calendar day in [eventZone], but only when that day
+     *   holds exactly one instance; a multi-per-day series removes nothing;
+     * - a DATE EXDATE removes every instance on its date.
+     */
+    private fun excludedInstants(
+        master: ICalEvent,
+        candidates: List<Candidate>,
+        instants: Set<Long>,
+        multiPerDay: Boolean,
+        eventZone: ZoneId
+    ): Set<Long> {
+        if (master.exdates.isEmpty()) return emptySet()
+        val byDay = candidates.groupBy { it.day }
+        val excluded = HashSet<Long>()
+        for (exdate in master.exdates) {
+            if (exdate.isDate) {
+                byDay[exdate.toLocalDate()]?.forEach { excluded.add(it.instantMs) }
+                continue
+            }
+            if (exdate.timestamp in instants) {
+                excluded.add(exdate.timestamp)
+                continue
+            }
+            if (multiPerDay) continue
+            // An all-day series reads a DATE-TIME EXDATE's date in its own zone, as an override's
+            // RECURRENCE-ID is (normalizeToMasterValueType); a timed series in the event's zone.
+            val day = if (master.isAllDay) exdate.toLocalDate() else dayOf(exdate, eventZone)
+            val sameDay = byDay[day]
+            if (sameDay != null && sameDay.size == 1) excluded.add(sameDay[0].instantMs)
+        }
+        return excluded
     }
 
     /**
@@ -268,7 +266,7 @@ class RRuleExpander {
     fun expand(
         masterEvent: ICalEvent,
         range: TimeRange,
-        overrides: Map<String, ICalEvent> = emptyMap()
+        overrides: List<ICalEvent> = emptyList()
     ): List<ICalEvent> = expand(masterEvent, range.start, range.end, overrides)
 
     /**
@@ -323,7 +321,7 @@ class RRuleExpander {
      * Build ical4j Recur from our RRule model.
      * Uses ical4j 4.x API with generics and java.time.
      */
-    private fun buildRecur(rrule: RRule): Recur<LocalDateTime> {
+    private fun buildRecur(rrule: RRule, eventZone: ZoneId, isAllDay: Boolean): Recur<LocalDateTime> {
         val freq = ICalFrequency.valueOf(rrule.freq.name)
         val builder = Recur.Builder<LocalDateTime>()
             .frequency(freq)
@@ -331,8 +329,16 @@ class RRuleExpander {
 
         rrule.count?.let { builder.count(it) }
         rrule.until?.let {
-            // ical4j 4.x: until() expects LocalDateTime
-            val untilDate = it.toZonedDateTime().toLocalDateTime()
+            // ical4j compares UNTIL with occurrences as wall clocks in eventZone. A UTC UNTIL (the Z
+            // form, RFC 5545 3.3.10) is an instant, so on a timed series it is moved into eventZone
+            // first; reading it as a UTC wall clock would end a TZID series at a different
+            // occurrence (one too many west of UTC, one too few east of it). Floating and DATE
+            // values, and every UNTIL on an all-day series, keep their own reading.
+            val untilDate = if (!isAllDay && it.isUtc && !it.isDate) {
+                it.toInstant().atZone(eventZone).toLocalDateTime()
+            } else {
+                it.toZonedDateTime().toLocalDateTime()
+            }
             builder.until(untilDate)
         }
 
@@ -458,16 +464,41 @@ class RRuleExpander {
         }
 
         /**
-         * Create a map of day codes to override events from a list of modified instances.
+         * True when [event]'s series can put more than one occurrence on a calendar day: its
+         * RRULE FREQ is HOURLY, MINUTELY or SECONDLY, or its BYHOUR, BYMINUTE and BYSECOND value
+         * counts multiply to more than 1, or two of DTSTART and its RDATEs share a calendar day in
+         * the event's zone. Decided from the series definition alone; a rule that BYSETPOS cuts to
+         * one per day still counts as multi-per-day.
          */
-        fun buildOverrideMap(overrideEvents: List<ICalEvent>): Map<String, ICalEvent> {
-            return overrideEvents
-                .filter { it.recurrenceId != null }
-                .associateBy { event ->
-                    // Use the RECURRENCE-ID date as the key (the original occurrence date)
-                    event.recurrenceId!!.toDayCode()
-                }
+        fun isMultiPerDay(event: ICalEvent): Boolean {
+            event.rrule?.let { rule ->
+                if (rule.freq == Frequency.HOURLY || rule.freq == Frequency.MINUTELY ||
+                    rule.freq == Frequency.SECONDLY
+                ) return true
+                val perDay = (rule.byHour?.size ?: 1) * (rule.byMinute?.size ?: 1) * (rule.bySecond?.size ?: 1)
+                if (perDay > 1) return true
+            }
+            val zone = eventZoneOf(event)
+            val days = (listOf(event.dtStart) + event.rdates).map { dayOf(it, zone) }
+            return days.size != days.toSet().size
         }
+
+        /**
+         * The zone a series is expanded in. It MUST match the zone `ICalDateTime.toZonedDateTime()`
+         * resolves the master's DTSTART in, since the seed's local time is re-interpreted in this
+         * zone to build each occurrence. All-day (DATE) and UTC (Z-form) series use UTC; reading the
+         * nullable `timezone` field alone would fall back to the machine default and desync the
+         * seed from the occurrences on a non-UTC host.
+         */
+        fun eventZoneOf(event: ICalEvent): ZoneId = when {
+            event.isAllDay -> ZoneOffset.UTC
+            event.dtStart.isUtc -> ZoneOffset.UTC
+            else -> event.dtStart.timezone ?: ZoneId.systemDefault()
+        }
+
+        /** The calendar day of [value]: its literal date for a DATE, else its instant's date in [zone]. */
+        internal fun dayOf(value: ICalDateTime, zone: ZoneId): LocalDate =
+            if (value.isDate) value.toLocalDate() else value.toInstant().atZone(zone).toLocalDate()
     }
 }
 

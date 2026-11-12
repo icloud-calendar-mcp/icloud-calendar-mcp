@@ -874,4 +874,26 @@ class IcsParserTest {
         assertEquals(2, alarms.size)
         assertEquals(setOf("-PT15M", "-P1D"), alarms.map { it.trigger }.toSet())
     }
+
+    // ========== Blank UID (pinned) ==========
+
+    private val blankUidIcs = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//Test//EN\r\nBEGIN:VEVENT\r\nUID:\r\n" +
+        "DTSTART:20260301T090000Z\r\nDTEND:20260301T100000Z\r\nSUMMARY:No UID\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+    @Test
+    fun `a blank-UID event is returned by get_events with a generated UID`() {
+        val events = parser.parseOccurrences(blankUidIcs, java.time.Instant.parse("2026-03-01T00:00:00Z"),
+            java.time.Instant.parse("2026-03-02T00:00:00Z"))
+        assertEquals(1, events.size, "the event is no longer dropped")
+        assertTrue(events[0].uid.isNotBlank())
+        assertEquals("No UID", events[0].summary)
+    }
+
+    @Test
+    fun `update_event on a blank-UID event writes a non-blank UID`() {
+        val patched = IcsPatcher().patch(existingIcs = blankUidIcs, uid = "", summary = "Renamed")
+        val uidLine = patched.replace("\r\n", "\n").lines().single { it.startsWith("UID:") }
+        assertTrue(uidLine.removePrefix("UID:").isNotBlank(), patched)
+        assertTrue(patched.contains("SUMMARY:Renamed"), patched)
+    }
 }

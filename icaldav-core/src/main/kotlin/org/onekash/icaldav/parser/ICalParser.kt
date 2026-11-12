@@ -105,6 +105,50 @@ class ICalParser(
     }
 
     companion object {
+        /**
+         * An uppercase newline escape `\N` whose leading backslash is unescaped: an even run of
+         * `\\` pairs (captured, re-emitted) followed by `\N`. `(?<!\\)` anchors the run so a
+         * `\\N` (escaped backslash and a literal N, e.g. C:\Notes) never matches. RFC 5545
+         * 3.3.11 makes `\N` equal to `\n` in TEXT values, but ical4j only decodes the lowercase
+         * form, and after its decode the two cases can't be told apart, so this runs on the raw
+         * text first.
+         */
+        private val UPPERCASE_NEWLINE_ESCAPE = Regex("""(?<!\\)((?:\\\\)*)\\N""")
+
+        /**
+         * Properties whose value is TEXT (RFC 5545 3.3.11), the only values where `\N` means a
+         * newline. Elsewhere (UID, URL, CN parameters, unknown X- values) a `\N` is data.
+         */
+        private val TEXT_PROPERTIES = setOf(
+            "SUMMARY", "DESCRIPTION", "LOCATION", "COMMENT", "CONTACT", "RESOURCES", "CATEGORIES",
+            "TZNAME", "RELATED-TO", "NAME", "X-WR-CALNAME", "X-WR-CALDESC"
+        )
+
+        /**
+         * Rewrites each unescaped `\N` to `\n` in the value of every TEXT property line of the
+         * unfolded [text] (see [UPPERCASE_NEWLINE_ESCAPE]). Property names and parameters are left
+         * alone; the value starts after the first `:` outside a quoted parameter value.
+         */
+        private fun normalizeUppercaseNewlineEscape(text: String): String {
+            if (!text.contains("\\N")) return text
+            return text.split('\n').joinToString("\n") { line -> normalizeTextValue(line) }
+        }
+
+        private fun normalizeTextValue(line: String): String {
+            if (!line.contains("\\N")) return line
+            val nameEnd = line.indexOfFirst { it == ';' || it == ':' }
+            if (nameEnd < 0 || line.substring(0, nameEnd).trim().uppercase() !in TEXT_PROPERTIES) return line
+            var quoted = false
+            var valueStart = -1
+            for ((i, c) in line.withIndex()) {
+                if (c == '"') quoted = !quoted
+                else if (c == ':' && !quoted) { valueStart = i + 1; break }
+            }
+            if (valueStart < 0) return line
+            return line.substring(0, valueStart) +
+                UPPERCASE_NEWLINE_ESCAPE.replace(line.substring(valueStart)) { "${it.groupValues[1]}\\n" }
+        }
+
         @Volatile
         private var configured = false
         private val configLock = Any()
@@ -186,18 +230,63 @@ class ICalParser(
      */
     fun parseAllEvents(icalData: String): ParseResult<List<ICalEvent>> {
         return try {
-            val unfolded = unfoldICalData(preprocessICalData(icalData))
+            val unfolded = prepare(icalData)
             val builder = createCalendarBuilder()
             val calendar = builder.build(StringReader(unfolded))
 
-            val events = calendar.getComponents<VEvent>(Component.VEVENT)
-                .mapNotNull { vevent ->
-                    parseVEvent(vevent).getOrNull()
-                }
-
-            ParseResult.success(events)
+            ParseResult.success(parseEvents(unfolded, calendar))
         } catch (e: Exception) {
             ParseResult.error("Failed to parse iCalendar data: ${e.message}", e)
+        }
+    }
+
+    private fun parseEvents(prepared: String, calendar: net.fortuna.ical4j.model.Calendar): List<ICalEvent> =
+        parseWithLines<VEvent, ICalEvent>(prepared, calendar, Component.VEVENT, handledProperties,
+            { component, uid -> parseVEvent(component, uid).getOrNull() }) { event, lines -> event.copy(unknownPropertyLines = lines) }
+
+    private fun parseTodos(prepared: String, calendar: net.fortuna.ical4j.model.Calendar): List<ICalTodo> =
+        parseWithLines<VToDo, ICalTodo>(prepared, calendar, Component.VTODO, handledTodoProperties,
+            { component, uid -> parseVTodo(component, uid).getOrNull() }) { todo, lines -> todo.copy(unknownPropertyLines = lines) }
+
+    private fun parseJournals(prepared: String, calendar: net.fortuna.ical4j.model.Calendar): List<ICalJournal> =
+        parseWithLines<VJournal, ICalJournal>(prepared, calendar, Component.VJOURNAL, handledJournalProperties,
+            { component, uid -> parseVJournal(component, uid).getOrNull() }) { journal, lines -> journal.copy(unknownPropertyLines = lines) }
+
+    /**
+     * UIDs for components with a missing or blank UID, derived from the resource text so they are
+     * the same on every parse. A resource with at most one master (a series and its overrides, as
+     * RFC 4791 4.1 requires of a CalDAV resource) gives every component the same UID; a file
+     * holding several masters gives each component its own.
+     */
+    private fun fallbackUids(prepared: String, components: List<net.fortuna.ical4j.model.component.CalendarComponent>): List<String> {
+        val base = UUID.nameUUIDFromBytes(prepared.toByteArray(Charsets.UTF_8)).toString()
+        val masters = components.count { it.getProperty<Property>("RECURRENCE-ID").isEmpty }
+        return if (masters <= 1) List(components.size) { base }
+        else List(components.size) { index -> UUID.nameUUIDFromBytes("$base#$index".toByteArray(Charsets.UTF_8)).toString() }
+    }
+
+    /**
+     * Parse every [name] component and attach its unknown properties as original lines
+     * ([UnknownPropertyLines]). Lines are matched by position before failed components are
+     * dropped, so a skipped component can't shift the lines onto its neighbour.
+     */
+    private inline fun <C : net.fortuna.ical4j.model.component.CalendarComponent, T : Any> parseWithLines(
+        prepared: String,
+        calendar: net.fortuna.ical4j.model.Calendar,
+        name: String,
+        modelled: Set<String>,
+        parse: (C, String) -> T?,
+        attach: (T, List<String>) -> T
+    ): List<T> {
+        val components = calendar.getComponents<C>(name)
+        if (components.isEmpty()) return emptyList()
+        val uids = fallbackUids(prepared, components)
+        val lines = UnknownPropertyLines.alignedLines(
+            UnknownPropertyLines.scan(prepared, name, modelled), components
+        ) { it.getProperty<Property>(Property.UID).orElse(null)?.value }
+        return components.mapIndexedNotNull { index, component ->
+            val parsed = parse(component, uids[index]) ?: return@mapIndexedNotNull null
+            lines?.get(index)?.takeIf { it.isNotEmpty() }?.let { attach(parsed, it) } ?: parsed
         }
     }
 
@@ -209,16 +298,11 @@ class ICalParser(
      */
     fun parseAllTodos(icalData: String): ParseResult<List<ICalTodo>> {
         return try {
-            val unfolded = unfoldICalData(preprocessICalData(icalData))
+            val unfolded = prepare(icalData)
             val builder = createCalendarBuilder()
             val calendar = builder.build(StringReader(unfolded))
 
-            val todos = calendar.getComponents<VToDo>(Component.VTODO)
-                .mapNotNull { vtodo ->
-                    parseVTodo(vtodo).getOrNull()
-                }
-
-            ParseResult.success(todos)
+            ParseResult.success(parseTodos(unfolded, calendar))
         } catch (e: Exception) {
             ParseResult.error("Failed to parse VTODO data: ${e.message}", e)
         }
@@ -227,11 +311,11 @@ class ICalParser(
     /**
      * Parse a single VTODO component to ICalTodo.
      */
-    fun parseVTodo(vtodo: VToDo): ParseResult<ICalTodo> {
+    fun parseVTodo(vtodo: VToDo, fallbackUid: String = UUID.randomUUID().toString()): ParseResult<ICalTodo> {
         return try {
             // Get UID - generate random UUID if missing (non-compliant servers)
-            val uid = vtodo.getPropertyOrNull<Property>("UID")?.value
-                ?: UUID.randomUUID().toString()
+            val uid = vtodo.getPropertyOrNull<Property>("UID")?.value?.takeIf { it.isNotBlank() }
+                ?: fallbackUid
 
             // Parse RECURRENCE-ID if present (modified instance)
             val recurrenceId = vtodo.getPropertyOrNull<Property>("RECURRENCE-ID")
@@ -256,11 +340,11 @@ class ICalParser(
 
             // Parse text properties
             val summary = vtodo.getPropertyOrNull<Property>("SUMMARY")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val description = vtodo.getPropertyOrNull<Property>("DESCRIPTION")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val location = vtodo.getPropertyOrNull<Property>("LOCATION")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val url = vtodo.getPropertyOrNull<Property>("URL")?.value
             val geo = vtodo.getPropertyOrNull<Property>("GEO")?.value
             val classification = vtodo.getPropertyOrNull<Property>("CLASS")?.value
@@ -431,16 +515,11 @@ class ICalParser(
      */
     fun parseAllJournals(icalData: String): ParseResult<List<ICalJournal>> {
         return try {
-            val unfolded = unfoldICalData(preprocessICalData(icalData))
+            val unfolded = prepare(icalData)
             val builder = createCalendarBuilder()
             val calendar = builder.build(StringReader(unfolded))
 
-            val journals = calendar.getComponents<VJournal>(Component.VJOURNAL)
-                .mapNotNull { vjournal ->
-                    parseVJournal(vjournal).getOrNull()
-                }
-
-            ParseResult.success(journals)
+            ParseResult.success(parseJournals(unfolded, calendar))
         } catch (e: Exception) {
             ParseResult.error("Failed to parse VJOURNAL data: ${e.message}", e)
         }
@@ -449,11 +528,11 @@ class ICalParser(
     /**
      * Parse a single VJOURNAL component to ICalJournal.
      */
-    fun parseVJournal(vjournal: VJournal): ParseResult<ICalJournal> {
+    fun parseVJournal(vjournal: VJournal, fallbackUid: String = UUID.randomUUID().toString()): ParseResult<ICalJournal> {
         return try {
             // Get UID - generate random UUID if missing (non-compliant servers)
-            val uid = vjournal.getPropertyOrNull<Property>("UID")?.value
-                ?: UUID.randomUUID().toString()
+            val uid = vjournal.getPropertyOrNull<Property>("UID")?.value?.takeIf { it.isNotBlank() }
+                ?: fallbackUid
 
             // Parse RECURRENCE-ID if present (modified instance)
             val recurrenceId = vjournal.getPropertyOrNull<Property>("RECURRENCE-ID")
@@ -474,9 +553,9 @@ class ICalParser(
 
             // Parse text properties
             val summary = vjournal.getPropertyOrNull<Property>("SUMMARY")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val description = vjournal.getPropertyOrNull<Property>("DESCRIPTION")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val url = vjournal.getPropertyOrNull<Property>("URL")?.value
             val classification = vjournal.getPropertyOrNull<Property>("CLASS")?.value
 
@@ -645,7 +724,7 @@ class ICalParser(
      */
     fun parse(icalData: String): ParseResult<ICalCalendar> {
         return try {
-            val unfolded = unfoldICalData(preprocessICalData(icalData))
+            val unfolded = prepare(icalData)
             val builder = createCalendarBuilder()
             val calendar = builder.build(StringReader(unfolded))
 
@@ -664,23 +743,9 @@ class ICalParser(
             val refreshInterval = calendar.getPropertyOrNull<Property>("REFRESH-INTERVAL")
                 ?.value?.let { ICalAlarm.parseDuration(it) }
 
-            // Parse all VEVENT components
-            val events = calendar.getComponents<VEvent>(Component.VEVENT)
-                .mapNotNull { vevent ->
-                    parseVEvent(vevent).getOrNull()
-                }
-
-            // Parse all VTODO components
-            val todos = calendar.getComponents<VToDo>(Component.VTODO)
-                .mapNotNull { vtodo ->
-                    parseVTodo(vtodo).getOrNull()
-                }
-
-            // Parse all VJOURNAL components
-            val journals = calendar.getComponents<VJournal>(Component.VJOURNAL)
-                .mapNotNull { vjournal ->
-                    parseVJournal(vjournal).getOrNull()
-                }
+            val events = parseEvents(unfolded, calendar)
+            val todos = parseTodos(unfolded, calendar)
+            val journals = parseJournals(unfolded, calendar)
 
             val icalCalendar = ICalCalendar(
                 prodId = prodId,
@@ -713,7 +778,7 @@ class ICalParser(
      */
     fun parseWithMethod(icalData: String): ParseResult<CalendarParseResult> {
         return try {
-            val unfolded = unfoldICalData(preprocessICalData(icalData))
+            val unfolded = prepare(icalData)
             val builder = createCalendarBuilder()
             val calendar = builder.build(StringReader(unfolded))
 
@@ -721,12 +786,7 @@ class ICalParser(
             val methodProp = calendar.getPropertyOrNull<Property>("METHOD")
             val method = methodProp?.value?.let { ITipMethod.fromString(it) }
 
-            val events = calendar.getComponents<VEvent>(Component.VEVENT)
-                .mapNotNull { vevent ->
-                    parseVEvent(vevent).getOrNull()
-                }
-
-            ParseResult.success(CalendarParseResult(method, events))
+            ParseResult.success(CalendarParseResult(method, parseEvents(unfolded, calendar)))
         } catch (e: Exception) {
             ParseResult.error("Failed to parse iCalendar data: ${e.message}", e)
         }
@@ -735,11 +795,11 @@ class ICalParser(
     /**
      * Parse a single VEVENT component to ICalEvent.
      */
-    fun parseVEvent(vevent: VEvent): ParseResult<ICalEvent> {
+    fun parseVEvent(vevent: VEvent, fallbackUid: String = UUID.randomUUID().toString()): ParseResult<ICalEvent> {
         return try {
             // Get UID - generate random UUID if missing (non-compliant servers)
-            val uid = vevent.getPropertyOrNull<Property>("UID")?.value
-                ?: UUID.randomUUID().toString()
+            val uid = vevent.getPropertyOrNull<Property>("UID")?.value?.takeIf { it.isNotBlank() }
+                ?: fallbackUid
 
             // Get DTSTART - fall back to DTEND if missing (non-compliant servers)
             val dtstartProp = vevent.getPropertyOrNull<Property>("DTSTART")
@@ -774,11 +834,16 @@ class ICalParser(
                     ?.let { RRule.parse(it.value) }
             } else null
 
+            // A floating EXDATE or RDATE value (no TZID, no Z) is read in DTSTART's zone (its TZID, or
+            // UTC for a Z-form DTSTART), so it never depends on the JVM default zone.
+            val dtstartTzid = dtstartProp.getParameterOrNull<net.fortuna.ical4j.model.parameter.TzId>("TZID")?.value
+                ?: "UTC".takeIf { dtstartProp.value.endsWith("Z") }
+
             // Parse EXDATE list
             val exdateProps = vevent.getProperties<Property>("EXDATE")
             val exdates = exdateProps.flatMap { exdate ->
                 val tzidParam = exdate.getParameterOrNull<net.fortuna.ical4j.model.parameter.TzId>("TZID")
-                    ?.value
+                    ?.value ?: dtstartTzid
                 // EXDATE can have multiple dates comma-separated
                 exdate.value.split(",").map { dateStr ->
                     ICalDateTime.parse(dateStr.trim(), tzidParam)
@@ -789,6 +854,7 @@ class ICalParser(
             val rdateProps = vevent.getProperties<Property>("RDATE")
             val rdates = rdateProps.flatMap { rdate ->
                 val tzidParam = rdate.getParameterOrNull<net.fortuna.ical4j.model.parameter.TzId>("TZID")?.value
+                    ?: dtstartTzid
                 val valueParam = rdate.getParameterOrNull<net.fortuna.ical4j.model.Parameter>("VALUE")?.value
                 if (valueParam == "PERIOD") {
                     emptyList()  // Skip PERIOD values (not commonly used)
@@ -816,11 +882,11 @@ class ICalParser(
 
             // Get simple string properties
             val summary = vevent.getPropertyOrNull<Property>("SUMMARY")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val description = vevent.getPropertyOrNull<Property>("DESCRIPTION")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val location = vevent.getPropertyOrNull<Property>("LOCATION")
-                ?.value?.let { unescapeICalText(it) }
+                ?.value
             val statusValue = vevent.getPropertyOrNull<Property>("STATUS")
                 ?.value
             val sequenceValue = vevent.getPropertyOrNull<Property>("SEQUENCE")
@@ -1098,6 +1164,10 @@ class ICalParser(
             .replace("\n\t", "")
     }
 
+    /** The text handed to ical4j and to [UnknownPropertyLines]: repaired, unfolded, `\N` normalized. */
+    private fun prepare(icalData: String): String =
+        normalizeUppercaseNewlineEscape(unfoldICalData(preprocessICalData(icalData)))
+
     /**
      * Fix known server bugs in raw iCalendar data before ical4j parsing.
      *
@@ -1145,28 +1215,6 @@ class ICalParser(
         ) { match ->
             "${match.groupValues[1]}:${match.groupValues[2]}T000000Z"
         }
-    }
-
-    /**
-     * Decode the residual TEXT escape that ical4j's PropertyCodec misses.
-     *
-     * RFC 5545 §3.3.11 defines `\N` (uppercase) as equivalent to `\n` for
-     * encoding a newline. ical4j 4.2.2's PropertyCodec regex only matches
-     * lowercase `\n`, so values arriving via `Property.value` for Encodable
-     * properties (Description/Summary/Location/...) have already had `\\`,
-     * `\;`, `\,`, and lowercase `\n` decoded — but not `\N`. We finish the job.
-     *
-     * Doing more here would double-decode and lose backslashes (e.g. `\\\\`
-     * would become `\` instead of `\\`).
-     */
-    private fun unescapeICalText(text: String): String {
-        // ical4j 4.2.2 already unescapes RFC 5545 §3.3.11 sequences (\\ \n \N \, \;)
-        // when it exposes Property.getValue(). A second pass here is not only
-        // redundant but actively corrupting: a real backslash followed by 'N'
-        // (e.g. a Windows path "C:\Users\Name") arrives already unescaped as
-        // C:\Users\Name, and replace("\\N", "\n") would then mangle the "\N" into
-        // a newline. Return the value ical4j already decoded, verbatim.
-        return text
     }
 
     /**
@@ -1578,7 +1626,7 @@ class ICalParser(
      */
     fun parseFreeBusy(icalData: String): ICalFreeBusy? {
         return try {
-            val unfolded = unfoldICalData(preprocessICalData(icalData))
+            val unfolded = prepare(icalData)
             val builder = createCalendarBuilder()
             val calendar = builder.build(StringReader(unfolded))
 

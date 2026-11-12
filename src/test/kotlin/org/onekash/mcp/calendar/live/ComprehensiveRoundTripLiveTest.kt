@@ -350,4 +350,46 @@ class ComprehensiveRoundTripLiveTest : LiveCalendarTestBase() {
         val stillThere = (res as ServiceResult.Success).data.any { it.uid == created.uid }
         assertTrue(!stillThere, "deleted event should not come back from iCloud")
     }
+
+    @Test
+    @DisplayName("17 update_event keeps X-APPLE-STRUCTURED-LOCATION and other unknown lines as iCloud stored them")
+    fun unknownPropertyLinesSurviveUpdate() {
+        val raw = LiveTestSupport.newClient()
+        val day = LocalDate.now().plusDays(120).toString().replace("-", "")
+        val uid = "${java.util.UUID.randomUUID()}@icloud-calendar-mcp-live"
+        val line = "X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS=\"1 Infinite Loop\\nCupertino CA 95014\\nUnited States\";" +
+            "X-APPLE-RADIUS=70;X-TITLE=\"Apple Park\":geo:37.33,-122.01"
+        val ics = listOf(
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//icloud-calendar-mcp//live-test//EN", "BEGIN:VEVENT",
+            "UID:$uid", "DTSTAMP:20260101T000000Z", "DTSTART:${day}T090000Z", "DTEND:${day}T100000Z",
+            "SUMMARY:${prefixed("unknown lines")}", "LOCATION:Apple Park", line, "X-REPEATED:one", "X-REPEATED:two",
+            "END:VEVENT", "END:VCALENDAR"
+        ).joinToString("\r\n") + "\r\n"
+        val created = raw.createEvent(calendarId, ics)
+        check(created is org.onekash.mcp.calendar.caldav.CalDavResult.Success) { "raw PUT failed: $created" }
+        val href = created.data.href
+        try {
+            fun storedLines(): List<String> {
+                val stored = raw.getEvent(href)
+                check(stored is org.onekash.mcp.calendar.caldav.CalDavResult.Success) { "raw GET failed: $stored" }
+                return stored.data.icalData.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
+            }
+            val before = storedLines()
+            val baseline = before.filter { it.startsWith("X-APPLE-STRUCTURED-LOCATION") || it.startsWith("X-REPEATED") }
+            assertEquals(3, baseline.size, "iCloud stored the three unknown lines: $baseline")
+
+            val etag = (raw.getEvent(href) as org.onekash.mcp.calendar.caldav.CalDavResult.Success).data.etag
+            val handle = org.onekash.mcp.calendar.service.EventHandle.encode(href, etag)
+            val updated = service.updateEvent(handle, summary = prefixed("unknown lines renamed"))
+            assertTrue(updated is ServiceResult.Success, "iCloud accepts the summary update: $updated")
+
+            val after = storedLines()
+            assertEquals(baseline, after.filter { it.startsWith("X-APPLE-STRUCTURED-LOCATION") || it.startsWith("X-REPEATED") },
+                "unknown lines unchanged after update")
+            assertTrue(after.any { it == "SUMMARY:${prefixed("unknown lines renamed")}" }, "summary changed: $after")
+        } finally {
+            // Delete by href whatever happened, so a refused update cannot leave the event behind.
+            println("  cleanup raw delete: ${raw.deleteEvent(href, null)::class.simpleName}")
+        }
+    }
 }

@@ -17,7 +17,9 @@ sealed class CalDavResult<out T> {
         val isRetryable: Boolean = false,
         val retryAt: Instant? = null,
         /** True when a PUT or DELETE may have reached the server before it failed. */
-        val outcomeUnknown: Boolean = false
+        val outcomeUnknown: Boolean = false,
+        /** Precondition names from a refused write's DAV:error body (RFC 4918 16), at most five. */
+        val preconditions: List<String> = emptyList()
     ) : CalDavResult<Nothing>() {
 
         /** True if this is an authentication or authorization error (401, 403) */

@@ -95,6 +95,9 @@ class OkHttpCalDavClient(
         /** Circuit breaker: consecutive failures before failing fast */
         internal const val CIRCUIT_BREAKER_THRESHOLD = 5
 
+        /** Largest refused-write body read for precondition names: 64 KB. */
+        private const val MAX_ERROR_BODY = 65_536L
+
         /** Write rejections that mean the server did not process the request. */
         private val REFUSED_WRITE_STATUSES = setOf(408, 429, 501, 503, 505, 507)
 
@@ -762,12 +765,24 @@ class OkHttpCalDavClient(
             code in 500..599 -> CalDavResult.Error.serverError(code).copy(isRetryable = isTransientStatus(code))
             else -> CalDavResult.Error(code, "Unexpected response: $code")
         }
+        if (!mutation) return error
+        // A refused write may say why in a DAV:error body; pass on its precondition names only.
+        val reasons = if (code in 400..499) refusalReasons(response) else emptyList()
+        val described = if (reasons.isEmpty()) error
+            else error.copy(message = "${error.message} (iCloud: ${reasons.joinToString(", ")})", preconditions = reasons)
         return when {
-            !mutation -> error
-            error.retryAt != null || code in REFUSED_WRITE_STATUSES -> notApplied(error)
-            code in 500..599 -> unknownOutcome(error)
-            else -> error
+            described.retryAt != null || code in REFUSED_WRITE_STATUSES -> notApplied(described)
+            code in 500..599 -> unknownOutcome(described)
+            else -> described
         }
+    }
+
+    /** Precondition names from a 4xx write reply's DAV:error body, read up to [MAX_ERROR_BODY]. */
+    private fun refusalReasons(response: Response): List<String> = try {
+        val peeked = response.peekBody(MAX_ERROR_BODY + 1)
+        if (peeked.contentLength() > MAX_ERROR_BODY) emptyList() else xmlParser.parsePreconditions(peeked.string())
+    } catch (_: IOException) {
+        emptyList()
     }
 
     private fun requestFailure(exception: Exception, mutation: Boolean = false): CalDavResult.Error {

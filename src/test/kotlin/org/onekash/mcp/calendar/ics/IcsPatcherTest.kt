@@ -1291,6 +1291,173 @@ class IcsPatcherTest {
         assertFalse(patched.contains("BEGIN:VALARM"), "Empty list clears all:\n$patched")
     }
 
+    // ========== Whole-series patch keeps edited occurrences ==========
+
+    private val seriesMaster = """
+        BEGIN:VEVENT
+        UID:series@test
+        DTSTAMP:20260101T000000Z
+        DTSTART:20260105T090000Z
+        DTEND:20260105T100000Z
+        RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6
+        SUMMARY:Weekly sync
+        END:VEVENT
+    """.trimIndent()
+
+    private val overrideFeb2 = """
+        BEGIN:VEVENT
+        UID:series@test
+        DTSTAMP:20260101T000000Z
+        RECURRENCE-ID:20260202T090000Z
+        DTSTART:20260202T093000Z
+        DTEND:20260202T103000Z
+        SUMMARY:Moved sync
+        END:VEVENT
+    """.trimIndent()
+
+    private val overrideJan19 = """
+        BEGIN:VEVENT
+        UID:series@test
+        DTSTAMP:20260101T000000Z
+        RECURRENCE-ID:20260119T090000Z
+        DTSTART:20260119T090000Z
+        DTEND:20260119T100000Z
+        SUMMARY:Planning edition
+        END:VEVENT
+    """.trimIndent()
+
+    private fun calendar(vararg vevents: String) =
+        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Test//Test//EN\n" + vevents.joinToString("\n") + "\nEND:VCALENDAR"
+
+    /** Each VEVENT block of [ics], unfolded, as its list of property lines. */
+    private fun vevents(ics: String): List<List<String>> =
+        ics.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
+            .fold(mutableListOf<MutableList<String>>() to false) { (acc, inside), line ->
+                when {
+                    line == "BEGIN:VEVENT" -> { acc.add(mutableListOf()); acc to true }
+                    line == "END:VEVENT" -> acc to false
+                    inside && !line.startsWith("BEGIN:") && !line.startsWith("END:") -> { acc.last().add(line); acc to true }
+                    else -> acc to inside
+                }
+            }.first
+
+    private fun prop(vevent: List<String>, name: String): String? =
+        vevent.firstOrNull { it.startsWith("$name:") || it.startsWith("$name;") }?.substringAfter(":")
+
+    private fun assertOverrideIntact(patched: String, recurrenceId: String, start: String, summary: String) {
+        val match = vevents(patched).filter { prop(it, "RECURRENCE-ID") == recurrenceId }
+        assertEquals(1, match.size, "override $recurrenceId written once:\n$patched")
+        assertEquals(start, prop(match[0], "DTSTART"), "override $recurrenceId keeps its DTSTART")
+        assertEquals(summary, prop(match[0], "SUMMARY"), "override $recurrenceId keeps its SUMMARY")
+        assertEquals("series@test", prop(match[0], "UID"))
+        assertNull(prop(match[0], "RRULE"), "an override carries no RRULE")
+    }
+
+    /** RRULE parts as a set: the generator writes them in its own order. */
+    private fun ruleParts(rrule: String?): Set<String>? = rrule?.split(';')?.toSet()
+
+    private fun masterOf(patched: String): List<String> =
+        vevents(patched).single { prop(it, "RECURRENCE-ID") == null }
+
+    @Test
+    fun `whole-series patch keeps every override when the master is listed first`() {
+        val patched = patcher.patch(
+            existingIcs = calendar(seriesMaster, overrideJan19, overrideFeb2),
+            uid = "series@test",
+            summary = "Renamed sync"
+        )
+        assertEquals(3, veventCount(patched), "master + both overrides:\n$patched")
+        assertEquals("Renamed sync", prop(masterOf(patched), "SUMMARY"))
+        assertEquals(ruleParts("FREQ=WEEKLY;BYDAY=MO;COUNT=6"), ruleParts(prop(masterOf(patched), "RRULE")))
+        assertOverrideIntact(patched, "20260119T090000Z", "20260119T090000Z", "Planning edition")
+        assertOverrideIntact(patched, "20260202T090000Z", "20260202T093000Z", "Moved sync")
+    }
+
+    @Test
+    fun `whole-series patch finds the master when an override is listed first and writes the master first`() {
+        val patched = patcher.patch(
+            existingIcs = calendar(overrideFeb2, seriesMaster),
+            uid = "series@test",
+            summary = "Renamed sync"
+        )
+        assertEquals(2, veventCount(patched), "master + override:\n$patched")
+        val first = vevents(patched).first()
+        assertNull(prop(first, "RECURRENCE-ID"), "the master is written first:\n$patched")
+        assertEquals("Renamed sync", prop(first, "SUMMARY"))
+        assertEquals(ruleParts("FREQ=WEEKLY;BYDAY=MO;COUNT=6"), ruleParts(prop(first, "RRULE")), "the series keeps its RRULE")
+        assertOverrideIntact(patched, "20260202T090000Z", "20260202T093000Z", "Moved sync")
+        // The response the service builds from parse(...)[0] describes the master.
+        assertEquals("Renamed sync", parser.parse(patched)[0].summary)
+    }
+
+    @Test
+    fun `a resource with only overrides patches its first VEVENT and keeps the others`() {
+        val patched = patcher.patch(
+            existingIcs = calendar(overrideJan19, overrideFeb2),
+            uid = "series@test",
+            summary = "Renamed"
+        )
+        assertEquals(2, veventCount(patched), patched)
+        val byRecid = vevents(patched).associateBy { prop(it, "RECURRENCE-ID") }
+        assertEquals("Renamed", prop(byRecid.getValue("20260119T090000Z"), "SUMMARY"), "first VEVENT patched")
+        assertOverrideIntact(patched, "20260202T090000Z", "20260202T093000Z", "Moved sync")
+    }
+
+    @Test
+    fun `moving the series time or changing its RRULE writes the overrides back unchanged`() {
+        val moved = patcher.patch(
+            existingIcs = calendar(seriesMaster, overrideFeb2),
+            uid = "series@test",
+            startTime = "2026-01-05T10:00:00Z",
+            endTime = "2026-01-05T11:00:00Z"
+        )
+        assertEquals("20260105T100000Z", prop(masterOf(moved), "DTSTART"))
+        assertOverrideIntact(moved, "20260202T090000Z", "20260202T093000Z", "Moved sync")
+
+        val newRule = patcher.patch(
+            existingIcs = calendar(seriesMaster, overrideFeb2),
+            uid = "series@test",
+            rrule = "FREQ=WEEKLY;BYDAY=MO;COUNT=10"
+        )
+        assertEquals(ruleParts("FREQ=WEEKLY;BYDAY=MO;COUNT=10"), ruleParts(prop(masterOf(newRule), "RRULE")))
+        assertOverrideIntact(newRule, "20260202T090000Z", "20260202T093000Z", "Moved sync")
+    }
+
+    @Test
+    fun `an override orphaned by a time move is stored but not emitted by get_events`() {
+        val moved = patcher.patch(
+            existingIcs = calendar(seriesMaster, overrideFeb2),
+            uid = "series@test",
+            startTime = "2026-01-05T10:00:00Z",
+            endTime = "2026-01-05T11:00:00Z"
+        )
+        assertOverrideIntact(moved, "20260202T090000Z", "20260202T093000Z", "Moved sync")
+        val occurrences = parser.parseOccurrences(
+            moved, java.time.Instant.parse("2026-02-02T00:00:00Z"), java.time.Instant.parse("2026-02-03T00:00:00Z")
+        )
+        assertEquals(listOf("Weekly sync"), occurrences.map { it.summary }, "only the moved series occurrence")
+        assertEquals(listOf("2026-02-02T10:00:00Z"), occurrences.map { it.startTime })
+    }
+
+    @Test
+    fun `clearing the RRULE drops overrides unless RDATEs keep the series recurring`() {
+        val single = patcher.patch(
+            existingIcs = calendar(seriesMaster, overrideFeb2),
+            uid = "series@test",
+            rrule = ""
+        )
+        assertEquals(1, veventCount(single), "a now single event keeps no overrides:\n$single")
+        assertNull(prop(masterOf(single), "RRULE"))
+
+        val withRdate = calendar(
+            seriesMaster.replace("RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6", "RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6\nRDATE:20260202T090000Z"),
+            overrideFeb2
+        )
+        val stillRecurring = patcher.patch(existingIcs = withRdate, uid = "series@test", rrule = "")
+        assertEquals(2, veventCount(stillRecurring), "RDATE keeps the series recurring:\n$stillRecurring")
+        assertOverrideIntact(stillRecurring, "20260202T090000Z", "20260202T093000Z", "Moved sync")
+    }
+
     // ========== Single-occurrence: patchOccurrence / exdateOccurrence ==========
 
     private fun veventCount(ics: String) = ics.split("BEGIN:VEVENT").size - 1
@@ -1728,5 +1895,229 @@ class IcsPatcherTest {
         assertEquals(1, veventCount(split.newSeries), "new series is just the patched master:\n${split.newSeries}")
         assertTrue(split.newSeries.contains("LOCATION:Room 9"), "the patch, not the old override, defines the instance:\n${split.newSeries}")
         assertFalse(split.newSeries.contains("Room 5"), "old override location dropped:\n${split.newSeries}")
+    }
+
+    // ========== exdates input forms and UNTIL moving with the series ==========
+
+    private val nyDaily = calendar("""
+        BEGIN:VEVENT
+        UID:ny@test
+        DTSTAMP:20260101T000000Z
+        DTSTART;TZID=America/New_York:20260301T090000
+        DTEND;TZID=America/New_York:20260301T100000
+        RRULE:FREQ=DAILY;UNTIL=20260315T130000Z
+        SUMMARY:NY daily
+        END:VEVENT
+    """.trimIndent())
+
+    @Test
+    fun `patch turns a date exdate on a one-per-day timed series into that day's occurrence`() {
+        val patched = patcher.patch(existingIcs = nyDaily, uid = "ny@test", exdates = listOf("2026-03-04"))
+        assertTrue(patched.contains("EXDATE;TZID=America/New_York:20260304T090000"), patched)
+    }
+
+    @Test
+    fun `patch rejects a date exdate on a multi-per-day series`() {
+        val twice = nyDaily.replace("RRULE:FREQ=DAILY;UNTIL=20260315T130000Z", "RRULE:FREQ=DAILY;BYHOUR=9,17;COUNT=6")
+        assertFailsWith<IcsBuilder.AmbiguousRecurrenceDateException> {
+            patcher.patch(existingIcs = twice, uid = "ny@test", exdates = listOf("2026-03-04"))
+        }
+    }
+
+    @Test
+    fun `patch reads a naive date-time exdate in the series zone`() {
+        val patched = patcher.patch(existingIcs = nyDaily, uid = "ny@test", exdates = listOf("2026-03-04T09:00:00"))
+        assertTrue(patched.contains("EXDATE;TZID=America/New_York:20260304T090000"), patched)
+    }
+
+    private fun until(ics: String): String? =
+        masterOf(ics).let { prop(it, "RRULE") }?.split(';')?.firstOrNull { it.startsWith("UNTIL=") }?.removePrefix("UNTIL=")
+
+    @Test
+    fun `moving a UTC series later or earlier shifts UNTIL by the same amount`() {
+        val utcSeries = calendar("""
+            BEGIN:VEVENT
+            UID:utc@test
+            DTSTAMP:20260101T000000Z
+            DTSTART:20260101T090000Z
+            DTEND:20260101T100000Z
+            RRULE:FREQ=DAILY;UNTIL=20260110T090000Z
+            SUMMARY:UTC daily
+            END:VEVENT
+        """.trimIndent())
+        val later = patcher.patch(utcSeries, "utc@test", startTime = "2026-01-01T10:00:00Z", endTime = "2026-01-01T11:00:00Z")
+        assertEquals("20260110T100000Z", until(later))
+        val earlier = patcher.patch(utcSeries, "utc@test", startTime = "2026-01-01T08:00:00Z", endTime = "2026-01-01T09:00:00Z")
+        assertEquals("20260110T080000Z", until(earlier))
+    }
+
+    @Test
+    fun `moving a New York series across DST keeps its last local occurrence`() {
+        // UNTIL is Mar 15 09:00 EDT (13:00Z). Moved to 10:00 local, the last occurrence is Mar 15 10:00 EDT.
+        val moved = patcher.patch(nyDaily, "ny@test", startTime = "2026-03-01T10:00:00", endTime = "2026-03-01T11:00:00",
+            timezone = "America/New_York")
+        assertEquals("20260315T140000Z", until(moved))
+        val occ = parser.parseOccurrences(moved, java.time.Instant.parse("2026-03-14T00:00:00Z"),
+            java.time.Instant.parse("2026-03-17T00:00:00Z")).map { it.startTime }
+        assertEquals(listOf("2026-03-14T14:00:00Z", "2026-03-15T14:00:00Z"), occ)
+    }
+
+    @Test
+    fun `moving a TZID series to a UTC start keeps the same last occurrence in local terms`() {
+        // Old: 09:00 New York (14:00Z on Mar 1), UNTIL Mar 15 09:00 EDT. New start 15:00Z: a 6 hour local shift.
+        val moved = patcher.patch(nyDaily, "ny@test", startTime = "2026-03-01T15:00:00Z", endTime = "2026-03-01T16:00:00Z")
+        assertEquals("20260315T150000Z", until(moved))
+    }
+
+    @Test
+    fun `a supplied rrule is used unchanged when the series moves`() {
+        val moved = patcher.patch(nyDaily, "ny@test", startTime = "2026-03-01T10:00:00", endTime = "2026-03-01T11:00:00",
+            timezone = "America/New_York", rrule = "FREQ=DAILY;UNTIL=20260320T000000Z")
+        assertEquals("20260320T000000Z", until(moved))
+    }
+
+    @Test
+    fun `moving an all-day series shifts a DATE UNTIL by the same number of days`() {
+        val allDay = calendar("""
+            BEGIN:VEVENT
+            UID:allday@test
+            DTSTAMP:20260101T000000Z
+            DTSTART;VALUE=DATE:20260301
+            DTEND;VALUE=DATE:20260302
+            RRULE:FREQ=DAILY;UNTIL=20260310
+            SUMMARY:All-day daily
+            END:VEVENT
+        """.trimIndent())
+        val moved = patcher.patch(allDay, "allday@test", startDate = "2026-03-02", endDate = "2026-03-02", isAllDay = true)
+        assertEquals("20260311", until(moved))
+    }
+
+    private val utcUntilSeries = calendar("""
+        BEGIN:VEVENT
+        UID:split@test
+        DTSTAMP:20250101T000000Z
+        DTSTART:20250115T090000Z
+        DTEND:20250115T091500Z
+        RRULE:FREQ=DAILY;UNTIL=20250130T090000Z
+        SUMMARY:Split daily
+        END:VEVENT
+    """.trimIndent())
+
+    @Test
+    fun `a truncated series moved later or earlier keeps its last occurrence and no split-day duplicate`() {
+        val split = patcher.splitSeries(utcUntilSeries, recurrenceId = "20250120T090000Z", summary = "Continuing")
+        for ((start, end, hour) in listOf(Triple("10:00", "10:15", "10"), Triple("08:00", "08:15", "08"))) {
+            val moved = patcher.patch(split.truncatedMaster, "split@test",
+                startTime = "2025-01-15T$start:00Z", endTime = "2025-01-15T$end:00Z")
+            val occ = parser.parseOccurrences(moved, java.time.Instant.parse("2025-01-15T00:00:00Z"),
+                java.time.Instant.parse("2025-02-01T00:00:00Z")).map { it.startTime!! }
+            assertEquals((15..19).map { "2025-01-${it}T$hour:00:00Z" }, occ, "moved to $start")
+        }
+    }
+
+    @Test
+    fun `the continuing series of a split that moves the time shifts its UNTIL too`() {
+        val split = patcher.splitSeries(utcUntilSeries, recurrenceId = "20250120T090000Z",
+            startTime = "2025-01-20T10:00:00Z", endTime = "2025-01-20T10:15:00Z")
+        val occ = parser.parseOccurrences(split.newSeries, java.time.Instant.parse("2025-01-20T00:00:00Z"),
+            java.time.Instant.parse("2025-02-01T00:00:00Z")).map { it.startTime!! }
+        assertEquals((20..30).map { "2025-01-${it}T10:00:00Z" }, occ, "continuing series still ends Jan 30")
+    }
+
+    // ========== Unknown properties kept as their original lines ==========
+
+    private val structuredLocation = "X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS=\"1 Infinite Loop\\nCupertino CA 95014\\nUnited States\";X-APPLE-RADIUS=70;X-TITLE=\"Apple Park\":geo:37.33,-122.01"
+    private val unknownLines = listOf(structuredLocation, "X-REPEATED:one", "X-REPEATED:two", "COMMENT:a\\, b\\; c")
+
+    private fun withUnknownLines(rrule: String? = null) = calendar((listOf(
+        "BEGIN:VEVENT", "UID:unknown@test", "DTSTAMP:20260101T000000Z",
+        "DTSTART:20260105T090000Z", "DTEND:20260105T100000Z", "SUMMARY:Original", "LOCATION:Apple Park"
+    ) + listOfNotNull(rrule?.let { "RRULE:$it" }) + unknownLines + "END:VEVENT").joinToString("\n"))
+
+    private fun unfoldedLines(ics: String) = ics.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
+
+    private fun unknownIn(vevent: List<String>) = vevent.filter { line -> unknownLines.any { it == line } }
+
+    @Test
+    fun `a summary edit writes every unknown line back byte for byte and in order`() {
+        val patched = patcher.patch(withUnknownLines(), "unknown@test", summary = "Renamed")
+        val lines = unfoldedLines(patched)
+        assertEquals(unknownLines, lines.filter { it in unknownLines }, patched)
+        assertTrue(lines.contains("SUMMARY:Renamed"), patched)
+        assertTrue(lines.contains("LOCATION:Apple Park"), patched)
+    }
+
+    @Test
+    fun `a this_and_future split gives the continuing series the original's unknown lines`() {
+        val split = patcher.splitSeries(withUnknownLines("FREQ=DAILY;COUNT=5"), recurrenceId = "20260107T090000Z",
+            summary = "Continuing")
+        assertEquals(unknownLines, unfoldedLines(split.newSeries).filter { it in unknownLines }, split.newSeries)
+        assertEquals(unknownLines, unfoldedLines(split.truncatedMaster).filter { it in unknownLines }, split.truncatedMaster)
+    }
+
+    @Test
+    fun `a this_occurrence edit gives the new override the master's unknown lines`() {
+        val patched = patcher.patchOccurrence(withUnknownLines("FREQ=DAILY;COUNT=5"), recurrenceId = "20260107T090000Z",
+            summary = "One-off")
+        val blocks = vevents(patched)
+        assertEquals(2, blocks.size, patched)
+        for (block in blocks) assertEquals(unknownLines, unknownIn(block), "each VEVENT keeps the lines:\n$patched")
+    }
+
+    @Test
+    fun `a LOCATION edit leaves X-APPLE-STRUCTURED-LOCATION as it was`() {
+        val patched = patcher.patch(withUnknownLines(), "unknown@test", location = "Somewhere else")
+        val lines = unfoldedLines(patched)
+        assertTrue(lines.contains("LOCATION:Somewhere else"), patched)
+        assertTrue(lines.contains(structuredLocation), "the structured location is not updated (stale):\n$patched")
+    }
+
+    // ========== Review fix: split with a UTC-form RECURRENCE-ID ==========
+
+    @Test
+    fun `a split at a UTC-form RECURRENCE-ID on a TZID series keeps the continuing series' last occurrence`() {
+        val ny = calendar("""
+            BEGIN:VEVENT
+            UID:ny-split@test
+            DTSTAMP:20260101T000000Z
+            DTSTART;TZID=America/New_York:20260101T090000
+            DTEND;TZID=America/New_York:20260101T093000
+            RRULE:FREQ=DAILY;UNTIL=20260630T130000Z
+            SUMMARY:NY daily
+            END:VEVENT
+        """.trimIndent())
+        // 2026-01-10 09:00 EST is 14:00Z; move the continuing series to 10:00 New York.
+        val split = patcher.splitSeries(ny, recurrenceId = "20260110T140000Z",
+            startTime = "2026-01-10T10:00:00", endTime = "2026-01-10T10:30:00", timezone = "America/New_York")
+        val last = parser.parseOccurrences(split.newSeries, java.time.Instant.parse("2026-06-29T00:00:00Z"),
+            java.time.Instant.parse("2026-07-02T00:00:00Z")).map { it.startTime }
+        assertEquals(listOf("2026-06-29T14:00:00Z", "2026-06-30T14:00:00Z"), last, "the series still ends on Jun 30 at 10:00 EDT")
+    }
+
+    @Test
+    fun `patch turns a date rdate on a one-per-day timed series into that day's occurrence`() {
+        val patched = patcher.patch(existingIcs = nyDaily, uid = "ny@test", rdates = listOf("2026-03-20"))
+        assertTrue(patched.contains("RDATE;TZID=America/New_York:20260320T090000"), patched)
+    }
+
+    @Test
+    fun `a truncated New York series moved across DST or to UTC keeps its last occurrence`() {
+        // Split at Mar 12 (after the Mar 8 DST change): the original keeps Mar 1 to Mar 11.
+        val split = patcher.splitSeries(nyDaily, recurrenceId = "20260312T090000", summary = "Continuing")
+        val window = java.time.Instant.parse("2026-02-28T00:00:00Z") to java.time.Instant.parse("2026-03-20T00:00:00Z")
+        fun starts(ics: String) = parser.parseOccurrences(ics, window.first, window.second).map { it.startTime!! }
+
+        val later = patcher.patch(split.truncatedMaster, "ny@test", startTime = "2026-03-01T10:00:00",
+            endTime = "2026-03-01T10:30:00", timezone = "America/New_York")
+        val laterStarts = starts(later)
+        assertEquals(11, laterStarts.size, "Mar 1 to Mar 11: $laterStarts")
+        assertEquals("2026-03-01T15:00:00Z", laterStarts.first(), "10:00 EST")
+        assertEquals("2026-03-11T14:00:00Z", laterStarts.last(), "10:00 EDT after the DST change")
+
+        val toUtc = patcher.patch(split.truncatedMaster, "ny@test", startTime = "2026-03-01T15:00:00Z",
+            endTime = "2026-03-01T15:30:00Z")
+        val utcStarts = starts(toUtc)
+        assertEquals(11, utcStarts.size, "Mar 1 to Mar 11: $utcStarts")
+        assertEquals("2026-03-11T15:00:00Z", utcStarts.last())
     }
 }

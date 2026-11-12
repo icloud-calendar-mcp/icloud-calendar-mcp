@@ -624,4 +624,16 @@ class InputValidatorTest {
                 is ValidationResult.Valid
         )
     }
+
+    @Test
+    fun `validateRecurrenceDateList names every accepted form when it rejects an offset`() {
+        assertTrue(InputValidator.validateRecurrenceDateList(
+            listOf("2026-03-02", "2026-03-02T09:00:00", "2026-03-02T14:00:00Z"), "exdates") is ValidationResult.Valid)
+        val invalid = InputValidator.validateRecurrenceDateList(listOf("2026-03-02T09:00:00+05:00"), "exdates")
+        assertTrue(invalid is ValidationResult.Invalid)
+        val message = (invalid as ValidationResult.Invalid).message
+        assertTrue(message.contains("YYYY-MM-DD"), message)
+        assertTrue(message.contains("event's zone"), message)
+        assertTrue(message.contains("ending in Z"), message)
+    }
 }

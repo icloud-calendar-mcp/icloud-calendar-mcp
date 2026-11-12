@@ -153,6 +153,43 @@ class IcsParserOccurrenceTest {
     }
 
     @Test
+    fun `two overrides on the same day of a twice-daily series both appear`() {
+        val ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:twice@example.com
+            DTSTART:20260301T090000Z
+            DTEND:20260301T093000Z
+            RRULE:FREQ=DAILY;BYHOUR=9,17;COUNT=6
+            SUMMARY:Base
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:twice@example.com
+            RECURRENCE-ID:20260302T090000Z
+            DTSTART:20260302T100000Z
+            DTEND:20260302T103000Z
+            SUMMARY:Morning moved
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:twice@example.com
+            RECURRENCE-ID:20260302T170000Z
+            DTSTART:20260302T180000Z
+            DTEND:20260302T183000Z
+            SUMMARY:Evening moved
+            END:VEVENT
+            END:VCALENDAR
+        """.trimIndent()
+
+        val (start, end) = day("2026-03-02")
+        val events = parser.parseOccurrences(ics, start, end)
+
+        assertEquals(
+            listOf("Morning moved" to "2026-03-02T10:00:00Z", "Evening moved" to "2026-03-02T18:00:00Z"),
+            events.map { it.summary to it.startTime }
+        )
+    }
+
+    @Test
     fun `multi-day range returns every occurrence in it`() {
         val ics = """
             BEGIN:VCALENDAR
