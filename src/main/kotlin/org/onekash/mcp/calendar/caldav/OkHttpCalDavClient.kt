@@ -394,8 +394,12 @@ class OkHttpCalDavClient(
         if (result.code == 412) {
             // Only an earlier attempt of this call can have created this href (an OkHttp replay or the
             // resend above). Confirm the stored event is ours before reporting success.
-            val stored = getEvent(eventUrl)
-            if (stored is CalDavResult.Success && stored.data.uid == uid) return created(stored.data.etag)
+            when (val stored = getEvent(eventUrl)) {
+                is CalDavResult.Success -> return if (stored.data.uid == uid) created(stored.data.etag) else result
+                // The 412 says something exists at this fresh href, but the read failed (iCloud lag or an
+                // outage). A conflict error would invite a retry under a new href and duplicate the event.
+                is CalDavResult.Error -> return unknownCreateOutcome(result)
+            }
         }
         return if (result.outcomeUnknown) unknownCreateOutcome(result) else result
     }
@@ -803,7 +807,9 @@ class OkHttpCalDavClient(
         message = "Event creation outcome unknown: iCloud may have stored it. Do not call create_event " +
             "again for this event, because get_events can miss a just-created event and a second call " +
             "creates a duplicate. Tell the user to check the calendar. " +
-            error.message.removePrefix(UNKNOWN_OUTCOME_PREFIX)
+            error.message.removePrefix(UNKNOWN_OUTCOME_PREFIX),
+        isRetryable = false,
+        outcomeUnknown = true
     )
 
     private fun <T> executeWithRetry(

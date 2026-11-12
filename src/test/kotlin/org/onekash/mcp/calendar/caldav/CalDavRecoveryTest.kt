@@ -631,6 +631,18 @@ class CalDavRecoveryTest {
                 error(client.createEvent("home", ics), 412)
             }
         }
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                discover(server, client)
+                server.enqueue(MockResponse().setResponseCode(412))
+                // The confirming read misses the event (read-after-write lag).
+                server.enqueue(MockResponse().setResponseCode(404))
+                val result = error(client.createEvent("home", ics), 412)
+                assertTrue(result.message.contains("Do not call create_event again"), result.message)
+                assertFalse(result.isRetryable)
+            }
+        }
     }
 
     @Test
