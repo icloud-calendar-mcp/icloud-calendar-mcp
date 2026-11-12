@@ -11,6 +11,9 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import javax.net.ssl.SSLException
 
+/** HTTP statuses that signal a temporary server condition. */
+internal fun isTransientStatus(code: Int) = code == 408 || code == 429 || code == 500 || code in 502..504
+
 /** Shared request admission and transient-failure recovery for one client. */
 internal class CalDavBackoff(
     private val clock: Clock,
@@ -60,7 +63,12 @@ internal class CalDavBackoff(
                 received.close()
                 throw e
             }
-            state.retryAfter?.let { received.newBuilder().header("Retry-After", it).build() } ?: received
+            // addUnsafeNonAscii: a malformed header must not throw past the IOException handling.
+            state.retryAfter?.let {
+                received.newBuilder()
+                    .headers(received.headers.newBuilder().addUnsafeNonAscii("Retry-After", it).build())
+                    .build()
+            } ?: received
         } catch (e: IOException) {
             failed(e)
             throw TransportFailure(e)
@@ -71,12 +79,16 @@ internal class CalDavBackoff(
             .build()
     }
 
+    /** The active window when it is too long to wait out within one call, else null. */
+    fun blockingWindow(): Window? = window()?.takeIf {
+        Duration.between(clock.instant(), it.retryAt) > Duration.ofMillis(OkHttpCalDavClient.MAX_RETRY_AFTER_MS)
+    }
+
     fun awaitAdmission() {
         while (true) {
             val window = window() ?: return
             val remaining = Duration.between(clock.instant(), window.retryAt)
-            if (remaining > Duration.ofMillis(
-                    OkHttpCalDavClient.MAX_RETRY_AFTER_MS)) {
+            if (remaining > Duration.ofMillis(OkHttpCalDavClient.MAX_RETRY_AFTER_MS)) {
                 throw Blocked(window)
             }
             if (remaining.isNegative || remaining.isZero) continue
@@ -111,8 +123,7 @@ internal class CalDavBackoff(
                     appleUntil = retryAt
                 }
             }
-            response.code == 429 || response.code in 500..599 ->
-                transientFailure()
+            isTransientStatus(response.code) -> transientFailure()
             else -> {
                 consecutiveFailures = 0
                 cooldownUntil = null

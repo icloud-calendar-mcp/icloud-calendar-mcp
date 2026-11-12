@@ -9,12 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Honor Retry-After across callers and recover automatically after transient
-  failures. Throttled tools return RATE_LIMITED with retryAt and
-  retryAfterSeconds; breaker cooldowns return CALDAV_ERROR with the deadline.
-- Send PUT and DELETE once per call. Report whether a blocked write was not
-  applied or an uncertain write needs to be read back before retrying.
-- Report refused discovery credentials as AUTH_ERROR and return failed calendar
-  listings without caching an empty result.
+  failures. When iCloud throttles a CalDAV request, the tool returns
+  RATE_LIMITED with retryAt and retryAfterSeconds; breaker cooldowns return
+  CALDAV_ERROR with the deadline.
+- PUT and DELETE no longer follow redirects, so a redirected write is an error
+  instead of a GET read as success. Report whether a refused write was not
+  applied or an uncertain update or delete needs to be read back before
+  retrying. An uncertain create is resent to the same href (If-None-Match: *),
+  and a 412 on that href resolves to the created event.
+- Report refused discovery credentials as AUTH_ERROR. A failing
+  /.well-known/caldav probe falls back to the base URL. Transient and
+  authentication failures in the calendar listing are returned instead of
+  cached as an empty result.
+- Read the response ETag header case-insensitively, which removes an extra
+  PROPFIND per event read and write over HTTP/2.
 
 ## [3.2.0] - 2026-08-14
 

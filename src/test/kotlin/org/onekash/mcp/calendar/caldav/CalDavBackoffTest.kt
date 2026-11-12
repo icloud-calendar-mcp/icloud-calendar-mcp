@@ -3,11 +3,14 @@ package org.onekash.mcp.calendar.caldav
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import org.junit.jupiter.api.Timeout
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 
+// Real clock and Thread::sleep: a gate regression would otherwise sleep the full Retry-After.
+@Timeout(30)
 class CalDavBackoffTest {
     @Test
     fun `Apple long retry after sends just one request`() {

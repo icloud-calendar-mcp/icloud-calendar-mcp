@@ -6,6 +6,10 @@ import okhttp3.EventListener
 import okhttp3.mockwebserver.*
 import org.junit.jupiter.api.Timeout
 import java.net.ConnectException
+import java.net.InetAddress
+import java.net.Socket
+import java.net.SocketAddress
+import javax.net.SocketFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.time.Clock
@@ -206,35 +210,49 @@ class CalDavRecoveryTest {
 
     @Test
     fun `ten real refused connections recover when the same endpoint becomes available`() {
-        val refused = MockWebServer()
-        refused.start()
-        val url = refused.url("/").newBuilder().host("127.0.0.1").build().toString().trimEnd('/')
-        val port = refused.port
-        refused.shutdown()
-        val attempts = AtomicInteger()
-        val clock = CalDavTestClock()
-        val http = OkHttpClient.Builder().eventListener(object : EventListener() {
-            override fun connectStart(call: Call, address: InetSocketAddress, proxy: Proxy) {
-                attempts.incrementAndGet()
-            }
-        }).build()
-        OkHttpCalDavClient(url, CalDavCredentials("test", "password"), http, clock, clock::sleep).use { client ->
-            for (count in listOf(2, 4, 5, 6, 7, 8, 9, 10)) {
-                val result = assertIs<CalDavResult.Error>(client.checkConnection())
-                assertEquals(count, attempts.get())
-                if (count >= 5) {
-                    val cooldown = minOf(30L shl (count - 5), 300L)
-                    assertEquals(clock.instant().plusSeconds(cooldown), result.retryAt)
-                    error(client.checkConnection(), 503, result.retryAt)
-                    assertEquals(count, attempts.get())
-                    clock.advance(cooldown)
+        // Refuse at the socket layer instead of freeing and rebinding a port, which races on shared hosts.
+        MockWebServer().use { server ->
+            server.start()
+            val url = server.url("/").newBuilder().host("127.0.0.1").build().toString().trimEnd('/')
+            var refuse = true
+            val attempts = AtomicInteger()
+            val clock = CalDavTestClock()
+            val sockets = object : SocketFactory() {
+                private fun socket() = object : Socket() {
+                    override fun connect(endpoint: SocketAddress, timeout: Int) {
+                        if (refuse) throw ConnectException("Connection refused")
+                        super.connect(endpoint, timeout)
+                    }
                 }
+                override fun createSocket() = socket()
+                override fun createSocket(host: String, port: Int) = throw UnsupportedOperationException()
+                override fun createSocket(host: String, port: Int, local: InetAddress, localPort: Int) =
+                    throw UnsupportedOperationException()
+                override fun createSocket(host: InetAddress, port: Int) = throw UnsupportedOperationException()
+                override fun createSocket(host: InetAddress, port: Int, local: InetAddress, localPort: Int) =
+                    throw UnsupportedOperationException()
             }
-            MockWebServer().use { available ->
-                available.start(port)
-                available.enqueue(connected())
+            val http = OkHttpClient.Builder().socketFactory(sockets).eventListener(object : EventListener() {
+                override fun connectStart(call: Call, address: InetSocketAddress, proxy: Proxy) {
+                    attempts.incrementAndGet()
+                }
+            }).build()
+            OkHttpCalDavClient(url, CalDavCredentials("test", "password"), http, clock, clock::sleep).use { client ->
+                for (count in listOf(2, 4, 5, 6, 7, 8, 9, 10)) {
+                    val result = assertIs<CalDavResult.Error>(client.checkConnection())
+                    assertEquals(count, attempts.get())
+                    if (count >= 5) {
+                        val cooldown = minOf(30L shl (count - 5), 300L)
+                        assertEquals(clock.instant().plusSeconds(cooldown), result.retryAt)
+                        error(client.checkConnection(), 503, result.retryAt)
+                        assertEquals(count, attempts.get())
+                        clock.advance(cooldown)
+                    }
+                }
+                refuse = false
+                server.enqueue(connected())
                 assertIs<CalDavResult.Success<Boolean>>(client.checkConnection())
-                assertEquals(1, available.requestCount)
+                assertEquals(1, server.requestCount)
             }
         }
     }
@@ -515,6 +533,233 @@ class CalDavRecoveryTest {
                     assertEquals(8, server.requestCount)
                     assertTrue(clock.sleeps.isEmpty())
                 } finally { pool.shutdownNow() }
+            }
+        }
+    }
+
+    // ── Review fixes ────────────────────────────────────────────────────
+
+    private fun wellKnownClient(server: MockWebServer, clock: CalDavTestClock) =
+        OkHttpCalDavClient(server.url("/").toString().trimEnd('/'), CalDavCredentials("test", "password"),
+            clock = clock, sleep = clock::sleep)
+
+    @Test
+    fun `a failing well-known probe falls back to the base URL`() {
+        for (failure in listOf(500, 403)) MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            wellKnownClient(server, clock).use { client ->
+                // 500 is retried once, 403 is not; both fall back to PROPFIND on the base URL.
+                repeat(if (failure == 500) 2 else 1) { server.enqueue(MockResponse().setResponseCode(failure)) }
+                discover(server, client)
+                assertEquals(if (failure == 500) 5 else 4, server.requestCount, "well-known $failure")
+            }
+        }
+    }
+
+    @Test
+    fun `refused credentials on well-known still report AUTH_ERROR from the principal PROPFIND`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            wellKnownClient(server, clock).use { client ->
+                server.enqueue(MockResponse().setResponseCode(401))
+                server.enqueue(MockResponse().setResponseCode(401))
+                error(client.listCalendars(), 401)
+                assertEquals("/.well-known/caldav", server.takeRequest().path)
+                assertEquals("PROPFIND", server.takeRequest().method)
+            }
+        }
+    }
+
+    @Test
+    fun `a write on a dropped pooled connection is replayed instead of reported as uncertain`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                // Pool a connection, then have the server drop it on the next request without answering
+                // (a stale connection after sleep or a network change). OkHttp replays the conditional DELETE.
+                server.enqueue(connected())
+                assertIs<CalDavResult.Success<Boolean>>(client.checkConnection())
+                server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+                server.enqueue(MockResponse().setResponseCode(204))
+                assertIs<CalDavResult.Success<Unit>>(client.deleteEvent("/event.ics", "etag"))
+                assertEquals(3, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `a write refused before sending is labeled not applied`() {
+        for (method in listOf("PUT", "DELETE")) MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            val http = OkHttpClient.Builder().addInterceptor { throw ConnectException("Connection refused") }.build()
+            client(server, clock, http).use { client ->
+                val result = assertIs<CalDavResult.Error>(if (method == "PUT")
+                    client.updateEvent("/event.ics", ics, "etag") else client.deleteEvent("/event.ics", "etag"))
+                assertTrue(result.message.startsWith("Mutation not applied"), result.message)
+                assertTrue(result.isRetryable)
+                assertFalse(result.outcomeUnknown)
+            }
+        }
+    }
+
+    private fun storedEvent(uid: String) = MockResponse().addHeader("ETag", "\"stored\"")
+        .setBody("BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:$uid\nEND:VEVENT\nEND:VCALENDAR")
+
+    @Test
+    fun `a create whose earlier attempt landed resolves the 412 to success`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                discover(server, client)
+                server.enqueue(MockResponse().setResponseCode(412))
+                server.enqueue(storedEvent("test@local"))
+                val event = assertIs<CalDavResult.Success<CalDavEvent>>(client.createEvent("home", ics)).data
+                assertEquals("stored", event.etag)
+                repeat(3) { server.takeRequest() }
+                val put = server.takeRequest()
+                val get = server.takeRequest()
+                assertEquals(listOf("PUT", "GET"), listOf(put.method, get.method))
+                assertEquals(put.path, get.path)
+            }
+        }
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                discover(server, client)
+                server.enqueue(MockResponse().setResponseCode(412))
+                server.enqueue(storedEvent("someone-else"))
+                error(client.createEvent("home", ics), 412)
+            }
+        }
+    }
+
+    @Test
+    fun `an uncertain create is resent to the same href and never told to re-list`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                discover(server, client)
+                server.enqueue(MockResponse().setResponseCode(502))
+                server.enqueue(MockResponse().setResponseCode(201).addHeader("ETag", "\"new\""))
+                assertIs<CalDavResult.Success<CalDavEvent>>(client.createEvent("home", ics))
+                repeat(3) { server.takeRequest() }
+                val first = server.takeRequest()
+                val second = server.takeRequest()
+                assertEquals(listOf("PUT", "PUT"), listOf(first.method, second.method))
+                assertEquals(first.path, second.path)
+                assertEquals("*", second.getHeader("If-None-Match"))
+            }
+        }
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                discover(server, client)
+                repeat(2) { server.enqueue(MockResponse().setResponseCode(502)) }
+                val result = error(client.createEvent("home", ics), 502)
+                assertTrue(result.message.contains("Do not call create_event again"), result.message)
+                assertFalse(result.message.contains("Read back"), result.message)
+                assertFalse(result.isRetryable)
+                assertEquals(5, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `a 408 is replayed once and counts as a transient failure`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                // A write has no app-level retry, so only OkHttp's 408 replay can make this succeed.
+                server.enqueue(MockResponse().setResponseCode(408))
+                server.enqueue(MockResponse().setResponseCode(204).addHeader("ETag", "\"new\""))
+                assertIs<CalDavResult.Success<CalDavEvent>>(client.updateEvent("/event.ics", ics, "etag"))
+                assertEquals(2, server.requestCount)
+            }
+        }
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                // Four 500s, then 408 pairs (OkHttp gives up on a second consecutive 408): the breaker opens.
+                repeat(4) { server.enqueue(MockResponse().setResponseCode(500)) }
+                repeat(2) { server.enqueue(MockResponse().setResponseCode(408)) }
+                repeat(2) { error(client.checkConnection(), 500) }
+                error(client.checkConnection(), 503, clock.instant().plusSeconds(30))
+            }
+        }
+    }
+
+    @Test
+    fun `definitive server refusals of a write are not applied and not retryable`() {
+        for (code in listOf(501, 505, 507)) MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                server.enqueue(MockResponse().setResponseCode(code))
+                val result = error(client.updateEvent("/event.ics", ics, "etag"), code)
+                assertTrue(result.message.startsWith("Mutation not applied"), "$code: ${result.message}")
+                assertFalse(result.isRetryable)
+            }
+        }
+    }
+
+    @Test
+    fun `a non-ASCII Retry-After is ignored instead of failing the call`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                repeat(2) {
+                    server.enqueue(MockResponse().setResponseCode(503).setBody("busy")
+                        .addHeaderLenient("Retry-After", "sam., 12 d\u00e9c. 2026 10:00:00 GMT"))
+                }
+                error(client.checkConnection(), 503)
+                assertEquals(2, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `a lowercase etag header avoids the PROPFIND probe`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                server.enqueue(MockResponse().addHeader("etag", "\"lower\"").setBody(ics))
+                assertEquals("lower", assertIs<CalDavResult.Success<CalDavEvent>>(
+                    client.getEvent("/event.ics")).data.etag)
+                assertEquals(1, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `a cached calendar list does not wait out a short window`() {
+        MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            client(server, clock).use { client ->
+                discover(server, client)
+                server.enqueue(MockResponse().setResponseCode(503).addHeader("Retry-After", "2"))
+                error(client.updateEvent("/cal/home/event.ics", ics, "etag"), 429, clock.instant().plusSeconds(2))
+                val count = server.requestCount
+                assertIs<CalDavResult.Success<List<CalDavCalendar>>>(client.listCalendars())
+                assertTrue(clock.sleeps.isEmpty())
+                assertEquals(count, server.requestCount)
+            }
+        }
+    }
+
+    @Test
+    fun `a redirected write is reported as an error, never as a GET success`() {
+        for (code in listOf(301, 302, 303)) MockWebServer().use { server ->
+            val clock = CalDavTestClock()
+            // A followed redirect would reach /elsewhere and read its 200 as a successful write.
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest) = if (request.path == "/elsewhere")
+                    MockResponse().setResponseCode(200)
+                    else MockResponse().setResponseCode(code).addHeader("Location", "/elsewhere")
+            }
+            client(server, clock).use { client ->
+                assertIs<CalDavResult.Error>(client.updateEvent("/event.ics", ics, "etag"), "PUT $code")
+                assertIs<CalDavResult.Error>(client.deleteEvent("/event.ics", "etag"), "DELETE $code")
+                assertEquals(listOf("PUT", "DELETE"), listOf(server.takeRequest().method, server.takeRequest().method))
+                assertEquals(2, server.requestCount)
             }
         }
     }

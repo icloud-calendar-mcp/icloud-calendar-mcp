@@ -966,13 +966,23 @@ class CalendarService(
         return attempt(base, allowRetry = true)
     }
 
-    private fun splitTruncatePartialFailure(error: ServiceResult.Error): ServiceResult.Error = ServiceResult.Error(
-        error.code,
-        "The continuing series for this and later occurrences was created, but truncating the original " +
-            "series failed: ${error.message}. Those occurrences now exist in both series (a duplicate). Re-list " +
-            "with get_events and delete the duplicate future occurrences from the original series.",
-        error.retryAt
-    )
+    /**
+     * The continuing series exists, so this call must not look retryable: repeating it creates another
+     * continuing series. Drop the throttle deadline and the client's applied/not-applied label (the
+     * truncation may have landed), and keep only the underlying cause.
+     */
+    private fun splitTruncatePartialFailure(error: ServiceResult.Error): ServiceResult.Error {
+        val cause = error.message
+            .removePrefix(OkHttpCalDavClient.NOT_APPLIED_PREFIX)
+            .removePrefix(OkHttpCalDavClient.UNKNOWN_OUTCOME_PREFIX)
+        return ServiceResult.Error(
+            if (error.code == 429) 503 else error.code,
+            "The continuing series for this and later occurrences was created, but truncating the original " +
+                "series did not complete: $cause. Do not repeat this update_event call, because it would " +
+                "create another continuing series. Re-list with get_events: if the original series still " +
+                "shows these occurrences, they are duplicates, so delete them from the original series."
+        )
+    }
 
     /**
      * The calendar id owning [href]. An event href is `…/<calendar-collection>/<uid>.ics`, and a

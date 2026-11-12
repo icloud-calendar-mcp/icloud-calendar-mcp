@@ -58,8 +58,16 @@ class BackoffPropagationTest {
             val result = assertIs<ServiceResult.Error>(if (update)
                 service.updateEvent(handle, summary = "Changed", scope = EventScope.THIS_AND_FUTURE)
                 else service.deleteEvent(handle, EventScope.THIS_AND_FUTURE))
-            assertEquals(429, result.code)
-            assertEquals(deadline, result.retryAt)
+            if (update) {
+                // The continuing series already exists, so the error must not invite a retry.
+                assertNotEquals(429, result.code)
+                assertNull(result.retryAt)
+                assertTrue(result.message.contains("Do not repeat"), result.message)
+                assertFalse(result.message.contains("not applied"), result.message)
+            } else {
+                assertEquals(429, result.code)
+                assertEquals(deadline, result.retryAt)
+            }
             assertEquals(2, reads)
             assertEquals(1, backing.updateEventCallCount)
         }

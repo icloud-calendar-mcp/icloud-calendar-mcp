@@ -153,7 +153,10 @@ abstract class LiveCalendarTestBase {
         val result = service.listCalendars()
         check(result is ServiceResult.Success) { "listCalendars failed: $result" }
         val writable = (result as ServiceResult.Success).data.firstOrNull {
-            !it.readOnly && it.id.isNotBlank() && !it.name.equals("Reminders", ignoreCase = true)
+            // Select by supported components, not name: a reminders list can be renamed ("Reminders ⚠️")
+            // and iCloud answers 403 to a VEVENT PUT there. An empty set means the server did not say.
+            !it.readOnly && it.id.isNotBlank() && !it.name.startsWith("Reminders", ignoreCase = true) &&
+                (it.supportedComponents.isEmpty() || "VEVENT" in it.supportedComponents)
         }
         checkNotNull(writable) { "no writable VEVENT calendar found on this account" }
         return writable.id

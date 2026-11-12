@@ -4,17 +4,18 @@ import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okio.BufferedSink
 import java.io.IOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.time.Clock
-import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
+import javax.net.ssl.SSLHandshakeException
 import kotlin.random.Random
 
 /**
@@ -41,8 +42,14 @@ class OkHttpCalDavClient(
     private val httpClient = httpClient.newBuilder().apply {
         interceptors().add(0, backoff)
         networkInterceptors().add(0, backoff.networkInterceptor)
-        retryOnConnectionFailure(false)
     }.build()
+
+    /**
+     * PUT and DELETE never follow redirects: OkHttp would turn a 301/302/303 into a bodiless GET
+     * whose 200 reads as a successful write. OkHttp's connection-failure replay stays on. Every
+     * write is conditional or idempotent, so a replay of a write that landed gets a 412 (create,
+     * update) or 404 (delete), which the callers resolve.
+     */
     private val mutationClient = this.httpClient.newBuilder().followRedirects(false).build()
 
     private val xmlParser = ICloudXmlParser()
@@ -87,6 +94,13 @@ class OkHttpCalDavClient(
 
         /** Circuit breaker: consecutive failures before failing fast */
         internal const val CIRCUIT_BREAKER_THRESHOLD = 5
+
+        /** Write rejections that mean the server did not process the request. */
+        private val REFUSED_WRITE_STATUSES = setOf(408, 429, 501, 503, 505, 507)
+
+        internal const val NOT_APPLIED_PREFIX = "Mutation not applied. "
+        internal const val UNKNOWN_OUTCOME_PREFIX =
+            "Mutation may have been applied. Read back the event before retrying. "
 
         /** Maximum redirect hops for well-known discovery */
         internal const val MAX_WELL_KNOWN_HOPS = 5
@@ -215,21 +229,21 @@ class OkHttpCalDavClient(
     // ═══════════════════════════════════════════════════════════════════
 
     override fun listCalendars(): CalDavResult<List<CalDavCalendar>> {
-        try {
-            backoff.awaitAdmission()
-        } catch (e: IOException) {
-            return requestFailure(e)
-        }
+        // Inside a long backoff window, refuse even a cache hit so every tool reports the same deadline.
+        backoff.blockingWindow()?.let { return it.error() }
         // Use cache if available and within TTL
         val cached = calendarsCache
         if (cached != null && (clock.millis() - cacheTimestamp) < CACHE_TTL_MS) {
             return CalDavResult.Success(cached)
         }
 
-        // Try well-known discovery for CalDAV endpoint (RFC 6764)
+        // Try well-known discovery for CalDAV endpoint (RFC 6764). It is optional: any failure
+        // falls back to baseUrl, and the principal PROPFIND reports real auth or outage errors.
         val discovery = discoverWellKnown()
-        if (discovery is CalDavResult.Error) return discovery
-        val effectiveBaseUrl = (discovery as CalDavResult.Success).data ?: baseUrl
+        if (discovery is CalDavResult.Error) {
+            logger.debug("well-known discovery failed (code {}), using base URL", discovery.code)
+        }
+        val effectiveBaseUrl = discovery.getOrNull() ?: baseUrl
 
         // Step 1: Get current user principal
         val principalResult = discoverPrincipal(effectiveBaseUrl)
@@ -356,11 +370,7 @@ class OkHttpCalDavClient(
             .addHeader("If-None-Match", "*") // Fail if exists
             .build()
 
-        return executeRequestWithHeaders(request) { _, headers ->
-            // Get etag from response header, fallback to PROPFIND if missing
-            // Normalize to strip W/ prefix, quotes, XML entities (RFC 7232)
-            val etag = EtagUtils.normalizeEtag(headers["ETag"]) ?: fetchEtag(eventUrl)
-
+        val created = { etag: String? ->
             CalDavResult.Success(CalDavEvent(
                 uid = uid,
                 href = eventUrl.substringAfter(baseUrl),
@@ -369,6 +379,25 @@ class OkHttpCalDavClient(
                 icalData = icalData
             ))
         }
+        val put = {
+            executeRequestWithHeaders(request) { _, headers ->
+                // Get etag from response header, fallback to PROPFIND if missing
+                // Normalize to strip W/ prefix, quotes, XML entities (RFC 7232)
+                created(EtagUtils.normalizeEtag(headers["ETag"]) ?: fetchEtag(eventUrl))
+            }
+        }
+        var result = put()
+        // The href is a fresh UUID and the PUT carries If-None-Match: *, so resending it cannot
+        // duplicate the event. Skip the resend after a timeout so one call stays within one read timeout.
+        if (result is CalDavResult.Error && result.outcomeUnknown && result.code != 408) result = put()
+        if (result !is CalDavResult.Error) return result
+        if (result.code == 412) {
+            // Only an earlier attempt of this call can have created this href (an OkHttp replay or the
+            // resend above). Confirm the stored event is ours before reporting success.
+            val stored = getEvent(eventUrl)
+            if (stored is CalDavResult.Success && stored.data.uid == uid) return created(stored.data.etag)
+        }
+        return if (result.outcomeUnknown) unknownCreateOutcome(result) else result
     }
 
     override fun updateEvent(href: String, icalData: String, etag: String?): CalDavResult<CalDavEvent> {
@@ -679,7 +708,7 @@ class OkHttpCalDavClient(
 
     private fun <T> executeRequestWithHeaders(
         request: Request,
-        onSuccess: (String, Map<String, String>) -> CalDavResult<T>
+        onSuccess: (String, okhttp3.Headers) -> CalDavResult<T>
     ): CalDavResult<T> = executeWithRetry(readOnly = !request.isMutation()) {
         executeSingleRequestWithHeaders(request, onSuccess = onSuccess)
     }
@@ -689,20 +718,10 @@ class OkHttpCalDavClient(
         expectBody: Boolean = true,
         allow404: Boolean = false,
         authentication: Boolean = false,
-        onSuccess: (String, Map<String, String>) -> CalDavResult<T>
+        onSuccess: (String, okhttp3.Headers) -> CalDavResult<T>
     ): CalDavResult<T> {
         return try {
-            val call = if (request.isMutation()) {
-                // Disable automatic replays for PUT and DELETE.
-                val body = request.body ?: ByteArray(0).toRequestBody()
-                val oneShot = object : RequestBody() {
-                    override fun contentType() = body.contentType()
-                    override fun contentLength() = body.contentLength()
-                    override fun writeTo(sink: BufferedSink) = body.writeTo(sink)
-                    override fun isOneShot() = true
-                }
-                mutationClient.newCall(request.newBuilder().method(request.method, oneShot).build())
-            } else httpClient.newCall(request)
+            val call = (if (request.isMutation()) mutationClient else httpClient).newCall(request)
             call.execute().use { response ->
                 if (response.code == 404 && allow404) {
                     @Suppress("UNCHECKED_CAST")
@@ -713,7 +732,7 @@ class OkHttpCalDavClient(
                     ?: return CalDavResult.Error.payloadTooLargeError(
                         "Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
                     else ""
-                onSuccess(body, response.headers.toMap())
+                onSuccess(body, response.headers)
             }
         } catch (e: Exception) {
             requestFailure(e, request.isMutation())
@@ -733,14 +752,16 @@ class OkHttpCalDavClient(
             code == 401 || (code == 403 && authentication) -> CalDavResult.Error.authError()
             code == 403 -> CalDavResult.Error.forbiddenError()
             code == 404 -> CalDavResult.Error.notFoundError()
+            code == 408 -> CalDavResult.Error.timeoutError("Server timed out waiting for the request")
             code == 412 -> CalDavResult.Error.conflictError()
             code == 429 -> CalDavResult.Error.rateLimitError()
-            code in 500..599 -> CalDavResult.Error.serverError(code)
+            code in 500..599 -> CalDavResult.Error.serverError(code).copy(isRetryable = isTransientStatus(code))
             else -> CalDavResult.Error(code, "Unexpected response: $code")
         }
         return when {
-            mutation && code in 500..599 && backoff.retryAfter(response) == null -> unknownOutcome(error)
-            mutation && error.retryAt != null -> notApplied(error)
+            !mutation -> error
+            error.retryAt != null || code in REFUSED_WRITE_STATUSES -> notApplied(error)
+            code in 500..599 -> unknownOutcome(error)
             else -> error
         }
     }
@@ -756,16 +777,33 @@ class OkHttpCalDavClient(
             is SocketTimeoutException -> CalDavResult.Error.timeoutError("Request timed out: ${cause.message}")
             else -> CalDavResult.Error.networkError("Network error: ${cause.message}")
         }
-        return if (mutation && cause is IOException) unknownOutcome(error) else error
+        return when {
+            !mutation || cause !is IOException -> error
+            cause.isBeforeSend() -> notApplied(error)
+            else -> unknownOutcome(error)
+        }
     }
 
+    /** Failures that happen while opening the connection, before any request byte is written. */
+    private fun IOException.isBeforeSend() = this is ConnectException || this is UnknownHostException ||
+        this is NoRouteToHostException || this is SSLHandshakeException
+
     private fun notApplied(error: CalDavResult.Error) = error.copy(
-        message = "Mutation not applied. ${error.message}"
+        message = "$NOT_APPLIED_PREFIX${error.message}"
     )
 
     private fun unknownOutcome(error: CalDavResult.Error) = error.copy(
-        message = "Mutation may have been applied. Read back the event before retrying. ${error.message}",
-        isRetryable = false
+        message = "$UNKNOWN_OUTCOME_PREFIX${error.message}",
+        isRetryable = false,
+        outcomeUnknown = true
+    )
+
+    // get_events can miss a just-created event, so a read-back cannot prove the create failed.
+    private fun unknownCreateOutcome(error: CalDavResult.Error) = error.copy(
+        message = "Event creation outcome unknown: iCloud may have stored it. Do not call create_event " +
+            "again for this event, because get_events can miss a just-created event and a second call " +
+            "creates a duplicate. Tell the user to check the calendar. " +
+            error.message.removePrefix(UNKNOWN_OUTCOME_PREFIX)
     )
 
     private fun <T> executeWithRetry(
@@ -775,12 +813,9 @@ class OkHttpCalDavClient(
         for (attempt in 0..if (readOnly) MAX_RETRIES else 0) {
             val result = block()
             if (result !is CalDavResult.Error || !result.isRetryable || !readOnly) return result
-            val window = backoff.window()
-            if (window != null && Duration.between(clock.instant(), window.retryAt).toMillis() > MAX_RETRY_AFTER_MS) {
-                return window.error()
-            }
+            backoff.blockingWindow()?.let { return it.error() }
             if (attempt == MAX_RETRIES) return result
-            if (window == null) {
+            if (backoff.window() == null) {
                 try {
                     sleep(BASE_DELAY_MS * (1L shl attempt) + Random.nextLong(0, MAX_JITTER_MS))
                 } catch (_: InterruptedException) {
@@ -790,13 +825,5 @@ class OkHttpCalDavClient(
             }
         }
         error("Retry loop must return a result")
-    }
-
-    private fun okhttp3.Headers.toMap(): Map<String, String> {
-        val map = mutableMapOf<String, String>()
-        for (i in 0 until size) {
-            map[name(i)] = value(i)
-        }
-        return map
     }
 }
