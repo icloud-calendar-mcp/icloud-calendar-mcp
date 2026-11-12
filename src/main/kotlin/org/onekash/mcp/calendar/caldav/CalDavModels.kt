@@ -1,5 +1,7 @@
 package org.onekash.mcp.calendar.caldav
 
+import java.time.Instant
+
 /**
  * Result type for CalDAV operations.
  *
@@ -12,7 +14,10 @@ sealed class CalDavResult<out T> {
     data class Error(
         val code: Int,
         val message: String,
-        val isRetryable: Boolean = false
+        val isRetryable: Boolean = false,
+        val retryAt: Instant? = null,
+        /** True when a PUT or DELETE may have reached the server before it failed. */
+        val outcomeUnknown: Boolean = false
     ) : CalDavResult<Nothing>() {
 
         /** True if this is an authentication or authorization error (401, 403) */

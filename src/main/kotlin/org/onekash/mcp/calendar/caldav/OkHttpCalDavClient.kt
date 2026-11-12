@@ -6,13 +6,16 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import java.io.IOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
+import java.net.UnknownHostException
+import java.time.Clock
 import java.util.UUID
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SSLException
+import javax.net.ssl.SSLHandshakeException
 import kotlin.random.Random
 
 /**
@@ -30,8 +33,24 @@ import kotlin.random.Random
 class OkHttpCalDavClient(
     private val baseUrl: String,
     private val credentials: CalDavCredentials,
-    private val httpClient: OkHttpClient = createDefaultClient()
+    httpClient: OkHttpClient = createDefaultClient(),
+    private val clock: Clock = Clock.systemUTC(),
+    private val sleep: (Long) -> Unit = Thread::sleep
 ) : CalDavClient, java.io.Closeable {
+
+    private val backoff = CalDavBackoff(clock, sleep)
+    private val httpClient = httpClient.newBuilder().apply {
+        interceptors().add(0, backoff)
+        networkInterceptors().add(0, backoff.networkInterceptor)
+    }.build()
+
+    /**
+     * PUT and DELETE never follow redirects: OkHttp would turn a 301/302/303 into a bodiless GET
+     * whose 200 reads as a successful write. OkHttp's connection-failure replay stays on. Every
+     * write is conditional or idempotent, so a replay of a write that landed gets a 412 (create,
+     * update) or 404 (delete), which the callers resolve.
+     */
+    private val mutationClient = this.httpClient.newBuilder().followRedirects(false).build()
 
     private val xmlParser = ICloudXmlParser()
     private val logger = org.slf4j.LoggerFactory.getLogger(OkHttpCalDavClient::class.java)
@@ -44,9 +63,6 @@ class OkHttpCalDavClient(
     private var calendarsCache: List<CalDavCalendar>? = null
     @Volatile
     private var cacheTimestamp: Long = 0L
-
-    // Circuit breaker: consecutive request-level failures
-    private val consecutiveFailures = AtomicInteger(0)
 
     // Well-known discovery cache
     // @Volatile: double-fetch under contention is acceptable (idempotent)
@@ -73,11 +89,18 @@ class OkHttpCalDavClient(
         internal const val MAX_RETRIES = 1
         internal const val BASE_DELAY_MS = 100L
         internal const val MAX_JITTER_MS = 50L
-        /** Cap Retry-After to 2s max — MCP tools must respond quickly */
+        /** Longest backoff window to wait out within one call. */
         internal const val MAX_RETRY_AFTER_MS = 2000L
 
         /** Circuit breaker: consecutive failures before failing fast */
         internal const val CIRCUIT_BREAKER_THRESHOLD = 5
+
+        /** Write rejections that mean the server did not process the request. */
+        private val REFUSED_WRITE_STATUSES = setOf(408, 429, 501, 503, 505, 507)
+
+        internal const val NOT_APPLIED_PREFIX = "Mutation not applied. "
+        internal const val UNKNOWN_OUTCOME_PREFIX =
+            "Mutation may have been applied. Read back the event before retrying. "
 
         /** Maximum redirect hops for well-known discovery */
         internal const val MAX_WELL_KNOWN_HOPS = 5
@@ -206,14 +229,21 @@ class OkHttpCalDavClient(
     // ═══════════════════════════════════════════════════════════════════
 
     override fun listCalendars(): CalDavResult<List<CalDavCalendar>> {
+        // Inside a long backoff window, refuse even a cache hit so every tool reports the same deadline.
+        backoff.blockingWindow()?.let { return it.error() }
         // Use cache if available and within TTL
         val cached = calendarsCache
-        if (cached != null && (System.currentTimeMillis() - cacheTimestamp) < CACHE_TTL_MS) {
+        if (cached != null && (clock.millis() - cacheTimestamp) < CACHE_TTL_MS) {
             return CalDavResult.Success(cached)
         }
 
-        // Try well-known discovery for CalDAV endpoint (RFC 6764)
-        val effectiveBaseUrl = discoverWellKnown() ?: baseUrl
+        // Try well-known discovery for CalDAV endpoint (RFC 6764). It is optional: any failure
+        // falls back to baseUrl, and the principal PROPFIND reports real auth or outage errors.
+        val discovery = discoverWellKnown()
+        if (discovery is CalDavResult.Error) {
+            logger.debug("well-known discovery failed (code {}), using base URL", discovery.code)
+        }
+        val effectiveBaseUrl = discovery.getOrNull() ?: baseUrl
 
         // Step 1: Get current user principal
         val principalResult = discoverPrincipal(effectiveBaseUrl)
@@ -239,6 +269,10 @@ class OkHttpCalDavClient(
 
         for (homeSet in homeSets) {
             val calendarsResult = fetchCalendars(homeSet)
+            if (calendarsResult is CalDavResult.Error &&
+                (calendarsResult.isRetryable || calendarsResult.isAuthError || calendarsResult.code == 0)) {
+                return calendarsResult
+            }
             if (calendarsResult is CalDavResult.Success) {
                 for (cal in calendarsResult.data) {
                     if (seenHrefs.add(cal.href)) {
@@ -249,7 +283,7 @@ class OkHttpCalDavClient(
         }
 
         calendarsCache = allCalendars
-        cacheTimestamp = System.currentTimeMillis()
+        cacheTimestamp = clock.millis()
         return CalDavResult.Success(allCalendars)
     }
 
@@ -315,7 +349,7 @@ class OkHttpCalDavClient(
     override fun createEvent(calendarId: String, icalData: String): CalDavResult<CalDavEvent> {
         // Ensure we have calendar info
         val calendarsResult = listCalendars()
-        if (calendarsResult is CalDavResult.Error) return calendarsResult
+        if (calendarsResult is CalDavResult.Error) return notApplied(calendarsResult)
 
         val calendars = (calendarsResult as CalDavResult.Success).data
         val calendar = calendars.find { it.id == calendarId }
@@ -336,11 +370,7 @@ class OkHttpCalDavClient(
             .addHeader("If-None-Match", "*") // Fail if exists
             .build()
 
-        return executeRequestWithHeaders(request) { _, headers ->
-            // Get etag from response header, fallback to PROPFIND if missing
-            // Normalize to strip W/ prefix, quotes, XML entities (RFC 7232)
-            val etag = EtagUtils.normalizeEtag(headers["ETag"]) ?: fetchEtag(eventUrl)
-
+        val created = { etag: String? ->
             CalDavResult.Success(CalDavEvent(
                 uid = uid,
                 href = eventUrl.substringAfter(baseUrl),
@@ -349,6 +379,29 @@ class OkHttpCalDavClient(
                 icalData = icalData
             ))
         }
+        val put = {
+            executeRequestWithHeaders(request) { _, headers ->
+                // Get etag from response header, fallback to PROPFIND if missing
+                // Normalize to strip W/ prefix, quotes, XML entities (RFC 7232)
+                created(EtagUtils.normalizeEtag(headers["ETag"]) ?: fetchEtag(eventUrl))
+            }
+        }
+        var result = put()
+        // The href is a fresh UUID and the PUT carries If-None-Match: *, so resending it cannot
+        // duplicate the event. Skip the resend after a timeout so one call stays within one read timeout.
+        if (result is CalDavResult.Error && result.outcomeUnknown && result.code != 408) result = put()
+        if (result !is CalDavResult.Error) return result
+        if (result.code == 412) {
+            // Only an earlier attempt of this call can have created this href (an OkHttp replay or the
+            // resend above). Confirm the stored event is ours before reporting success.
+            when (val stored = getEvent(eventUrl)) {
+                is CalDavResult.Success -> return if (stored.data.uid == uid) created(stored.data.etag) else result
+                // The 412 says something exists at this fresh href, but the read failed (iCloud lag or an
+                // outage). A conflict error would invite a retry under a new href and duplicate the event.
+                is CalDavResult.Error -> return unknownCreateOutcome(result)
+            }
+        }
+        return if (result.outcomeUnknown) unknownCreateOutcome(result) else result
     }
 
     override fun updateEvent(href: String, icalData: String, etag: String?): CalDavResult<CalDavEvent> {
@@ -419,28 +472,17 @@ class OkHttpCalDavClient(
                     .build()
 
                 httpClient.newCall(request).execute().use { response ->
-                    when {
-                        response.code == 401 || response.code == 403 ->
-                            if (response.code == 401) CalDavResult.Error.authError() else CalDavResult.Error.forbiddenError()
-                        response.code !in 200..299 ->
-                            CalDavResult.Error.serverError(response.code)
-                        else -> {
-                            val davHeader = response.header("DAV") ?: ""
-                            if (davHeader.contains("calendar-access")) {
-                                CalDavResult.Success(true)
-                            } else {
-                                CalDavResult.Error.badRequestError(
-                                    "Server does not support CalDAV (missing 'calendar-access' in DAV header)")
-                            }
-                        }
+                    responseError(response, authentication = true)?.let { return@executeWithRetry it }
+                    val davHeader = response.header("DAV") ?: ""
+                    if (davHeader.contains("calendar-access")) {
+                        CalDavResult.Success(true)
+                    } else {
+                        CalDavResult.Error.badRequestError(
+                            "Server does not support CalDAV (missing 'calendar-access' in DAV header)")
                     }
                 }
-            } catch (e: SSLException) {
-                CalDavResult.Error.sslError("SSL error: ${e.message}")
-            } catch (e: SocketTimeoutException) {
-                CalDavResult.Error.timeoutError("Connection timed out")
             } catch (e: Exception) {
-                CalDavResult.Error.networkError("Unable to connect: ${e.message}")
+                requestFailure(e)
             }
         }
     }
@@ -490,7 +532,7 @@ class OkHttpCalDavClient(
             .addHeader("Depth", "0")
             .build()
 
-        return executeRequest(request) { responseBody ->
+        return executeRequest(request, authentication = true) { responseBody ->
             val principal = xmlParser.parseCurrentUserPrincipal(responseBody)
             CalDavResult.Success(principal)
         }
@@ -506,7 +548,7 @@ class OkHttpCalDavClient(
             .addHeader("Depth", "0")
             .build()
 
-        return executeRequest(request) { responseBody ->
+        return executeRequest(request, authentication = true) { responseBody ->
             val homeSets = xmlParser.parseCalendarHomeSets(responseBody)
             CalDavResult.Success(homeSets)
         }
@@ -522,7 +564,7 @@ class OkHttpCalDavClient(
             .addHeader("Depth", "1")
             .build()
 
-        return executeRequest(request) { responseBody ->
+        return executeRequest(request, authentication = true) { responseBody ->
             val calendars = xmlParser.parseCalendars(responseBody, baseUrl)
             CalDavResult.Success(calendars)
         }
@@ -534,11 +576,12 @@ class OkHttpCalDavClient(
      * to discover the CalDAV endpoint URL.
      *
      * Returns the discovered URL, or null if well-known is not supported.
-     * Result is cached (only attempted once per client lifetime).
+     * Cache successful discovery and permanent absence, leaving transient failures retryable.
      */
-    private fun discoverWellKnown(): String? {
-        if (wellKnownAttempted) return discoveredBaseUrl
-        wellKnownAttempted = true // Double-fetch OK (idempotent)
+    private fun discoverWellKnown(): CalDavResult<String?> = executeWithRetry { discoverWellKnownOnce() }
+
+    private fun discoverWellKnownOnce(): CalDavResult<String?> {
+        if (wellKnownAttempted) return CalDavResult.Success(discoveredBaseUrl)
 
         try {
             val url = "${baseUrl.trimEnd('/')}/.well-known/caldav"
@@ -551,7 +594,8 @@ class OkHttpCalDavClient(
 
             for (hop in 0 until MAX_WELL_KNOWN_HOPS) {
                 if (!visited.add(currentUrl)) {
-                    return null // Loop detected
+                    wellKnownAttempted = true
+                    return CalDavResult.Success(null)
                 }
 
                 val request = Request.Builder()
@@ -561,11 +605,14 @@ class OkHttpCalDavClient(
                     .build()
 
                 noRedirectClient.newCall(request).execute().use { response ->
+                    val error = responseError(response, authentication = true)
+                    if (error != null && (error.isRetryable || error.isAuthError)) return error
                     when (response.code) {
                         301, 302, 307, 308 -> {
-                            val location = response.header("Location") ?: return null
+                            val location = response.header("Location")
+                                ?: return CalDavResult.Success(null).also { wellKnownAttempted = true }
                             val resolved = response.request.url.resolve(location)?.toString()
-                                ?: return null
+                                ?: return CalDavResult.Success(null).also { wellKnownAttempted = true }
 
                             // Preserve HTTPS: reject downgrade to HTTP
                             currentUrl = if (baseUrl.startsWith("https://") && resolved.startsWith("http://")) {
@@ -576,17 +623,19 @@ class OkHttpCalDavClient(
                         }
                         in 200..299, 207 -> {
                             discoveredBaseUrl = currentUrl
-                            return currentUrl
+                            wellKnownAttempted = true
+                            return CalDavResult.Success(currentUrl)
                         }
-                        else -> return null // 404 or other error
+                        else -> return CalDavResult.Success(null).also { wellKnownAttempted = true }
                     }
                 }
             }
 
-            return null // Max hops exceeded
+            wellKnownAttempted = true
+            return CalDavResult.Success(null)
         } catch (e: Exception) {
             logger.debug("well-known discovery failed for {}/.well-known/caldav: {}", baseUrl.trimEnd('/'), e.toString())
-            return null // Well-known discovery is best-effort
+            return requestFailure(e)
         }
     }
 
@@ -602,26 +651,13 @@ class OkHttpCalDavClient(
      * Returns null if PROPFIND fails or ETag not present.
      */
     private fun fetchEtag(eventUrl: String): String? {
-        return try {
-            val request = Request.Builder()
-                .url(eventUrl)
-                .method("PROPFIND", PROPFIND_ETAG.toRequestBody(XML_MEDIA_TYPE))
-                .addHeader("Authorization", basicAuth())
-                .addHeader("Depth", "0")
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                if (response.code in 200..299 || response.code == 207) {
-                    val body = readBodyWithLimit(response) ?: return null
-                    xmlParser.parseEtag(body)
-                } else {
-                    null
-                }
-            }
-        } catch (e: Exception) {
-            logger.debug("fetchEtag PROPFIND failed for {}: {}", eventUrl, e.toString())
-            null
-        }
+        val request = Request.Builder()
+            .url(eventUrl)
+            .method("PROPFIND", PROPFIND_ETAG.toRequestBody(XML_MEDIA_TYPE))
+            .addHeader("Authorization", basicAuth())
+            .addHeader("Depth", "0")
+            .build()
+        return executeRequest(request) { body -> CalDavResult.Success(xmlParser.parseEtag(body)) }.getOrNull()
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -652,211 +688,148 @@ class OkHttpCalDavClient(
         return body.string()
     }
 
+    private fun Request.isMutation() = method == "PUT" || method == "DELETE"
+
     private fun <T> executeRequest(
         request: Request,
         expectBody: Boolean = true,
         allow404: Boolean = false,
+        authentication: Boolean = false,
         onSuccess: (String) -> CalDavResult<T>
-    ): CalDavResult<T> {
-        return executeWithRetry {
-            executeSingleRequest(request, expectBody, allow404, onSuccess)
-        }
+    ): CalDavResult<T> = executeWithRetry(readOnly = !request.isMutation()) {
+        executeSingleRequest(request, expectBody, allow404, authentication, onSuccess)
     }
 
     private fun <T> executeSingleRequest(
         request: Request,
-        expectBody: Boolean = true,
-        allow404: Boolean = false,
+        expectBody: Boolean,
+        allow404: Boolean,
+        authentication: Boolean,
         onSuccess: (String) -> CalDavResult<T>
-    ): CalDavResult<T> {
-        return try {
-            httpClient.newCall(request).execute().use { response ->
-                val code = response.code
-                val body = readBodyWithLimit(response)
-                    ?: return CalDavResult.Error.payloadTooLargeError("Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
-
-                when {
-                    code in 200..299 || code == 207 -> {
-                        onSuccess(body)
-                    }
-                    code == 404 && allow404 -> {
-                        @Suppress("UNCHECKED_CAST")
-                        CalDavResult.Success(Unit) as CalDavResult<T>
-                    }
-                    code == 401 || code == 403 -> {
-                        if (code == 401) CalDavResult.Error.authError() else CalDavResult.Error.forbiddenError()
-                    }
-                    code == 404 -> {
-                        CalDavResult.Error.notFoundError()
-                    }
-                    code == 412 -> {
-                        CalDavResult.Error.conflictError()
-                    }
-                    code == 429 -> {
-                        val retryAfter = parseRetryAfter(response)
-                        CalDavResult.Error.rateLimitError().also {
-                            retryAfterHint.set(retryAfter)
-                        }
-                    }
-                    code in 500..599 -> {
-                        CalDavResult.Error.serverError(code)
-                    }
-                    else -> {
-                        CalDavResult.Error(code, "Unexpected response: $code", isRetryable = false)
-                    }
-                }
-            }
-        } catch (e: SSLException) {
-            CalDavResult.Error.sslError("SSL error: ${e.message}")
-        } catch (e: SocketTimeoutException) {
-            CalDavResult.Error.timeoutError("Request timed out: ${e.message}")
-        } catch (e: Exception) {
-            CalDavResult.Error.networkError("Network error: ${e.message}")
-        }
+    ): CalDavResult<T> = executeSingleRequestWithHeaders(request, expectBody, allow404, authentication) { body, _ ->
+        onSuccess(body)
     }
 
-    /**
-     * Helper for response handling that needs etag from headers.
-     */
     private fun <T> executeRequestWithHeaders(
         request: Request,
-        onSuccess: (String, Map<String, String>) -> CalDavResult<T>
-    ): CalDavResult<T> {
-        return executeWithRetry {
-            executeSingleRequestWithHeaders(request, onSuccess)
-        }
+        onSuccess: (String, okhttp3.Headers) -> CalDavResult<T>
+    ): CalDavResult<T> = executeWithRetry(readOnly = !request.isMutation()) {
+        executeSingleRequestWithHeaders(request, onSuccess = onSuccess)
     }
 
     private fun <T> executeSingleRequestWithHeaders(
         request: Request,
-        onSuccess: (String, Map<String, String>) -> CalDavResult<T>
+        expectBody: Boolean = true,
+        allow404: Boolean = false,
+        authentication: Boolean = false,
+        onSuccess: (String, okhttp3.Headers) -> CalDavResult<T>
     ): CalDavResult<T> {
         return try {
-            httpClient.newCall(request).execute().use { response ->
-                val code = response.code
-                val body = readBodyWithLimit(response)
-                    ?: return CalDavResult.Error.payloadTooLargeError("Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
-                val headers = response.headers.toMap()
+            val call = (if (request.isMutation()) mutationClient else httpClient).newCall(request)
+            call.execute().use { response ->
+                if (response.code == 404 && allow404) {
+                    @Suppress("UNCHECKED_CAST")
+                    return CalDavResult.Success(Unit) as CalDavResult<T>
+                }
+                responseError(response, authentication, request.isMutation())?.let { return it }
+                val body = if (expectBody) readBodyWithLimit(response)
+                    ?: return CalDavResult.Error.payloadTooLargeError(
+                        "Response too large (exceeds ${MAX_BODY_SIZE / 1_000_000}MB limit)")
+                    else ""
+                onSuccess(body, response.headers)
+            }
+        } catch (e: Exception) {
+            requestFailure(e, request.isMutation())
+        }
+    }
 
-                when {
-                    code in 200..299 || code == 207 -> {
-                        onSuccess(body, headers)
-                    }
-                    code == 401 || code == 403 -> {
-                        if (code == 401) CalDavResult.Error.authError() else CalDavResult.Error.forbiddenError()
-                    }
-                    code == 404 -> {
-                        CalDavResult.Error.notFoundError()
-                    }
-                    code == 412 -> {
-                        CalDavResult.Error.conflictError()
-                    }
-                    code == 429 -> {
-                        val retryAfter = parseRetryAfter(response)
-                        CalDavResult.Error.rateLimitError().also {
-                            retryAfterHint.set(retryAfter)
-                        }
-                    }
-                    code in 500..599 -> {
-                        CalDavResult.Error.serverError(code)
-                    }
-                    else -> {
-                        CalDavResult.Error(code, "Unexpected response: $code", isRetryable = false)
-                    }
+    private fun responseError(
+        response: Response,
+        authentication: Boolean = false,
+        mutation: Boolean = false
+    ): CalDavResult.Error? {
+        val code = response.code
+        if (code in 200..299) return null
+        val window = response.request.tag(CalDavBackoff.Window::class.java)
+        val error = when {
+            (code == 429 || code == 503) && window != null -> window.error()
+            code == 401 || (code == 403 && authentication) -> CalDavResult.Error.authError()
+            code == 403 -> CalDavResult.Error.forbiddenError()
+            code == 404 -> CalDavResult.Error.notFoundError()
+            code == 408 -> CalDavResult.Error.timeoutError("Server timed out waiting for the request")
+            code == 412 -> CalDavResult.Error.conflictError()
+            code == 429 -> CalDavResult.Error.rateLimitError()
+            code in 500..599 -> CalDavResult.Error.serverError(code).copy(isRetryable = isTransientStatus(code))
+            else -> CalDavResult.Error(code, "Unexpected response: $code")
+        }
+        return when {
+            !mutation -> error
+            error.retryAt != null || code in REFUSED_WRITE_STATUSES -> notApplied(error)
+            code in 500..599 -> unknownOutcome(error)
+            else -> error
+        }
+    }
+
+    private fun requestFailure(exception: Exception, mutation: Boolean = false): CalDavResult.Error {
+        if (exception is CalDavBackoff.Blocked) {
+            val error = exception.window.error()
+            return if (mutation) notApplied(error) else error
+        }
+        val cause = if (exception is CalDavBackoff.TransportFailure) exception.failure else exception
+        val error = when (cause) {
+            is SSLException -> CalDavResult.Error.sslError("SSL error: ${cause.message}")
+            is SocketTimeoutException -> CalDavResult.Error.timeoutError("Request timed out: ${cause.message}")
+            else -> CalDavResult.Error.networkError("Network error: ${cause.message}")
+        }
+        return when {
+            !mutation || cause !is IOException -> error
+            cause.isBeforeSend() -> notApplied(error)
+            else -> unknownOutcome(error)
+        }
+    }
+
+    /** Failures that happen while opening the connection, before any request byte is written. */
+    private fun IOException.isBeforeSend() = this is ConnectException || this is UnknownHostException ||
+        this is NoRouteToHostException || this is SSLHandshakeException
+
+    private fun notApplied(error: CalDavResult.Error) = error.copy(
+        message = "$NOT_APPLIED_PREFIX${error.message}"
+    )
+
+    private fun unknownOutcome(error: CalDavResult.Error) = error.copy(
+        message = "$UNKNOWN_OUTCOME_PREFIX${error.message}",
+        isRetryable = false,
+        outcomeUnknown = true
+    )
+
+    // get_events can miss a just-created event, so a read-back cannot prove the create failed.
+    private fun unknownCreateOutcome(error: CalDavResult.Error) = error.copy(
+        message = "Event creation outcome unknown: iCloud may have stored it. Do not call create_event " +
+            "again for this event, because get_events can miss a just-created event and a second call " +
+            "creates a duplicate. Tell the user to check the calendar. " +
+            error.message.removePrefix(UNKNOWN_OUTCOME_PREFIX),
+        isRetryable = false,
+        outcomeUnknown = true
+    )
+
+    private fun <T> executeWithRetry(
+        readOnly: Boolean = true,
+        block: () -> CalDavResult<T>
+    ): CalDavResult<T> {
+        for (attempt in 0..if (readOnly) MAX_RETRIES else 0) {
+            val result = block()
+            if (result !is CalDavResult.Error || !result.isRetryable || !readOnly) return result
+            backoff.blockingWindow()?.let { return it.error() }
+            if (attempt == MAX_RETRIES) return result
+            if (backoff.window() == null) {
+                try {
+                    sleep(BASE_DELAY_MS * (1L shl attempt) + Random.nextLong(0, MAX_JITTER_MS))
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return result
                 }
             }
-        } catch (e: SSLException) {
-            CalDavResult.Error.sslError("SSL error: ${e.message}")
-        } catch (e: SocketTimeoutException) {
-            CalDavResult.Error.timeoutError("Request timed out: ${e.message}")
-        } catch (e: Exception) {
-            CalDavResult.Error.networkError("Network error: ${e.message}")
         }
-    }
-
-    // Thread-local Retry-After hint for retry loop
-    private val retryAfterHint = ThreadLocal<Long>()
-
-    /**
-     * Execute with retry: exponential backoff + jitter.
-     * Max 2 retries. Only retries when result.isRetryable.
-     * Respects Retry-After header (capped at 10s).
-     * Circuit breaker: fails fast after CIRCUIT_BREAKER_THRESHOLD consecutive failures.
-     */
-    private fun <T> executeWithRetry(block: () -> CalDavResult<T>): CalDavResult<T> {
-        // Circuit breaker check
-        if (consecutiveFailures.get() >= CIRCUIT_BREAKER_THRESHOLD) {
-            return CalDavResult.Error(503, "Circuit breaker open: too many consecutive failures", isRetryable = false)
-        }
-
-        var lastResult: CalDavResult<T>? = null
-
-        for (attempt in 0..MAX_RETRIES) {
-            retryAfterHint.remove()
-            val result = block()
-
-            if (result is CalDavResult.Success) {
-                consecutiveFailures.set(0) // Reset on success
-                return result
-            }
-
-            lastResult = result
-            val error = result as CalDavResult.Error
-
-            // Don't retry non-retryable errors
-            if (!error.isRetryable) {
-                consecutiveFailures.incrementAndGet()
-                return result
-            }
-
-            // Don't retry after last attempt
-            if (attempt == MAX_RETRIES) break
-
-            // Calculate delay
-            val retryAfterMs = (retryAfterHint.get() ?: 0L)
-            val backoffMs = BASE_DELAY_MS * (1L shl attempt) // exponential: 500, 1000
-            val jitterMs = Random.nextLong(0, MAX_JITTER_MS)
-            val delayMs = maxOf(backoffMs + jitterMs, retryAfterMs)
-
-            try {
-                Thread.sleep(delayMs)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                break
-            }
-        }
-
-        consecutiveFailures.incrementAndGet()
-        return lastResult ?: CalDavResult.Error.networkError("Request failed after retries")
-    }
-
-    /**
-     * Parse Retry-After header: supports seconds (integer) and HTTP-date (RFC 7231).
-     * Returns delay in milliseconds, capped at MAX_RETRY_AFTER_MS for MCP responsiveness.
-     */
-    internal fun parseRetryAfter(response: Response): Long {
-        val header = response.header("Retry-After") ?: return 0L
-
-        // Try as integer (seconds)
-        header.toLongOrNull()?.let { seconds ->
-            return minOf(seconds * 1000, MAX_RETRY_AFTER_MS)
-        }
-
-        // Try as HTTP-date (RFC 7231)
-        return try {
-            val date = ZonedDateTime.parse(header, DateTimeFormatter.RFC_1123_DATE_TIME)
-            val delayMs = date.toInstant().toEpochMilli() - System.currentTimeMillis()
-            minOf(maxOf(delayMs, 0), MAX_RETRY_AFTER_MS)
-        } catch (_: Exception) {
-            0L
-        }
-    }
-
-    private fun okhttp3.Headers.toMap(): Map<String, String> {
-        val map = mutableMapOf<String, String>()
-        for (i in 0 until size) {
-            map[name(i)] = value(i)
-        }
-        return map
+        error("Retry loop must return a result")
     }
 }
