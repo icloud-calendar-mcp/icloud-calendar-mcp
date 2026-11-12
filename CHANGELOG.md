@@ -5,89 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.3.0] - 2026-11-12
 
 ### Fixed
-- Honor Retry-After across callers and recover automatically after transient
-  failures. When iCloud throttles a CalDAV request, the tool returns
-  RATE_LIMITED with retryAt and retryAfterSeconds; breaker cooldowns return
-  CALDAV_ERROR with the deadline.
-- PUT and DELETE no longer follow redirects, so a redirected write is an error
-  instead of a GET read as success. Report whether a refused write was not
-  applied or an uncertain update or delete needs to be read back before
-  retrying. An uncertain create is resent to the same href (If-None-Match: *),
-  and a 412 on that href resolves to the created event.
-- Report refused discovery credentials as AUTH_ERROR. A failing
-  /.well-known/caldav probe falls back to the base URL. Transient and
-  authentication failures in the calendar listing are returned instead of
-  cached as an empty result.
-- Read the response ETag header case-insensitively, which removes an extra
-  PROPFIND per event read and write over HTTP/2.
-- `update_event` on a whole series keeps its edited occurrences. It used to
-  write back only the first VEVENT of the resource, dropping every
-  RECURRENCE-ID override, and if iCloud listed an override first it patched
-  that one and turned the series into a single event. Clearing the RRULE still
-  drops the overrides when no RDATE is left.
-- A UTC `UNTIL` on a series in another zone now ends the series at that
-  instant. It was read as a UTC wall clock, which kept one occurrence too many
-  west of UTC and dropped the last one east of it.
-- EXDATE matching: a DATE-TIME EXDATE first removes the occurrence at its
-  exact instant, so deleting one of two same-day occurrences no longer hides
-  both. If it matches no instant, a series with one occurrence per day still
-  removes the occurrence on the EXDATE's day, now taken in the event's zone
-  (a UTC EXDATE used to be read on its UTC date, which removed the wrong day
-  for Seoul mornings and US evenings). A DATE EXDATE removes its whole date.
-  An EXDATE stored as UTC midnight (`...T000000Z`) on a non-UTC series can now
-  land on the neighbouring day.
-- RDATEs are deduplicated against the RRULE by instant, so an RDATE at another
-  time of an occupied day adds its own occurrence. Two edited occurrences on
-  the same day both appear. A floating EXDATE or RDATE on a TZID series is read
-  in that TZID instead of the JVM zone, and is written back with it.
-- `exdates` and `rdates` accept a UTC instant ending in Z, a local date-time
-  read in the event's zone, or a date. A date on a timed series means that
-  day's occurrence; it is rejected with VALIDATION_ERROR on a series with
-  several occurrences per day. On an all-day series every form becomes a date.
-- Moving a series' start with `update_event` moves its `UNTIL` by the same
-  amount, so the series keeps its last occurrence, also across DST and zone
-  changes. The continuing series of a `this_and_future` edit that moves the
-  time does the same.
-- Properties the server does not model (X-APPLE-STRUCTURED-LOCATION, repeated
-  X- properties, COMMENT) are written back as their original lines on update.
-  Repeated properties used to collapse to the last one and quoted parameters
-  lost their quotes. Editing LOCATION does not update a structured location.
-- An uppercase `\N` in text decodes to a newline. A blank UID is treated as a
-  missing one. VALARM DESCRIPTION, SUMMARY and RELATED-TO are escaped, and a CR
-  inside any text value is written as a newline. A BYDAY ordinal outside
-  -53..53, or 0, is rejected.
-- A refused write names the CalDAV precondition from iCloud's error body, and
-  `create_event` into a calendar without event support (such as a reminders
-  list, which iCloud refuses with a bare 403) says why.
-- An RRULE occurrence starting exactly at the end of an expansion range is no
-  longer returned, matching the documented exclusive end.
-- An event with `rdates` and no `rrule` now shows its own start in
-  `get_events`. DTSTART is the first instance of the recurrence set (RFC 5545
-  3.8.5.2); it was dropped, so only the RDATEs appeared.
-- Error results escape every control character, so a message holding one is
-  still valid JSON.
-- A property the server does not model is never written back with a raw line
-  break or a control character: a decoded line break in its value is escaped
-  (it used to split into a separate, injected property), and lines, names or
-  values holding other control characters, or junk lines with no property
-  name, are not kept for write-back.
+- When iCloud is busy or rate-limits requests, the server tells you when to
+  retry and recovers on its own instead of failing repeatedly.
+- Creating, updating or deleting an event reports clearly when the change did
+  not go through, or when it may have and should be checked first. Retrying a
+  create no longer makes a duplicate event.
+- A wrong password is reported as a sign-in error, and a temporary iCloud
+  failure no longer shows an empty calendar list.
+- Editing a whole recurring series keeps the occurrences you changed one by
+  one.
+- Recurring events show the right occurrences: the last occurrence is no
+  longer dropped or repeated across time zones, deleting one of two
+  occurrences on the same day removes only that one, skipped dates land on the
+  right day, and an event made only of extra dates shows its first date.
+- Moving a recurring series to another time keeps its last occurrence.
+- Details the server does not edit, such as a map location set in Apple
+  Calendar, are kept when you update an event.
+- Creating an event in a Reminders list now explains why it is refused.
+- Text with line breaks or special characters is saved and read back
+  correctly.
 
 ### Changed
-- MCP Kotlin SDK 0.16.0 (from 0.15.0). The server still speaks protocol
-  2025-11-25, the newest the SDK implements; a client asking for 2026-07-28
-  negotiates down to it.
-- ical4j 4.4.0 (from 4.3.0). Its repeated-BYDAY fix removes duplicate
-  occurrences that COUNT also miscounted.
+- Skipped and extra dates (`exdates`, `rdates`) accept a date, a local time or
+  a UTC time.
+- Reading and saving events takes one less request to iCloud.
+- Updated the MCP and iCalendar libraries.
 
 ### Known limitations
-- On a series with several occurrences per day, moving the series' time does
-  not move its EXDATEs, so a deleted occurrence can reappear. Resend `exdates`
-  after such a move.
-- A text value with a backslash directly before a line break reads back with
-  the line break as a literal `\n` (an ical4j decoding bug).
+- On a series with several occurrences per day, moving the series to another
+  time can bring back a deleted occurrence. Delete it again after the move.
+- A backslash right before a line break in event text reads back as a literal
+  `\n`.
 
 ## [3.2.0] - 2026-08-14
 
@@ -275,9 +226,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error messages sanitize passwords, tokens, paths, emails
 - Input validation prevents injection attacks
 - Rate limiting prevents abuse
-
-## [Unreleased]
-
-### Planned
-- Calendar sharing
-- Attendee management
