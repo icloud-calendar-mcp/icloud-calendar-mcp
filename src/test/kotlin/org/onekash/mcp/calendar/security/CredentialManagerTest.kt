@@ -159,4 +159,47 @@ class CredentialManagerTest {
         val creds3 = CredentialManager.Credentials("user@icloud.com", "pass1")
         assertTrue(creds1 == creds3)
     }
+
+    // ========== Mutation-audit gaps: short usernames and the environment lookup ==========
+
+    @Test
+    fun `a username of three characters or fewer is fully masked`() {
+        for (name in listOf("abc", "ab", "a")) {
+            val shown = CredentialManager.Credentials(name, "secret-password-123").toString()
+            assertTrue(shown.contains("username=***,"), "username $name leaked: $shown")
+        }
+        assertTrue(CredentialManager.Credentials("abcd@example.com", "secret-password-123").toString().contains("abc***"))
+    }
+
+    private fun env(vararg pairs: Pair<String, String>): (String) -> String? = mapOf(*pairs)::get
+
+    @Test
+    fun `loadFromEnvironment reads both variables and validates them`() {
+        assertEquals(null, CredentialManager.loadFromEnvironment(env()))
+        assertFailsWith<CredentialException> {
+            CredentialManager.loadFromEnvironment(env("ICLOUD_PASSWORD" to "placeholder-pass-123"))
+        }
+        assertFailsWith<CredentialException> {
+            CredentialManager.loadFromEnvironment(env("ICLOUD_USERNAME" to "user@example.com"))
+        }
+        assertFailsWith<CredentialException> {
+            CredentialManager.loadFromEnvironment(env("ICLOUD_USERNAME" to "no-at-sign", "ICLOUD_PASSWORD" to "placeholder-pass-123"))
+        }
+        assertFailsWith<CredentialException> {
+            CredentialManager.loadFromEnvironment(env("ICLOUD_USERNAME" to "user@example.com", "ICLOUD_PASSWORD" to "short"))
+        }
+        val creds = CredentialManager.loadFromEnvironment(
+            env("ICLOUD_USERNAME" to "user@example.com", "ICLOUD_PASSWORD" to "placeholder-pass-123")
+        )
+        assertEquals("user@example.com", creds?.username)
+        assertEquals("placeholder-pass-123", creds?.password)
+    }
+
+    @Test
+    fun `isConfigured needs both variables`() {
+        assertFalse(CredentialManager.isConfigured(env()))
+        assertFalse(CredentialManager.isConfigured(env("ICLOUD_USERNAME" to "user@example.com")))
+        assertFalse(CredentialManager.isConfigured(env("ICLOUD_USERNAME" to "user@example.com", "ICLOUD_PASSWORD" to " ")))
+        assertTrue(CredentialManager.isConfigured(env("ICLOUD_USERNAME" to "user@example.com", "ICLOUD_PASSWORD" to "x")))
+    }
 }

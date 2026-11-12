@@ -1,5 +1,6 @@
 package org.onekash.icaldav.recurrence
 
+import org.onekash.icaldav.testutil.withDefaultZone
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -9,7 +10,6 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
-import java.util.TimeZone
 import kotlin.test.assertEquals
 
 /**
@@ -26,19 +26,13 @@ class RRuleExpanderUtcUntilTest {
     private val ny = ZoneId.of("America/New_York")
 
     /** Parse and expand with the JVM default timezone forced to [jvmZone], then restore. */
-    private fun expandOn(jvmZone: String, vevent: String): List<Long> {
-        val saved = TimeZone.getDefault()
-        return try {
-            TimeZone.setDefault(TimeZone.getTimeZone(jvmZone))
+    private fun expandOn(jvmZone: String, vevent: String): List<Long> = withDefaultZone(jvmZone) {
             val ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Test//Test//EN\n" +
                 "BEGIN:VEVENT\nUID:until-test\nSUMMARY:Until\n$vevent\nEND:VEVENT\nEND:VCALENDAR\n"
             val master = parser.parseAllEvents(ics).getOrThrow().single()
             val from = master.dtStart.toInstant().minusSeconds(DAY_SECONDS)
             val to = from.plusSeconds(1200L * DAY_SECONDS)
             expander.expand(master, TimeRange(from, to)).map { it.dtStart.timestamp }
-        } finally {
-            TimeZone.setDefault(saved)
-        }
     }
 
     private fun ms(zone: ZoneId, y: Int, mo: Int, d: Int, h: Int) =

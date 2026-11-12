@@ -1,5 +1,6 @@
 package org.onekash.icaldav.recurrence
 
+import org.onekash.icaldav.testutil.withDefaultZone
 import io.kotest.property.Arb
 import io.kotest.property.arbitrary.arbitrary
 import io.kotest.property.arbitrary.element
@@ -479,16 +480,10 @@ class RRuleRfc5545PropertiesTest {
             val text = (listOf("BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Test//Test//EN", "BEGIN:VEVENT",
                 "UID:zone-identity@test", "SUMMARY:Zone", "RRULE:${rule.text(";COUNT=30")}") + lines +
                 listOf("END:VEVENT", "END:VCALENDAR")).joinToString("\r\n")
-            fun run(jvmZone: String): List<Long> {
-                val saved = java.util.TimeZone.getDefault()
-                return try {
-                    java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone(jvmZone))
-                    val master = org.onekash.icaldav.parser.ICalParser().parseAllEvents(text).getOrThrow().single()
-                    expander.expand(master, start.minusDays(2).toInstant(), start.plusDays(spanFor(rule, 30)).toInstant())
-                        .map { it.dtStart.timestamp }
-                } finally {
-                    java.util.TimeZone.setDefault(saved)
-                }
+            fun run(jvmZone: String): List<Long> = withDefaultZone(jvmZone) {
+                val master = org.onekash.icaldav.parser.ICalParser().parseAllEvents(text).getOrThrow().single()
+                expander.expand(master, start.minusDays(2).toInstant(), start.plusDays(spanFor(rule, 30)).toInstant())
+                    .map { it.dtStart.timestamp }
             }
             assertEquals(run("UTC"), run("Asia/Seoul"), "kind $kind, ${rule.text()} from $start, other $other")
         }

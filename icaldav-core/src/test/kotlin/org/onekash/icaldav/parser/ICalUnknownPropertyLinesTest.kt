@@ -1,6 +1,11 @@
 package org.onekash.icaldav.parser
 
+import org.onekash.icaldav.testutil.IcsText.unfold
+import org.onekash.icaldav.testutil.IcsText.unfoldedLines
+import org.onekash.icaldav.testutil.IcsText.componentBlocks
+import org.onekash.icaldav.testutil.IcsText.calendar
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
@@ -38,10 +43,6 @@ class ICalUnknownPropertyLinesTest {
         "X-EMPTY:",
     )
 
-    private fun calendar(vararg components: String) =
-        (listOf("BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Test//Test//EN") +
-            components.toList() + listOf("END:VCALENDAR", "")).joinToString("\r\n")
-
     private fun vevent(uid: String, summary: String, lines: List<String>, recurrenceId: String? = null, rrule: String? = null) =
         (listOfNotNull(
             "BEGIN:VEVENT",
@@ -54,26 +55,6 @@ class ICalUnknownPropertyLinesTest {
             "SUMMARY:$summary",
         ) + lines + "END:VEVENT").joinToString("\r\n")
 
-    private fun unfold(ics: String) = ics.replace(Regex("\r?\n[ \t]"), "")
-
-    /** Top-level lines of each component named [type], nested components skipped. */
-    private fun blocks(ics: String, type: String = "VEVENT"): List<List<String>> {
-        val out = mutableListOf<List<String>>()
-        var current: MutableList<String>? = null
-        var depth = 0
-        for (line in unfold(ics).split("\r\n", "\n")) {
-            when {
-                current == null && line == "BEGIN:$type" -> { current = mutableListOf(); depth = 0 }
-                current == null -> Unit
-                line == "END:$type" && depth == 0 -> { out += current; current = null }
-                line.startsWith("BEGIN:") -> depth++
-                line.startsWith("END:") -> depth--
-                depth == 0 -> current += line
-            }
-        }
-        return out
-    }
-
     private fun unknownIn(block: List<String>, expected: List<String>) = block.filter { it in expected }
 
     @Test
@@ -83,14 +64,14 @@ class ICalUnknownPropertyLinesTest {
 
         assertEquals(unknownLines, event.unknownPropertyLines)
         val out = generator.generate(event)
-        assertEquals(unknownLines, unknownIn(blocks(out).single(), unknownLines))
+        assertEquals(unknownLines, unknownIn(componentBlocks(out).single(), unknownLines))
     }
 
     @Test
     fun `each unknown line is written exactly once`() {
         val ics = calendar(vevent("probe-2@example.test", "Probe", unknownLines))
         val out = generator.generate(parser.parseAllEvents(ics).getOrNull()!!.single())
-        val block = blocks(out).single()
+        val block = componentBlocks(out).single()
         val unknownNames = setOf("X-APPLE-STRUCTURED-LOCATION", "X-APPLE-SUGGESTION-INFO-UNIQUE-KEY",
             "X-MICROSOFT-LOCATIONS", "COMMENT", "RESOURCES", "ATTACH", "X-PROBE", "X-LINK", "X-EMPTY")
         val written = block.filter { it.split(':', ';').first() in unknownNames }
@@ -107,7 +88,7 @@ class ICalUnknownPropertyLinesTest {
 
         val out = generator.generate(event)
         assertTrue(out.split("\r\n").all { it.toByteArray(Charsets.UTF_8).size <= 75 })
-        assertEquals(listOf(long), unknownIn(blocks(out).single(), listOf(long)))
+        assertEquals(listOf(long), unknownIn(componentBlocks(out).single(), listOf(long)))
     }
 
     @Test
@@ -123,7 +104,7 @@ class ICalUnknownPropertyLinesTest {
         assertEquals(seriesLines, events.single { it.recurrenceId == null }.unknownPropertyLines)
 
         val out = generator.generate(ICalCalendar(prodId = null, events = events))
-        val outBlocks = blocks(out)
+        val outBlocks = componentBlocks(out)
         assertEquals(occurrenceLines, unknownIn(outBlocks[0], seriesLines + occurrenceLines))
         assertEquals(seriesLines, unknownIn(outBlocks[1], seriesLines + occurrenceLines))
     }
@@ -171,7 +152,7 @@ class ICalUnknownPropertyLinesTest {
             created = null, transparency = org.onekash.icaldav.model.Transparency.OPAQUE, url = null,
             rawProperties = mapOf("X-MAP-ONLY" to "value", "X-WITH-PARAM;P=1" to "v")
         )
-        val block = blocks(generator.generate(event)).single()
+        val block = componentBlocks(generator.generate(event)).single()
         assertTrue(block.contains("X-MAP-ONLY:value"))
         assertTrue(block.contains("X-WITH-PARAM;P=1:v"))
     }
@@ -205,8 +186,8 @@ class ICalUnknownPropertyLinesTest {
         assertEquals(todoLines, todo.unknownPropertyLines)
         assertEquals(journalLines, journal.unknownPropertyLines)
 
-        assertEquals(todoLines, unknownIn(blocks(generator.generate(todo), "VTODO").single(), todoLines))
-        assertEquals(journalLines, unknownIn(blocks(generator.generate(journal), "VJOURNAL").single(), journalLines))
+        assertEquals(todoLines, unknownIn(componentBlocks(generator.generate(todo), "VTODO").single(), todoLines))
+        assertEquals(journalLines, unknownIn(componentBlocks(generator.generate(journal), "VJOURNAL").single(), journalLines))
     }
 
     @Test
@@ -242,6 +223,74 @@ class ICalUnknownPropertyLinesTest {
         )
         val event = parser.parseAllEvents(ics).getOrNull()!!.single()
         assertEquals(emptyList<String>(), event.unknownPropertyLines)
-        assertTrue(blocks(generator.generate(event)).single().contains("X-CUSTOM:value"))
+        assertTrue(componentBlocks(generator.generate(event)).single().contains("X-CUSTOM:value"))
+    }
+
+    // Found by fuzzing the patch path: without a UID the lines can't be aligned, so the parser falls
+    // back to the property map, whose values ical4j has already decoded. A decoded line break must
+    // not reach the output as a raw one.
+    @Test
+    fun `the property-map fallback never writes a raw line break inside a value`() {
+        val ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//Test//EN\r\nBEGIN:VEVENT\r\n" +
+            "DTSTART:20260101T100000Z\r\nSUMMARY:No UID\r\nX-NOTE:first\\nX-INJECTED:1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        val event = parser.parseAllEvents(ics).getOrNull()!!.single()
+        assertTrue(event.unknownPropertyLines.isEmpty(), "no UID, so the map fallback is in use")
+        val out = generator.generate(event)
+        val lines = unfoldedLines(out)
+        assertFalse(lines.any { it.startsWith("X-INJECTED") }, "an escaped newline must not become a new property:\n$out")
+        val again = parser.parseAllEvents(out).getOrNull()!!.single()
+        assertEquals(event.rawProperties, again.rawProperties, "the map survives a round trip")
+    }
+
+    // Found by fuzzing the patch path (the crashing input, base64): a bare CR inside an unknown line,
+    // accepted on input, must not be written back as a raw line break.
+    @Test
+    fun `an unknown line with a bare CR is written back on one line`() {
+        val ics = String(java.util.Base64.getDecoder().decode("QkVHSU46VkNBTEVOREFSDQpJRDotL29FTg0KQkVHSU46VkVWRU5UDQpVSUQ6ckBiDQpEVFNUQVJUOjIwMjYwMTAxVDEwMDAwMFoNCkUJU0lPTjoyLjANClBST0RJRDotLy94L1xuDUVRRUxLWTtDscyqsVQ9Mw0KU1VNTUFSWTpSC1xuDQpFTkQ6VkVWRU5UDQpFTkQ6VkNBTEVOREFSDQo="), Charsets.UTF_8)
+        val event = parser.parseAllEvents(ics).getOrNull()!!.single()
+        // A bare CR is a CONTROL character (RFC 5545 3.1), so the line is not kept for write-back.
+        assertTrue(event.unknownPropertyLines.none { '\r' in it }, "no line with a stray CR is kept: ${event.unknownPropertyLines}")
+        val out = generator.generate(event)
+        assertTrue(out.split("\r\n").none { it.contains('\r') || it.contains('\n') }, "no raw line break inside a line:\n$out")
+        assertEquals(1, parser.parseAllEvents(out).getOrNull()!!.size, "the output parses back")
+    }
+
+    // Found by fuzzing the patch path (the crashing input, base64): lines that are not content
+    // lines (no property name, no colon) are skipped by ical4j on input, so they are not kept as
+    // unknown lines either; writing them back produced output that does not parse.
+    @Test
+    fun `junk lines that are not properties are not kept as unknown lines`() {
+        val ics = String(java.util.Base64.getDecoder().decode("QkVHSU46VkNBTEVOREFSDQpWRVJTSU9OOjIuMA0KUFJPRElEOi0vL3gvb0VODQpCRUdJTjpWRVZFTlQNClVJRDpyQGINCkRUU1RBUlQ6MjAyNjAxMDFUMTAwMDAwWg0KUlItMDEwMVQxMDAwMDBaDR7/AVVFOkYKUlc9RQlTSU9OXG4wDQpQU09ESUQ6LS8veC9cbkVMS1k7Q08zVU5UPTYNClNVTU1BUlk6UmVjdXINCi8veC9cbkU7Q08zVUxUPTMNClNVTU1BUlk6UmVjdXINCkVORDpWRVZFTlQNCkVORDpWQ0FMRU5EQVINCg=="), Charsets.UTF_8)
+        val event = parser.parseAllEvents(ics).getOrNull()!!.single()
+        assertTrue(event.unknownPropertyLines.all { Regex("^[A-Za-z0-9-]+[;:]").containsMatchIn(it) && ':' in it },
+            "only content lines are kept: ${event.unknownPropertyLines}")
+        val out = generator.generate(event)
+        assertEquals(1, parser.parseAllEvents(out).getOrNull()?.size, "the output parses back:\n$out")
+    }
+
+    // Found by fuzzing the patch path (the crashing input, base64): ical4j's relaxed parsing turns
+    // junk into properties with invalid names (empty, non-ASCII). Without an aligned UID they reach
+    // the property map, and writing them back produced output that does not parse.
+    @Test
+    fun `properties with invalid names are not kept in the property map`() {
+        val ics = String(java.util.Base64.getDecoder().decode("QkVHSU46VkNBTEVOREFSDTANQVBST0RJRDotLwAAXSxuQQ0KQkVHSU46VkVWRU5UDQpV2klEOmFAYg0KWgEAANpJRDphQGINCkRUU1RBUlQ6NDA1MjAyMDJUMTAwMDAwWg0wMFoNUFJJT1JJVFkwMDUwMTAwMDBVWg0KU1VNTUFSWTpIaQ0KU1RBUklNQUdFMDBaDQpEAAAADQAAAApV2gAAXFxcMzA6SA0MUkVMQVRFRC1UTzphQLZFTg0KQgAzVdoAAAAAAABOMDBuQQ0xMDAwAAAATjAwWg0iCkSAAAANAAAAClXaAFXagAxICwpFTkQ6VkVWRU5UDQpFTkQ6VkNBTEVOREFSDQo="), Charsets.ISO_8859_1)
+        val event = parser.parseAllEvents(ics).getOrNull()!!.single()
+        assertTrue(event.rawProperties.keys.all { Regex("^[A-Za-z0-9-]+(;|$)").containsMatchIn(it) },
+            "only valid property names: ${event.rawProperties.keys}")
+        val out = generator.generate(event)
+        assertEquals(1, parser.parseAllEvents(out).getOrNull()?.size, "the output parses back:\n$out")
+    }
+
+    // Found by fuzzing the patch path (the crashing input, base64): content lines may not hold
+    // CONTROL characters other than HTAB (RFC 5545 3.1), so lines and values holding NUL and the
+    // like are not kept for write-back.
+    @Test
+    fun `lines and values with control characters are not kept for write-back`() {
+        val ics = String(java.util.Base64.getDecoder().decode("QkVHSU46VkNBTEVOREFSDQpWRQpWRVJTSU9OOjIveC9vRU4NCkJFR0lOOlZFVkVOVA0KVUlOOlZFVkVOVA0KVUlEOjpIDQ0KCwpBTjBaDU9SRy5JcERPDVBSCkQ6LS8veC9cbkVMS05EQ08zVU5UPTMNClNVTU1BUv///1k6UmVjdXINClVMXidXPUFQUk9EMDIwMlxuVDEwMDAwQVoNCkRURU5EOjIwMjYwMTAxVDExMDAwMAAACgoJCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoBAAAAAAAAAC9vRU4NCkJFR0VFS0xZO0JZTU87AQD///86AABJTjpWRVZFTlQNClVUOjJVCgEfT0RJRDotMA1PUkdBTjBaDU9SRy5JcERPDVBSCkQ6LS8veC9cbkVMS05EQ08zVU5UPTMNClNVTU1BUv///1k6UmVjdXINCi8veE5pSFJZOlJlY3VyDQpFTkQ6VkVWRU5UDQpFTkQ6VkNBTEVOREFSDQo="), Charsets.UTF_8)
+        val event = parser.parseAllEvents(ics).getOrNull()!!.single()
+        val control = { s: String -> s.any { (it < ' ' && it != '\t' && it != '\n') || it == '\u007f' } }
+        assertTrue(event.unknownPropertyLines.none(control), "lines: ${event.unknownPropertyLines}")
+        assertTrue(event.rawProperties.values.none(control), "map: ${event.rawProperties}")
+        assertTrue(generator.generate(event).split("\r\n").none(control), "no control character is written back")
     }
 }

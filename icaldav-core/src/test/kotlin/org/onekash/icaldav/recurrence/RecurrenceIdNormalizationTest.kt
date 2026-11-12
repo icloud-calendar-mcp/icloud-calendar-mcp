@@ -1,5 +1,6 @@
 package org.onekash.icaldav.recurrence
 
+import org.onekash.icaldav.testutil.withDefaultZone
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -9,7 +10,6 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
-import java.util.TimeZone
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -40,17 +40,6 @@ class RecurrenceIdNormalizationTest {
     private val parser = ICalParser()
     private val expander = RRuleExpander()
     private val nyZone = ZoneId.of("America/New_York")
-
-    /** Run [block] with the JVM default timezone forced to [zoneId], then restore. */
-    private fun <T> withDefaultZone(zoneId: String, block: () -> T): T {
-        val saved = TimeZone.getDefault()
-        return try {
-            TimeZone.setDefault(TimeZone.getTimeZone(zoneId))
-            block()
-        } finally {
-            TimeZone.setDefault(saved)
-        }
-    }
 
     private fun expandParsed(ics: String, zone: ZoneId, from: ZonedDateTime, to: ZonedDateTime) =
         run {

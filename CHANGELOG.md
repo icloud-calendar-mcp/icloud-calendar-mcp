@@ -67,8 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An event with `rdates` and no `rrule` now shows its own start in
   `get_events`. DTSTART is the first instance of the recurrence set (RFC 5545
   3.8.5.2); it was dropped, so only the RDATEs appeared.
+- Error results escape every control character, so a message holding one is
+  still valid JSON.
+- A property the server does not model is never written back with a raw line
+  break or a control character: a decoded line break in its value is escaped
+  (it used to split into a separate, injected property), and lines, names or
+  values holding other control characters, or junk lines with no property
+  name, are not kept for write-back.
 
 ### Changed
+- MCP Kotlin SDK 0.16.0 (from 0.15.0). The server still speaks protocol
+  2025-11-25, the newest the SDK implements; a client asking for 2026-07-28
+  negotiates down to it.
 - ical4j 4.4.0 (from 4.3.0). Its repeated-BYDAY fix removes duplicate
   occurrences that COUNT also miscounted.
 

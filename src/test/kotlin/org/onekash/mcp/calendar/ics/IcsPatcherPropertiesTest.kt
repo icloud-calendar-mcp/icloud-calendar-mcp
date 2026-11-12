@@ -7,6 +7,7 @@ import io.kotest.property.arbitrary.int
 import io.kotest.property.arbitrary.long
 import io.kotest.property.checkAll
 import kotlinx.coroutines.runBlocking
+import org.onekash.icaldav.testutil.IcsText
 import org.onekash.icaldav.testutil.PropertyRuns
 import java.time.LocalDate
 import java.time.LocalTime
@@ -48,22 +49,9 @@ class IcsPatcherPropertiesTest {
         return Line(head[0].uppercase(), params, raw.substring(colon + 1))
     }
 
-    /** Each VEVENT of [ics], unfolded, as its parsed lines. */
-    private fun vevents(ics: String): List<List<Line>> {
-        val lines = ics.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
-        val out = mutableListOf<MutableList<Line>>()
-        var depth = 0
-        for (line in lines) {
-            when {
-                line == "BEGIN:VEVENT" -> { out.add(mutableListOf()); depth = 1 }
-                line == "END:VEVENT" -> depth = 0
-                depth == 1 && line.startsWith("BEGIN:") -> depth = 2
-                depth == 2 && line.startsWith("END:") -> depth = 1
-                depth == 1 && line.isNotBlank() -> out.last().add(parseLine(line))
-            }
-        }
-        return out
-    }
+    /** Each VEVENT of [ics], unfolded, as its parsed top-level lines. */
+    private fun vevents(ics: String): List<List<Line>> =
+        IcsText.componentBlocks(ics).map { block -> block.filter { it.isNotBlank() }.map(::parseLine) }
 
     private fun List<Line>.prop(name: String): Line? = firstOrNull { it.name == name }
 
@@ -251,8 +239,7 @@ class IcsPatcherPropertiesTest {
                 "UID:unknown-prop@test", "DTSTAMP:20260101T000000Z", "DTSTART:20260301T090000Z",
                 "DTEND:20260301T100000Z", "SUMMARY:Original") + lines.map { fold(it, random) } +
                 listOf("END:VEVENT", "END:VCALENDAR")).joinToString("\r\n") + "\r\n"
-            fun unknownIn(text: String) = text.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
-                .filter { it.startsWith("X-PROP-") }
+            fun unknownIn(text: String) = IcsText.unfoldedLines(text).filter { it.startsWith("X-PROP-") }
 
             val parsed = (org.onekash.icaldav.parser.ICalParser().parseAllEvents(ics)
                 as org.onekash.icaldav.model.ParseResult.Success).value.single()

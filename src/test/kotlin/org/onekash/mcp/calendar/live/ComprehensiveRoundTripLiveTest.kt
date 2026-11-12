@@ -372,7 +372,7 @@ class ComprehensiveRoundTripLiveTest : LiveCalendarTestBase() {
             fun storedLines(): List<String> {
                 val stored = raw.getEvent(href)
                 check(stored is org.onekash.mcp.calendar.caldav.CalDavResult.Success) { "raw GET failed: $stored" }
-                return stored.data.icalData.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
+                return org.onekash.icaldav.testutil.IcsText.unfoldedLines(stored.data.icalData)
             }
             val before = storedLines()
             val baseline = before.filter { it.startsWith("X-APPLE-STRUCTURED-LOCATION") || it.startsWith("X-REPEATED") }

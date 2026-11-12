@@ -547,11 +547,18 @@ class ICalGenerator(
      */
     private fun StringBuilder.appendUnknownProperties(lines: List<String>, map: Map<String, String>) {
         if (lines.isNotEmpty()) {
-            lines.forEach { appendFoldedLine(it) }
+            // Valid lines carry no CR or LF; a stray one (accepted on input) must not split the line.
+            lines.forEach { appendFoldedLine(escapeLineBreaks(it)) }
         } else {
-            map.forEach { (key, value) -> appendFoldedLine("$key:$value") }
+            // The map holds values ical4j already decoded, so a line break in one is real; write it
+            // back as the TEXT escape, or it would split the value into a separate (injected) line.
+            map.forEach { (key, value) -> appendFoldedLine("$key:${escapeLineBreaks(value)}") }
         }
     }
+
+    /** [value] with CRLF, CR and LF written as the `\n` escape (RFC 5545 3.3.11), so it stays on one line. */
+    private fun escapeLineBreaks(value: String): String =
+        value.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
 
     /**
      * Format DTSTAMP as UTC timestamp.

@@ -1,5 +1,8 @@
 package org.onekash.mcp.calendar.ics
 
+import org.onekash.icaldav.testutil.IcsText.calendar
+import org.onekash.icaldav.testutil.IcsText.componentBlocks
+import org.onekash.icaldav.testutil.IcsText.unfoldedLines
 import kotlin.test.*
 
 /**
@@ -1326,26 +1329,11 @@ class IcsPatcherTest {
         END:VEVENT
     """.trimIndent()
 
-    private fun calendar(vararg vevents: String) =
-        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Test//Test//EN\n" + vevents.joinToString("\n") + "\nEND:VCALENDAR"
-
-    /** Each VEVENT block of [ics], unfolded, as its list of property lines. */
-    private fun vevents(ics: String): List<List<String>> =
-        ics.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
-            .fold(mutableListOf<MutableList<String>>() to false) { (acc, inside), line ->
-                when {
-                    line == "BEGIN:VEVENT" -> { acc.add(mutableListOf()); acc to true }
-                    line == "END:VEVENT" -> acc to false
-                    inside && !line.startsWith("BEGIN:") && !line.startsWith("END:") -> { acc.last().add(line); acc to true }
-                    else -> acc to inside
-                }
-            }.first
-
     private fun prop(vevent: List<String>, name: String): String? =
         vevent.firstOrNull { it.startsWith("$name:") || it.startsWith("$name;") }?.substringAfter(":")
 
     private fun assertOverrideIntact(patched: String, recurrenceId: String, start: String, summary: String) {
-        val match = vevents(patched).filter { prop(it, "RECURRENCE-ID") == recurrenceId }
+        val match = componentBlocks(patched).filter { prop(it, "RECURRENCE-ID") == recurrenceId }
         assertEquals(1, match.size, "override $recurrenceId written once:\n$patched")
         assertEquals(start, prop(match[0], "DTSTART"), "override $recurrenceId keeps its DTSTART")
         assertEquals(summary, prop(match[0], "SUMMARY"), "override $recurrenceId keeps its SUMMARY")
@@ -1357,7 +1345,7 @@ class IcsPatcherTest {
     private fun ruleParts(rrule: String?): Set<String>? = rrule?.split(';')?.toSet()
 
     private fun masterOf(patched: String): List<String> =
-        vevents(patched).single { prop(it, "RECURRENCE-ID") == null }
+        componentBlocks(patched).single { prop(it, "RECURRENCE-ID") == null }
 
     @Test
     fun `whole-series patch keeps every override when the master is listed first`() {
@@ -1381,7 +1369,7 @@ class IcsPatcherTest {
             summary = "Renamed sync"
         )
         assertEquals(2, veventCount(patched), "master + override:\n$patched")
-        val first = vevents(patched).first()
+        val first = componentBlocks(patched).first()
         assertNull(prop(first, "RECURRENCE-ID"), "the master is written first:\n$patched")
         assertEquals("Renamed sync", prop(first, "SUMMARY"))
         assertEquals(ruleParts("FREQ=WEEKLY;BYDAY=MO;COUNT=6"), ruleParts(prop(first, "RRULE")), "the series keeps its RRULE")
@@ -1398,7 +1386,7 @@ class IcsPatcherTest {
             summary = "Renamed"
         )
         assertEquals(2, veventCount(patched), patched)
-        val byRecid = vevents(patched).associateBy { prop(it, "RECURRENCE-ID") }
+        val byRecid = componentBlocks(patched).associateBy { prop(it, "RECURRENCE-ID") }
         assertEquals("Renamed", prop(byRecid.getValue("20260119T090000Z"), "SUMMARY"), "first VEVENT patched")
         assertOverrideIntact(patched, "20260202T090000Z", "20260202T093000Z", "Moved sync")
     }
@@ -2034,7 +2022,6 @@ class IcsPatcherTest {
         "DTSTART:20260105T090000Z", "DTEND:20260105T100000Z", "SUMMARY:Original", "LOCATION:Apple Park"
     ) + listOfNotNull(rrule?.let { "RRULE:$it" }) + unknownLines + "END:VEVENT").joinToString("\n"))
 
-    private fun unfoldedLines(ics: String) = ics.replace("\r\n", "\n").replace(Regex("\n[ \t]"), "").split("\n")
 
     private fun unknownIn(vevent: List<String>) = vevent.filter { line -> unknownLines.any { it == line } }
 
@@ -2059,7 +2046,7 @@ class IcsPatcherTest {
     fun `a this_occurrence edit gives the new override the master's unknown lines`() {
         val patched = patcher.patchOccurrence(withUnknownLines("FREQ=DAILY;COUNT=5"), recurrenceId = "20260107T090000Z",
             summary = "One-off")
-        val blocks = vevents(patched)
+        val blocks = componentBlocks(patched)
         assertEquals(2, blocks.size, patched)
         for (block in blocks) assertEquals(unknownLines, unknownIn(block), "each VEVENT keeps the lines:\n$patched")
     }
@@ -2119,5 +2106,81 @@ class IcsPatcherTest {
         val utcStarts = starts(toUtc)
         assertEquals(11, utcStarts.size, "Mar 1 to Mar 11: $utcStarts")
         assertEquals("2026-03-11T15:00:00Z", utcStarts.last())
+    }
+
+    // ========== Mutation-audit gaps: series cuts carry or drop each exception ==========
+
+    private fun override(day: String, summary: String) = listOf(
+        "BEGIN:VEVENT", "UID:cut@test", "DTSTAMP:20260101T000000Z", "RECURRENCE-ID:${day}T090000Z",
+        "DTSTART:${day}T110000Z", "DTEND:${day}T113000Z", "SUMMARY:$summary", "END:VEVENT"
+    ).joinToString("\r\n")
+
+    /** Daily at 09:00 UTC from 03-01, with an EXDATE, an RDATE and an override on each side of 03-06. */
+    private val cutSeries = calendar(
+        listOf(
+            "BEGIN:VEVENT", "UID:cut@test", "DTSTAMP:20260101T000000Z", "SEQUENCE:2",
+            "DTSTART:20260301T090000Z", "DTEND:20260301T093000Z", "RRULE:FREQ=DAILY;COUNT=10",
+            "EXDATE:20260303T090000Z", "EXDATE:20260308T090000Z",
+            "RDATE:20260304T150000Z", "RDATE:20260309T150000Z", "SUMMARY:Daily", "END:VEVENT"
+        ).joinToString("\r\n"),
+        override("20260302", "Early edit"),
+        override("20260307", "Late edit"),
+    )
+
+    private fun List<String>.values(name: String) =
+        filter { it.startsWith("$name:") || it.startsWith("$name;") }.flatMap { it.substringAfter(':').split(',') }
+
+    private fun assertTruncatedMaster(ics: String) {
+        val blocks = componentBlocks(ics)
+        val master = blocks.single { b -> b.none { it.startsWith("RECURRENCE-ID") } }
+        assertEquals(2, blocks.size, "master plus the earlier override:\n$ics")
+        assertTrue(master.contains("SEQUENCE:3"), "SEQUENCE goes up by one:\n$ics")
+        assertTrue(master.values("RRULE").single().contains("UNTIL=20260305T090000Z"), ics)
+        assertEquals(listOf("20260303T090000Z"), master.values("EXDATE"), "only the earlier EXDATE stays")
+        assertEquals(listOf("20260304T150000Z"), master.values("RDATE"), "only the earlier RDATE stays")
+        val kept = blocks.single { b -> b.any { it.startsWith("RECURRENCE-ID") } }
+        assertTrue(kept.contains("SUMMARY:Early edit"), ics)
+    }
+
+    @Test
+    fun `truncateSeries keeps the exceptions before the cut and drops the later ones`() {
+        assertTruncatedMaster(patcher.truncateSeries(cutSeries, "20260306T090000Z"))
+    }
+
+    @Test
+    fun `splitSeries carries the later exceptions onto the new series`() {
+        val split = patcher.splitSeries(cutSeries, "20260306T090000Z", summary = "Renamed")
+        assertTruncatedMaster(split.truncatedMaster)
+
+        val blocks = componentBlocks(split.newSeries)
+        assertEquals(2, blocks.size, "new master plus the later override:\n${split.newSeries}")
+        val master = blocks.single { b -> b.none { it.startsWith("RECURRENCE-ID") } }
+        assertTrue(master.contains("DTSTART:20260306T090000Z"), split.newSeries)
+        assertTrue(master.contains("DTEND:20260306T093000Z"), "DTEND keeps the master's duration")
+        assertTrue(master.contains("SUMMARY:Renamed"))
+        assertEquals(listOf("20260308T090000Z"), master.values("EXDATE"), "the later EXDATE moves over")
+        assertEquals(listOf("20260309T150000Z"), master.values("RDATE"), "the later RDATE moves over")
+        val newUid = master.single { it.startsWith("UID:") }
+        assertNotEquals("UID:cut@test", newUid)
+        val carried = blocks.single { b -> b.any { it.startsWith("RECURRENCE-ID") } }
+        assertTrue(carried.contains("SUMMARY:Late edit"))
+        assertTrue(carried.contains(newUid), "the carried override takes the new UID")
+    }
+
+    @Test
+    fun `exdateOccurrence bumps SEQUENCE and does not repeat an EXDATE`() {
+        val once = patcher.exdateOccurrence(cutSeries, "20260305T090000Z")
+        val master = componentBlocks(once).single { b -> b.none { it.startsWith("RECURRENCE-ID") } }
+        assertTrue(master.contains("SEQUENCE:3"), once)
+        val twice = patcher.exdateOccurrence(once, "20260305T090000Z")
+        val again = componentBlocks(twice).single { b -> b.none { it.startsWith("RECURRENCE-ID") } }
+        assertEquals(1, again.values("EXDATE").count { it == "20260305T090000Z" }, twice)
+    }
+
+    @Test
+    fun `patchOccurrence with only a summary ends the exception after the master's duration`() {
+        val patched = patcher.patchOccurrence(weeklyTimedSeries, "20260202T090000Z", summary = "Renamed")
+        val exception = componentBlocks(patched).single { b -> b.any { it.startsWith("RECURRENCE-ID") } }
+        assertTrue(exception.contains("DTEND:20260202T100000Z"), patched)
     }
 }

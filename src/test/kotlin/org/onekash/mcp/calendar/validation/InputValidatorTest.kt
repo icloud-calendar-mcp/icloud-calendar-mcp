@@ -636,4 +636,45 @@ class InputValidatorTest {
         assertTrue(message.contains("event's zone"), message)
         assertTrue(message.contains("ending in Z"), message)
     }
+
+    // ========== Mutation-audit gaps: boundaries and malformed values ==========
+
+    @Test
+    fun `validateRecurrenceDateList rejects a malformed value and bounds the list at 366`() {
+        assertTrue(InputValidator.validateRecurrenceDateList(listOf("not-a-date"), "exdates") is ValidationResult.Invalid)
+        val year = (0 until 366).map { java.time.LocalDate.of(2026, 1, 1).plusDays(it.toLong()).toString() }
+        assertTrue(InputValidator.validateRecurrenceDateList(year, "exdates") is ValidationResult.Valid, "366 entries pass")
+        assertTrue(InputValidator.validateRecurrenceDateList(year + "2027-01-02", "exdates") is ValidationResult.Invalid,
+            "367 entries fail")
+    }
+
+    @Test
+    fun `validateAlarmList enforces its count, text length and repeat limits`() {
+        val alarm = mapOf<String, Any?>("trigger" to "-PT15M")
+        assertTrue(InputValidator.validateAlarmList(List(8) { alarm }) is ValidationResult.Valid, "8 alarms pass")
+        assertTrue(InputValidator.validateAlarmList(List(9) { alarm }) is ValidationResult.Invalid, "9 alarms fail")
+        for (field in listOf("description", "summary")) {
+            assertTrue(InputValidator.validateAlarmList(listOf(alarm + (field to "x".repeat(500)))) is ValidationResult.Valid,
+                "$field of 500 characters passes")
+            assertTrue(InputValidator.validateAlarmList(listOf(alarm + (field to "x".repeat(501)))) is ValidationResult.Invalid,
+                "$field of 501 characters fails")
+        }
+        assertTrue(InputValidator.validateAlarmList(listOf(alarm + ("repeat_count" to 0))) is ValidationResult.Valid)
+        assertTrue(InputValidator.validateAlarmList(listOf(alarm + ("repeat_count" to -1))) is ValidationResult.Invalid)
+        assertTrue(InputValidator.validateAlarmList(listOf(alarm + ("repeat_duration" to "PT5M"))) is ValidationResult.Valid)
+        assertTrue(InputValidator.validateAlarmList(listOf(alarm + ("repeat_duration" to "five minutes"))) is ValidationResult.Invalid)
+    }
+
+    @Test
+    fun `validateOptionalText passes at its maximum length and fails one past it`() {
+        assertTrue(InputValidator.validateOptionalText("x".repeat(500), "location", maxLength = 500) is ValidationResult.Valid)
+        assertTrue(InputValidator.validateOptionalText("x".repeat(501), "location", maxLength = 500) is ValidationResult.Invalid)
+    }
+
+    @Test
+    fun `validateTimezone accepts a blank value and rejects one over 100 characters`() {
+        assertTrue(InputValidator.validateTimezone("") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateTimezone("   ") is ValidationResult.Valid)
+        assertTrue(InputValidator.validateTimezone("A/" + "b".repeat(99)) is ValidationResult.Invalid)
+    }
 }

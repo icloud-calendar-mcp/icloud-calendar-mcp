@@ -114,8 +114,8 @@ fun main(args: Array<String>) {
 
     // Start server with STDIO transport (for Claude Desktop)
     val transport = StdioServerTransport(
-        inputStream = System.`in`.asSource().buffered(),
-        outputStream = System.out.asSink().buffered()
+        input = System.`in`.asSource().buffered(),
+        output = System.out.asSink().buffered()
     )
     val session = server.createSession(transport)
 

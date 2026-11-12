@@ -93,15 +93,6 @@ tasks.test {
         System.getProperty("user.timezone")?.takeIf { it.isNotBlank() }
             ?: TimeZone.getDefault().id
     )
-    // Property tests (testutil.PropertyRuns): -PpropertySeed=<seed>|random replays a printed seed
-    // or draws a new one, -PpropertyIterations=<n> multiplies the iterations. Never up to date
-    // while set, so a repeated random run draws again.
-    listOf("propertySeed", "propertyIterations").forEach { key ->
-        if (project.hasProperty(key)) {
-            systemProperty(key, project.property(key).toString())
-            outputs.upToDateWhen { false }
-        }
-    }
     // Integration tests share a single real iCloud account, so serialize them to
     // avoid ETag races and cross-test event collisions on the same calendar.
     if (project.hasProperty("integration")) {
@@ -111,6 +102,20 @@ tasks.test {
     // integration runs are auditable. Off for the default hermetic run.
     if (project.hasProperty("integration")) {
         testLogging { showStandardStreams = true }
+    }
+}
+
+// Property tests (testutil.PropertyRuns), in every module: -PpropertySeed=<seed>|random replays a
+// printed seed or draws a new one, -PpropertyIterations=<n> multiplies the iterations. A test task
+// is never up to date while either is set, so a repeated random run draws again.
+allprojects {
+    tasks.withType<Test>().configureEach {
+        listOf("propertySeed", "propertyIterations").forEach { key ->
+            providers.gradleProperty(key).orNull?.let { value ->
+                systemProperty(key, value)
+                outputs.upToDateWhen { false }
+            }
+        }
     }
 }
 

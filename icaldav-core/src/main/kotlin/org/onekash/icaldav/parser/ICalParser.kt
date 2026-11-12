@@ -149,6 +149,9 @@ class ICalParser(
                 UPPERCASE_NEWLINE_ESCAPE.replace(line.substring(valueStart)) { "${it.groupValues[1]}\\n" }
         }
 
+        /** An RFC 5545 property name (iana-token or x-name): letters, digits and hyphens. */
+        private val PROPERTY_NAME = Regex("[A-Z0-9-]+")
+
         @Volatile
         private var configured = false
         private val configLock = Any()
@@ -484,6 +487,8 @@ class ICalParser(
         for (prop in vtodo.getAllProperties()) {
             val propName = prop.name?.uppercase() ?: continue
             if (propName in handledTodoProperties) continue
+            // ical4j's relaxed parsing can invent a name from junk; keep only an RFC 5545 iana-token.
+            if (!PROPERTY_NAME.matches(propName)) continue
             if (propName == "BEGIN" || propName == "END") continue
 
             val paramList = prop.getParameters()
@@ -497,7 +502,12 @@ class ICalParser(
             }
 
             val value = prop.value
-            if (!value.isNullOrBlank()) {
+            // A CONTROL character other than HTAB is not valid in a content line (RFC 5545 3.1); a
+            // value holding one (a decoded line break excepted, which the generator escapes), or a
+            // name or parameter holding one, is dropped rather than written back.
+            if (!value.isNullOrBlank() && value.none { (it < ' ' && it != '\t' && it != '\n') || it == '\u007f' } &&
+                key.none { (it < ' ' && it != '\t') || it == '\u007f' }
+            ) {
                 raw[key] = value
             }
         }
@@ -683,6 +693,8 @@ class ICalParser(
         for (prop in vjournal.getAllProperties()) {
             val propName = prop.name?.uppercase() ?: continue
             if (propName in handledJournalProperties) continue
+            // ical4j's relaxed parsing can invent a name from junk; keep only an RFC 5545 iana-token.
+            if (!PROPERTY_NAME.matches(propName)) continue
             if (propName == "BEGIN" || propName == "END") continue
 
             val paramList = prop.getParameters()
@@ -696,7 +708,12 @@ class ICalParser(
             }
 
             val value = prop.value
-            if (!value.isNullOrBlank()) {
+            // A CONTROL character other than HTAB is not valid in a content line (RFC 5545 3.1); a
+            // value holding one (a decoded line break excepted, which the generator escapes), or a
+            // name or parameter holding one, is dropped rather than written back.
+            if (!value.isNullOrBlank() && value.none { (it < ' ' && it != '\t' && it != '\n') || it == '\u007f' } &&
+                key.none { (it < ' ' && it != '\t') || it == '\u007f' }
+            ) {
                 raw[key] = value
             }
         }
@@ -1587,6 +1604,8 @@ class ICalParser(
 
             // Skip properties we handle explicitly
             if (propName in handledProperties) continue
+            // ical4j's relaxed parsing can invent a name from junk; keep only an RFC 5545 iana-token.
+            if (!PROPERTY_NAME.matches(propName)) continue
 
             // Skip component markers
             if (propName == "BEGIN" || propName == "END") continue
@@ -1608,7 +1627,12 @@ class ICalParser(
 
             // Store the value
             val value = prop.value
-            if (!value.isNullOrBlank()) {
+            // A CONTROL character other than HTAB is not valid in a content line (RFC 5545 3.1); a
+            // value holding one (a decoded line break excepted, which the generator escapes), or a
+            // name or parameter holding one, is dropped rather than written back.
+            if (!value.isNullOrBlank() && value.none { (it < ' ' && it != '\t' && it != '\n') || it == '\u007f' } &&
+                key.none { (it < ' ' && it != '\t') || it == '\u007f' }
+            ) {
                 raw[key] = value
             }
         }

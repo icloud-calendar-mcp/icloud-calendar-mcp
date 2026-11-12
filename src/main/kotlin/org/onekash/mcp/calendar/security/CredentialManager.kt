@@ -38,12 +38,13 @@ object CredentialManager {
     /**
      * Load credentials from environment variables.
      *
+     * @param env Reads one environment variable; the process environment by default (tests pass a map)
      * @return Credentials if both username and password are set, null otherwise
      * @throws CredentialException if credentials are invalid
      */
-    fun loadFromEnvironment(): Credentials? {
-        val username = System.getenv(ENV_ICLOUD_USERNAME)
-        val password = System.getenv(ENV_ICLOUD_PASSWORD)
+    fun loadFromEnvironment(env: (String) -> String? = System::getenv): Credentials? {
+        val username = env(ENV_ICLOUD_USERNAME)
+        val password = env(ENV_ICLOUD_PASSWORD)
 
         if (username.isNullOrBlank() && password.isNullOrBlank()) {
             return null // No credentials configured
@@ -89,10 +90,12 @@ object CredentialManager {
 
     /**
      * Check if credentials are configured (without loading them).
+     *
+     * @param env Reads one environment variable; the process environment by default
      */
-    fun isConfigured(): Boolean {
-        val username = System.getenv(ENV_ICLOUD_USERNAME)
-        val password = System.getenv(ENV_ICLOUD_PASSWORD)
+    fun isConfigured(env: (String) -> String? = System::getenv): Boolean {
+        val username = env(ENV_ICLOUD_USERNAME)
+        val password = env(ENV_ICLOUD_PASSWORD)
         return !username.isNullOrBlank() && !password.isNullOrBlank()
     }
 }

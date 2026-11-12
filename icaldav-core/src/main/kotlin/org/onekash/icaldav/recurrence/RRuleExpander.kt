@@ -106,74 +106,27 @@ class RRuleExpander {
         // every other instance from the range start's instant. The end is exclusive for all.
         val allDayFloorMs = rangeStartDay.toEpochMilli()
 
-        // ========== Candidate instances: RRULE, then RDATE ==========
-        val candidates = mutableListOf<Candidate>()
-        if (rrule != null) {
-            // Build ical4j Recur from our RRule
-            val recur = buildRecur(rrule, eventZone, masterEvent.isAllDay)
+        // ========== Candidate instances: RRULE, DTSTART (no RRULE), then RDATE ==========
+        val candidates = if (rrule != null) {
+            rruleCandidates(masterEvent, rrule, eventZone, genStart, genEnd).toMutableList()
+        } else mutableListOf()
 
-            // Get start date for recurrence calculation
-            val eventStartZdt = masterEvent.dtStart.toZonedDateTime()
-
-            val periodStart = ZonedDateTime.ofInstant(genStart, eventZone)
-            val periodEnd = ZonedDateTime.ofInstant(genEnd, eventZone)
-
-            // Always use LocalDateTime - for all-day events, use midnight
-            val seed = if (masterEvent.isAllDay) {
-                eventStartZdt.toLocalDate().atStartOfDay()
-            } else {
-                eventStartZdt.toLocalDateTime()
-            }
-
-            val rangeStartLdt = if (masterEvent.isAllDay) {
-                periodStart.toLocalDate().atStartOfDay()
-            } else {
-                periodStart.toLocalDateTime()
-            }
-
-            val rangeEndLdt = if (masterEvent.isAllDay) {
-                periodEnd.toLocalDate().atStartOfDay()
-            } else {
-                periodEnd.toLocalDateTime()
-            }
-
-            // Bound expansion to MAX_ITERATIONS generated instances per series (US2,
-            // CWE-400). Two parts:
-            //  1. Fast-forward the seed toward the window ourselves (fastForwardSeed):
-            //     ical4j's own fast-forward (RecurDateSpliterator, still in 4.4.0) doubles an int
-            //     multiplier and overflows to 0 for a far-seed FREQ=SECONDLY, spinning
-            //     forever. Advancing the seed to the window sidesteps that loop.
-            //  2. Cap in-window generation with maxCount = MAX_ITERATIONS + 1; if the
-            //     count-limited result overflows the limit, abort rather than return a
-            //     truncated (silently wrong) list.
-            val effectiveSeed = fastForwardSeed(rrule, seed, rangeStartLdt)
-            val dates: List<LocalDateTime> =
-                recur.getDates(effectiveSeed, rangeStartLdt, rangeEndLdt, MAX_ITERATIONS + 1)
-            if (dates.size > MAX_ITERATIONS) {
-                throw ExpansionLimitException(masterEvent.uid, MAX_ITERATIONS)
-            }
-            for (date in dates) {
-                val zdt = date.atZone(eventZone)
-                candidates.add(Candidate(zdt.toInstant().toEpochMilli(), zdt.toLocalDate(), rrule = zdt, rdate = null))
-            }
-        }
-
-        // RDATEs add instances; an RDATE at an instant RRULE already generated counts once
-        // (RFC 5545 3.8.5.3). The dedupe is by instant, so an RDATE at another time of an
-        // occupied day adds its own instance.
         // RFC 5545 3.8.5.2: "The "DTSTART" property defines the first instance in the recurrence
         // set." With an RRULE it is the rule's first instance; without one it is added here.
         if (rrule == null) {
             val start = masterEvent.dtStart
             if (start.timestamp >= genStart.toEpochMilli() && start.timestamp < genEnd.toEpochMilli()) {
-                candidates.add(Candidate(start.timestamp, dayOf(start, eventZone), rrule = null, rdate = start))
+                candidates.add(Candidate.of(start, eventZone))
             }
         }
+        // RDATEs add instances; an RDATE at an instant already generated counts once (RFC 5545
+        // 3.8.5.3). The dedupe is by instant, so an RDATE at another time of an occupied day adds
+        // its own instance.
         val generatedInstants = candidates.mapTo(HashSet()) { it.instantMs }
         for (rdate in masterEvent.rdates) {
             if (rdate.timestamp < genStart.toEpochMilli() || rdate.timestamp >= genEnd.toEpochMilli()) continue
             if (!generatedInstants.add(rdate.timestamp)) continue
-            candidates.add(Candidate(rdate.timestamp, dayOf(rdate, eventZone), rrule = null, rdate = rdate))
+            candidates.add(Candidate.of(rdate, eventZone))
         }
 
         // ========== EXDATE ==========
@@ -183,7 +136,7 @@ class RRuleExpander {
         val occurrences = mutableListOf<ICalEvent>()
         for (candidate in candidates) {
             if (candidate.instantMs in excluded) continue
-            val lowerMs = if (masterEvent.isAllDay && candidate.rrule != null) allDayFloorMs else rangeStart.toEpochMilli()
+            val lowerMs = if (masterEvent.isAllDay && candidate.fromRrule) allDayFloorMs else rangeStart.toEpochMilli()
             if (candidate.instantMs < lowerMs || candidate.instantMs >= rangeEnd.toEpochMilli()) continue
 
             // If there's an override for this occurrence's instant, use it instead
@@ -193,43 +146,94 @@ class RRuleExpander {
                 continue
             }
 
-            val occurrenceStart = candidate.rrule?.let { ICalDateTime.fromZonedDateTime(it, masterEvent.isAllDay) }
-                ?: candidate.rdate!!
-            val occurrenceEnd = eventDuration?.let { dur ->
-                ICalDateTime.fromTimestamp(
-                    occurrenceStart.timestamp + dur.toMillis(),
-                    occurrenceStart.timezone,
-                    masterEvent.isAllDay
-                )
-            }
-            val dayCode = candidate.rdate?.toDayCode()
-                ?: "%04d%02d%02d".format(candidate.day.year, candidate.day.monthValue, candidate.day.dayOfMonth)
-            occurrences.add(
-                masterEvent.copy(
-                    importId = "${masterEvent.uid}:OCC:$dayCode",
-                    dtStart = occurrenceStart,
-                    dtEnd = occurrenceEnd,
-                    rrule = null,
-                    exdates = emptyList(),
-                    rdates = emptyList(),
-                    recurrenceId = null
-                )
-            )
+            occurrences.add(toOccurrence(masterEvent, candidate, eventDuration))
         }
 
         return occurrences.sortedBy { it.dtStart.timestamp }
     }
 
     /**
-     * One generated instance before EXDATE: its instant, its calendar [day] in the event's zone,
-     * and where it came from ([rrule] for an RRULE instance, [rdate] for an RDATE).
+     * One generated instance before EXDATE: its [start] value (as the occurrence will carry it),
+     * its instant, its calendar [day] in the event's zone, the [dayCode] its importId uses, and
+     * whether it came from the RRULE ([fromRrule]) or from DTSTART or an RDATE.
      */
     private class Candidate(
+        val start: ICalDateTime,
         val instantMs: Long,
         val day: LocalDate,
-        val rrule: ZonedDateTime?,
-        val rdate: ICalDateTime?
-    )
+        val dayCode: String,
+        val fromRrule: Boolean
+    ) {
+        companion object {
+            /** An RRULE instance at [zdt] (in the event's zone). */
+            fun ofRrule(zdt: ZonedDateTime, isAllDay: Boolean) = Candidate(
+                start = ICalDateTime.fromZonedDateTime(zdt, isAllDay),
+                instantMs = zdt.toInstant().toEpochMilli(),
+                day = zdt.toLocalDate(),
+                dayCode = "%04d%02d%02d".format(zdt.year, zdt.monthValue, zdt.dayOfMonth),
+                fromRrule = true
+            )
+
+            /** DTSTART or an RDATE, kept as written. */
+            fun of(value: ICalDateTime, eventZone: ZoneId) = Candidate(
+                start = value,
+                instantMs = value.timestamp,
+                day = dayOf(value, eventZone),
+                dayCode = value.toDayCode(),
+                fromRrule = false
+            )
+        }
+    }
+
+    /**
+     * The RRULE's instances between [genStart] and [genEnd], computed by ical4j on wall clocks in
+     * [eventZone]. Bound to MAX_ITERATIONS instances per series (US2, CWE-400), in two parts:
+     *  1. Fast-forward the seed toward the window ourselves ([fastForwardSeed]): ical4j's own
+     *     fast-forward (RecurDateSpliterator, still in 4.4.0) doubles an int multiplier and
+     *     overflows to 0 for a far-seed FREQ=SECONDLY, spinning forever.
+     *  2. Cap generation with maxCount = MAX_ITERATIONS + 1; if the result overflows the limit,
+     *     abort rather than return a truncated (silently wrong) list.
+     */
+    private fun rruleCandidates(
+        master: ICalEvent,
+        rrule: RRule,
+        eventZone: ZoneId,
+        genStart: Instant,
+        genEnd: Instant
+    ): List<Candidate> {
+        val recur = buildRecur(rrule, eventZone, master.isAllDay)
+        val eventStartZdt = master.dtStart.toZonedDateTime()
+        val periodStart = ZonedDateTime.ofInstant(genStart, eventZone)
+        val periodEnd = ZonedDateTime.ofInstant(genEnd, eventZone)
+        // Always LocalDateTime; an all-day series runs on midnights.
+        val seed = if (master.isAllDay) eventStartZdt.toLocalDate().atStartOfDay() else eventStartZdt.toLocalDateTime()
+        val rangeStartLdt = if (master.isAllDay) periodStart.toLocalDate().atStartOfDay() else periodStart.toLocalDateTime()
+        val rangeEndLdt = if (master.isAllDay) periodEnd.toLocalDate().atStartOfDay() else periodEnd.toLocalDateTime()
+
+        val dates: List<LocalDateTime> =
+            recur.getDates(fastForwardSeed(rrule, seed, rangeStartLdt), rangeStartLdt, rangeEndLdt, MAX_ITERATIONS + 1)
+        if (dates.size > MAX_ITERATIONS) {
+            throw ExpansionLimitException(master.uid, MAX_ITERATIONS)
+        }
+        return dates.map { Candidate.ofRrule(it.atZone(eventZone), master.isAllDay) }
+    }
+
+    /** The occurrence event for [candidate]: the master's fields at the candidate's start. */
+    private fun toOccurrence(master: ICalEvent, candidate: Candidate, eventDuration: Duration?): ICalEvent {
+        val start = candidate.start
+        val end = eventDuration?.let { dur ->
+            ICalDateTime.fromTimestamp(start.timestamp + dur.toMillis(), start.timezone, master.isAllDay)
+        }
+        return master.copy(
+            importId = "${master.uid}:OCC:${candidate.dayCode}",
+            dtStart = start,
+            dtEnd = end,
+            rrule = null,
+            exdates = emptyList(),
+            rdates = emptyList(),
+            recurrenceId = null
+        )
+    }
 
     /**
      * The candidate instants EXDATE removes (RFC 5545 3.8.5.1), with hybrid matching:

@@ -1,5 +1,6 @@
 package org.onekash.icaldav.recurrence
 
+import org.onekash.icaldav.testutil.withDefaultZone
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
@@ -13,7 +14,6 @@ import org.onekash.icaldav.parser.ICalParser
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
-import java.util.TimeZone
 
 /**
  * Unit tests for RDATE expansion in RRuleExpander.
@@ -663,13 +663,7 @@ class RRuleExpanderRdateTest {
             val text = ics("DTSTART;TZID=Asia/Seoul:20260301T080000", "DTEND;TZID=Asia/Seoul:20260301T083000",
                 "FREQ=DAILY;BYHOUR=8,18;COUNT=6", listOf("EXDATE:20260302T080000"))
             for (jvm in listOf("UTC", "Asia/Seoul", "America/Los_Angeles")) {
-                val saved = TimeZone.getDefault()
-                val out = try {
-                    TimeZone.setDefault(TimeZone.getTimeZone(jvm))
-                    expandIcs(text)
-                } finally {
-                    TimeZone.setDefault(saved)
-                }
+                val out = withDefaultZone(jvm) { expandIcs(text) }
                 assertEquals(
                     listOf(kst(1, 8), kst(1, 18), kst(2, 18), kst(3, 8), kst(3, 18)), out, "JVM zone $jvm"
                 )
@@ -787,12 +781,8 @@ class RRuleExpanderRdateTest {
             val lines = listOf("DTSTART:20260301T000000Z", "DTEND:20260301T010000Z", "RRULE:FREQ=DAILY;COUNT=10",
                 "EXDATE:20260305T000000", "RDATE:20260312T050000")
             val results = listOf("UTC", "Asia/Seoul", "America/Los_Angeles").associateWith { jvm ->
-                val saved = TimeZone.getDefault()
-                try {
-                    TimeZone.setDefault(TimeZone.getTimeZone(jvm))
+                withDefaultZone(jvm) {
                     expander.expand(parse(lines), rangeFor2026()).map { Instant.ofEpochMilli(it.dtStart.timestamp).toString() }
-                } finally {
-                    TimeZone.setDefault(saved)
                 }
             }
             val utc = results.getValue("UTC")

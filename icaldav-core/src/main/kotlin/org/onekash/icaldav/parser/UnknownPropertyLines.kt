@@ -55,7 +55,7 @@ internal object UnknownPropertyLines {
                 }
                 else -> if (lines != null && isTarget(stack, componentName)) {
                     if (name == "UID") uid = line.substringAfter(':').trim()
-                    if (name !in modelled) lines += line
+                    if (name !in modelled && isContentLine(line, name)) lines += line
                 }
             }
         }
@@ -80,6 +80,21 @@ internal object UnknownPropertyLines {
 
     private fun isTarget(stack: ArrayDeque<String>, componentName: String): Boolean =
         stack.size == 2 && stack[0] == "VCALENDAR" && stack[1] == componentName
+
+    /**
+     * True when [line] is a content line (RFC 5545 3.1): a property name of letters, digits and
+     * hyphens, then parameters or the value after a ':'. ical4j skips anything else on input, so
+     * keeping it would write back a line that does not parse. A line holding a CONTROL character
+     * other than HTAB is not a content line either.
+     */
+    private fun isContentLine(line: String, name: String): Boolean =
+        PROPERTY_NAME.matches(name) && line.indexOf(':') > 0 && line.none { it.isContentControl() }
+
+    /** CONTROL characters (RFC 5545 3.1) other than HTAB, which no content line may contain. */
+    private fun Char.isContentControl() = (this < ' ' && this != '\t') || this == '\u007f'
+
+
+    private val PROPERTY_NAME = Regex("[A-Z0-9-]+")
 
     /** The name part of a content line: everything before the first ';' or ':'. */
     private fun propertyName(line: String): String {

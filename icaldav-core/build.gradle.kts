@@ -66,13 +66,4 @@ tasks.withType<Test> {
         System.getProperty("user.timezone")?.takeIf { it.isNotBlank() }
             ?: TimeZone.getDefault().id
     )
-    // Property tests (testutil.PropertyRuns): -PpropertySeed=<seed>|random replays a printed seed
-    // or draws a new one, -PpropertyIterations=<n> multiplies the iterations. Never up to date
-    // while set, so a repeated random run draws again.
-    listOf("propertySeed", "propertyIterations").forEach { key ->
-        if (project.hasProperty(key)) {
-            systemProperty(key, project.property(key).toString())
-            outputs.upToDateWhen { false }
-        }
-    }
 }
