@@ -493,4 +493,22 @@ class RRuleRfc5545PropertiesTest {
             assertEquals(run("UTC"), run("Asia/Seoul"), "kind $kind, ${rule.text()} from $start, other $other")
         }
     }
+
+    // 3.8.5.2: "The "DTSTART" property defines the first instance in the recurrence set." A
+    // series defined by RDATE alone is DTSTART plus its RDATEs, each once.
+    @Test
+    fun `an RDATE-only series is DTSTART plus its RDATEs`(): Unit = runBlocking {
+        val cases = arbitrary {
+            val s = startArb().bind()
+            s to (0 until Arb.int(1..6).bind()).map { Arb.int(0..60).bind() }
+        }
+        checkAll(PropertyRuns.config(300), cases) { (start, offsets) ->
+            // Offsets in days; 0 repeats DTSTART itself, which must count once.
+            val rdates = offsets.map { start.plusDays(it.toLong()).toInstant().toEpochMilli() }
+            val event = event(start, "FREQ=DAILY", rdates = rdates).copy(rrule = null)
+            val out = expander.expand(event, start.toInstant(), start.plusDays(62).toInstant()).map { it.dtStart.timestamp }
+            val expected = (listOf(start.toInstant().toEpochMilli()) + rdates).toSortedSet().toList()
+            assertEquals(expected, out, "RDATE-only from $start, offsets $offsets")
+        }
+    }
 }

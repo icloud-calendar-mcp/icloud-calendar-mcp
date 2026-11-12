@@ -62,11 +62,12 @@ class RRuleExpanderRdateTest {
 
             val occurrences = expander.expand(event, rangeFor2026())
 
-            // Should have 3 occurrences from RDATE
-            assertEquals(3, occurrences.size)
+            // DTSTART is the first instance, then the 3 RDATEs (RFC 5545 3.8.5.2)
+            assertEquals(4, occurrences.size)
 
             // Verify dates
             val dayCodes = occurrences.map { it.dtStart.toDayCode() }
+            assertEquals("20260115", dayCodes.first())
             assertTrue(dayCodes.contains("20260120"))
             assertTrue(dayCodes.contains("20260125"))
             assertTrue(dayCodes.contains("20260130"))
@@ -228,8 +229,8 @@ class RRuleExpanderRdateTest {
 
             val occurrences = expander.expand(event, rangeFor2026())
 
-            // 3 RDATEs minus 1 EXDATE = 2 occurrences
-            assertEquals(2, occurrences.size)
+            // DTSTART plus 3 RDATEs minus 1 EXDATE = 3 occurrences
+            assertEquals(3, occurrences.size)
 
             val dayCodes = occurrences.map { it.dtStart.toDayCode() }
             assertTrue(dayCodes.contains("20260120"))
@@ -302,9 +303,8 @@ class RRuleExpanderRdateTest {
 
             val occurrences = expander.expand(event, rangeFor2026())
 
-            // Only Jan 20, 2026 is in range; Jan 15, 2027 is not
-            assertEquals(1, occurrences.size)
-            assertEquals("20260120", occurrences[0].dtStart.toDayCode())
+            // DTSTART (Jan 15, 2026) and Jan 20, 2026 are in range; Jan 15, 2027 is not
+            assertEquals(listOf("20260115", "20260120"), occurrences.map { it.dtStart.toDayCode() })
         }
 
         @Test
@@ -330,8 +330,8 @@ class RRuleExpanderRdateTest {
 
             val occurrences = expander.expand(event, rangeFor2026())
 
-            // Only Jan 20, 2026 is in range
-            assertEquals(1, occurrences.size)
+            // DTSTART (Jan 15) and Jan 20 are in range; Dec 15, 2025 is not
+            assertEquals(listOf("20260115", "20260120"), occurrences.map { it.dtStart.toDayCode() })
         }
     }
 
@@ -362,8 +362,10 @@ class RRuleExpanderRdateTest {
 
             val occurrences = expander.expand(event, rangeFor2026())
 
-            assertEquals(1, occurrences.size)
-            assertTrue(occurrences[0].importId.contains("OCC:20260120"))
+            // DTSTART is the first instance; the RDATE is the second.
+            assertEquals(2, occurrences.size)
+            val rdateOccurrence = occurrences.single { it.dtStart.toDayCode() == "20260120" }
+            assertTrue(rdateOccurrence.importId.contains("OCC:20260120"))
         }
 
         @Test
@@ -391,10 +393,12 @@ class RRuleExpanderRdateTest {
 
             val occurrences = expander.expand(event, rangeFor2026())
 
-            assertEquals(1, occurrences.size)
-            assertEquals("Important Meeting", occurrences[0].summary)
-            assertEquals("Test description", occurrences[0].description)
-            assertEquals("Conference Room", occurrences[0].location)
+            // DTSTART is the first instance; the RDATE is the second.
+            assertEquals(2, occurrences.size)
+            val rdateOccurrence = occurrences.single { it.dtStart.toDayCode() == "20260120" }
+            assertEquals("Important Meeting", rdateOccurrence.summary)
+            assertEquals("Test description", rdateOccurrence.description)
+            assertEquals("Conference Room", rdateOccurrence.location)
         }
 
         @Test
@@ -452,8 +456,9 @@ class RRuleExpanderRdateTest {
 
             val occurrences = expander.expand(event, rangeFor2026())
 
-            assertEquals(1, occurrences.size)
-            val occ = occurrences[0]
+            // DTSTART is the first instance; the RDATE is the second.
+            assertEquals(2, occurrences.size)
+            val occ = occurrences.single { it.dtStart.toDayCode() == "20260120" }
 
             // RDATE starts at 14:00, should end at 16:00 (2 hour duration)
             assertNotNull(occ.dtEnd)
@@ -673,9 +678,9 @@ class RRuleExpanderRdateTest {
 
         @Test
         fun `an RDATE-only series keeps two RDATEs on the same day`() {
-            // An RDATE-only series emits its RDATEs and not DTSTART (pinned by the RDATE-only tests above).
+            // DTSTART is the first instance, then both same-day RDATEs.
             assertEquals(
-                listOf(ny(2, 9), ny(2, 15)),
+                listOf(ny(1, 10), ny(2, 9), ny(2, 15)),
                 expandIcs(ics("DTSTART;TZID=America/New_York:20260301T100000",
                     "DTEND;TZID=America/New_York:20260301T110000", null,
                     listOf("RDATE;TZID=America/New_York:20260302T090000,20260302T150000")))
@@ -794,6 +799,48 @@ class RRuleExpanderRdateTest {
             assertFalse("2026-03-05T00:00:00Z" in utc, "Mar 5 excluded: $utc")
             assertTrue("2026-03-12T05:00:00Z" in utc, "RDATE at 05:00Z: $utc")
             results.forEach { (jvm, out) -> assertEquals(utc, out, "JVM zone $jvm") }
+        }
+    }
+
+    /**
+     * RFC 5545 3.8.5.1/3.8.5.2: "The "DTSTART" property defines the first instance in the
+     * recurrence set." That holds for a series defined by RDATE alone.
+     */
+    @Nested
+    @DisplayName("DTSTART is the first instance of an RDATE-only series")
+    inner class RdateOnlyDtstart {
+
+        private fun expandRdateOnly(vararg extra: String): List<String> {
+            val ics = (listOf("BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Test//Test//EN", "BEGIN:VEVENT",
+                "UID:rdate-dtstart@test.com", "DTSTAMP:20260101T000000Z", "DTSTART:20260115T100000Z",
+                "DTEND:20260115T110000Z", "SUMMARY:RDATE only") + extra + listOf("END:VEVENT", "END:VCALENDAR"))
+                .joinToString("\r\n")
+            val event = (parser.parseAllEvents(ics) as ParseResult.Success).value.first()
+            return expander.expand(event, rangeFor2026()).map { Instant.ofEpochMilli(it.dtStart.timestamp).toString() }
+        }
+
+        @Test
+        fun `DTSTART is returned before the RDATEs`() {
+            assertEquals(
+                listOf("2026-01-15T10:00:00Z", "2026-01-20T10:00:00Z", "2026-01-25T10:00:00Z"),
+                expandRdateOnly("RDATE:20260120T100000Z,20260125T100000Z")
+            )
+        }
+
+        @Test
+        fun `an RDATE equal to DTSTART counts once`() {
+            assertEquals(
+                listOf("2026-01-15T10:00:00Z", "2026-01-20T10:00:00Z"),
+                expandRdateOnly("RDATE:20260115T100000Z,20260120T100000Z")
+            )
+        }
+
+        @Test
+        fun `an EXDATE on DTSTART removes it`() {
+            assertEquals(
+                listOf("2026-01-20T10:00:00Z"),
+                expandRdateOnly("RDATE:20260120T100000Z", "EXDATE:20260115T100000Z")
+            )
         }
     }
 }

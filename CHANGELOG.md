@@ -64,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list, which iCloud refuses with a bare 403) says why.
 - An RRULE occurrence starting exactly at the end of an expansion range is no
   longer returned, matching the documented exclusive end.
+- An event with `rdates` and no `rrule` now shows its own start in
+  `get_events`. DTSTART is the first instance of the recurrence set (RFC 5545
+  3.8.5.2); it was dropped, so only the RDATEs appeared.
 
 ### Changed
 - ical4j 4.4.0 (from 4.3.0). Its repeated-BYDAY fix removes duplicate

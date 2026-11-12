@@ -392,4 +392,23 @@ class ComprehensiveRoundTripLiveTest : LiveCalendarTestBase() {
             println("  cleanup raw delete: ${raw.deleteEvent(href, null)::class.simpleName}")
         }
     }
+
+    @Test
+    @DisplayName("18 an event with rdates and no rrule shows its own start plus each RDATE")
+    fun rdateOnlySeriesIncludesDtstart() {
+        val day = LocalDate.now().plusDays(130)
+        val created = createTracked(
+            summary = "rdate only",
+            startTime = "${day}T09:00:00Z",
+            endTime = "${day}T09:30:00Z",
+            rdates = listOf("${day.plusDays(2)}T09:00:00Z", "${day.plusDays(4)}T09:00:00Z")
+        )
+        val res = service.getEvents(calendarId, day.minusDays(1).toString(), day.plusDays(6).toString())
+        assertTrue(res is ServiceResult.Success, "getEvents should succeed: $res")
+        val starts = (res as ServiceResult.Success).data.filter { it.uid == created.uid }.mapNotNull { it.startTime }.sorted()
+        assertEquals(
+            listOf("${day}T09:00:00Z", "${day.plusDays(2)}T09:00:00Z", "${day.plusDays(4)}T09:00:00Z"), starts,
+            "DTSTART is the first instance, then the two RDATEs"
+        )
+    }
 }

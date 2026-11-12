@@ -161,6 +161,14 @@ class RRuleExpander {
         // RDATEs add instances; an RDATE at an instant RRULE already generated counts once
         // (RFC 5545 3.8.5.3). The dedupe is by instant, so an RDATE at another time of an
         // occupied day adds its own instance.
+        // RFC 5545 3.8.5.2: "The "DTSTART" property defines the first instance in the recurrence
+        // set." With an RRULE it is the rule's first instance; without one it is added here.
+        if (rrule == null) {
+            val start = masterEvent.dtStart
+            if (start.timestamp >= genStart.toEpochMilli() && start.timestamp < genEnd.toEpochMilli()) {
+                candidates.add(Candidate(start.timestamp, dayOf(start, eventZone), rrule = null, rdate = start))
+            }
+        }
         val generatedInstants = candidates.mapTo(HashSet()) { it.instantMs }
         for (rdate in masterEvent.rdates) {
             if (rdate.timestamp < genStart.toEpochMilli() || rdate.timestamp >= genEnd.toEpochMilli()) continue
