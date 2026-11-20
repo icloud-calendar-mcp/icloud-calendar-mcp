@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp"
+Homepage = "https://mcp.onekash.org"
 Repository = "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp"
 Issues = "https://github.com/icloud-calendar-mcp/icloud-calendar-mcp/issues"
 

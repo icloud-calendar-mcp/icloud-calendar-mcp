@@ -13,6 +13,8 @@
 
 An MCP (Model Context Protocol) server that gives AI assistants access to iCloud Calendar via CalDAV, with security controls aligned with the [OWASP MCP Top 10](https://owasp.org/www-project-mcp-top-10/).
 
+Website and setup guide: [mcp.onekash.org](https://mcp.onekash.org)
+
 > [!CAUTION]
 > **Never use your main Apple ID password.** This server requires an [app-specific password](https://support.apple.com/en-us/HT204397) which can be revoked independently without affecting your Apple ID.
 
